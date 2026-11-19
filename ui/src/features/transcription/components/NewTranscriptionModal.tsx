@@ -66,6 +66,8 @@ interface NewTranscriptionModalProps {
   selectedModelSupportsTranslation?: boolean;
   /** The selected model accepts a keyword list. */
   selectedModelSupportsKeywords?: boolean;
+  /** The selected model takes transcript style options. */
+  selectedModelSupportsTranscriptStyle?: boolean;
   /** The selected model times words itself: timestamps need no aligner. */
   selectedModelHasNativeWordTimestamps?: boolean;
   /** Shown under the SAA model: why an installed model is not offered. */
@@ -130,6 +132,7 @@ export function NewTranscriptionModal({
   selectedModelStatus = null,
   selectedModelSupportsTranslation = false,
   selectedModelSupportsKeywords = false,
+  selectedModelSupportsTranscriptStyle = false,
   selectedModelHasNativeWordTimestamps = false,
   speakerAttributionHint = null,
   timestampAlignerModelId,
@@ -153,6 +156,10 @@ export function NewTranscriptionModal({
   const [selectedLanguage, setSelectedLanguage] = useState(AUTO_LANGUAGE);
   const [translationTarget, setTranslationTarget] = useState(NO_TRANSLATION);
   const [keywordsText, setKeywordsText] = useState("");
+  // The model's own defaults: digits, fillers dropped, repeats kept.
+  const [numbersAsDigits, setNumbersAsDigits] = useState(true);
+  const [keepFillers, setKeepFillers] = useState(false);
+  const [keepRepeats, setKeepRepeats] = useState(true);
   const [includeTimestamps, setIncludeTimestamps] = useState(false);
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [generateSummary, setGenerateSummary] = useState(false);
@@ -340,6 +347,14 @@ export function NewTranscriptionModal({
         const keywords = selectedModelSupportsKeywords
           ? parseKeywords(keywordsText)
           : [];
+        // Only the options moved off the model's default are sent.
+        const transcriptStyle = selectedModelSupportsTranscriptStyle
+          ? {
+              ...(numbersAsDigits ? {} : { digits: false }),
+              ...(keepFillers ? { filler: true } : {}),
+              ...(keepRepeats ? {} : { verbatim: false }),
+            }
+          : {};
         const request = {
           audio_file: uploadedBlob,
           audio_filename: uploadFilename,
@@ -351,6 +366,8 @@ export function NewTranscriptionModal({
           language: languageHint(selectedLanguage),
           target_language: translating ? translationTarget : undefined,
           keywords: keywords.length > 0 ? keywords : undefined,
+          transcript_style:
+            Object.keys(transcriptStyle).length > 0 ? transcriptStyle : undefined,
           include_timestamps: includeTimestamps,
           generate_summary: generateSummary,
         };
@@ -514,6 +531,10 @@ export function NewTranscriptionModal({
       generateSummary,
       keywordsText,
       selectedModelSupportsKeywords,
+      selectedModelSupportsTranscriptStyle,
+      numbersAsDigits,
+      keepFillers,
+      keepRepeats,
       translating,
       translationTarget,
       onClose,
@@ -792,6 +813,32 @@ export function NewTranscriptionModal({
                 className="min-h-[72px] text-[13.5px]"
               />
             </CreationField>
+          ) : null}
+
+          {!isSpeakerAttributedAsrMode && selectedModelSupportsTranscriptStyle ? (
+            <>
+              <CreationOption
+                title="Numbers as digits"
+                description="Write numbers as digits. Off writes them as words."
+                checked={numbersAsDigits}
+                onCheckedChange={setNumbersAsDigits}
+                disabled={isSubmitting}
+              />
+              <CreationOption
+                title="Keep filler words"
+                description="Keep fillers such as “um” and “uh” in the transcript."
+                checked={keepFillers}
+                onCheckedChange={setKeepFillers}
+                disabled={isSubmitting}
+              />
+              <CreationOption
+                title="Keep repeated words"
+                description="Keep words the speaker repeats. Off collapses them."
+                checked={keepRepeats}
+                onCheckedChange={setKeepRepeats}
+                disabled={isSubmitting}
+              />
+            </>
           ) : null}
 
           {!isSpeakerAttributedAsrMode ? (

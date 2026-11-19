@@ -47,6 +47,7 @@ use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
 };
+use crate::models::architectures::rumble::RumblePreparedPromptArtifact;
 use crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparedArtifact;
 use crate::models::architectures::vibevoice::tts::{
     VibeVoiceTtsGenerationParams, VibeVoiceTtsPreparedArtifact,
@@ -217,6 +218,31 @@ pub struct AsrEngineInput {
     pub prompt: Option<String>,
 }
 
+/// How a transcript is written, for models that take the choice
+/// (`ModelVariant::supports_asr_transcript_style`). `None` leaves a setting
+/// at the model's default.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct AsrTranscriptStyle {
+    /// Numbers as digits (`true`) or as words (`false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digits: Option<bool>,
+    /// Keep fillers such as "um" and "uh" (`true`) or drop them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filler: Option<bool>,
+    /// Keep repeated words (`true`) or collapse them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbatim: Option<bool>,
+}
+
+impl AsrTranscriptStyle {
+    /// Whether every setting is left at the model's default.
+    pub fn is_default(&self) -> bool {
+        self.digits.is_none() && self.filler.is_none() && self.verbatim.is_none()
+    }
+}
+
 /// What an ASR request asks for beyond transcription in the spoken language.
 /// Only families that report the capability accept a non-empty value
 /// (`ModelVariant::supports_asr_translation`, `supports_asr_keyword_biasing`).
@@ -229,6 +255,9 @@ pub struct AsrTaskOptions {
     /// Tag the transcript with speakers
     /// (`ModelVariant::supports_asr_speaker_tags`).
     pub speaker_attribution: bool,
+    /// How the transcript is written
+    /// (`ModelVariant::supports_asr_transcript_style`).
+    pub style: AsrTranscriptStyle,
 }
 
 impl AsrTaskOptions {
@@ -244,7 +273,14 @@ impl AsrTaskOptions {
                 .filter(|keyword| !keyword.is_empty())
                 .collect(),
             speaker_attribution: false,
+            style: AsrTranscriptStyle::default(),
         }
+    }
+
+    /// The same options with the transcript style set.
+    pub fn with_style(mut self, style: AsrTranscriptStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// The same options with speaker tags on or off.
@@ -992,6 +1028,7 @@ enum PreparedAsrEncoderArtifactValue {
     VibeVoice(Arc<VibeVoiceAsrPreparedArtifact>),
     GraniteSpeech(Arc<GraniteSpeechPreparedPromptArtifact>),
     GraniteSpeech5(Arc<GraniteSpeech5PreparedPromptArtifact>),
+    Rumble(Arc<RumblePreparedPromptArtifact>),
     Lfm25Audio(Arc<Lfm25AudioPreparedAsrArtifact>),
     Parakeet(Arc<ParakeetPreparedEncoderArtifact>),
     Nemotron(Arc<NemotronPreparedEncoderArtifact>),
@@ -1017,6 +1054,7 @@ impl crate::backends::DeviceResident for PreparedAsrEncoderArtifactValue {
             Self::VibeVoice(value) => Some(value.device_location()),
             Self::GraniteSpeech(value) => Some(value.device_location()),
             Self::GraniteSpeech5(value) => Some(value.device_location()),
+            Self::Rumble(value) => Some(value.device_location()),
             Self::Lfm25Audio(value) => Some(value.device_location()),
             Self::Parakeet(value) => Some(value.device_location()),
             Self::Nemotron(value) => Some(value.device_location()),
@@ -1033,6 +1071,7 @@ impl PreparedAsrEncoderArtifactValue {
             Self::VibeVoice(_) => "vibevoice",
             Self::GraniteSpeech(_) => "granite_speech",
             Self::GraniteSpeech5(_) => "granite_speech5",
+            Self::Rumble(_) => "rumble",
             Self::Lfm25Audio(_) => "lfm25_audio",
             Self::Parakeet(_) => "parakeet",
             Self::Nemotron(_) => "nemotron",
@@ -1053,6 +1092,9 @@ impl PreparedAsrEncoderArtifactValue {
             Self::GraniteSpeech5(value) => {
                 Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
             }
+            Self::Rumble(value) => {
+                Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
+            }
             Self::Lfm25Audio(value) => {
                 Ok((value.retained_host_bytes, value.retained_resident_bytes))
             }
@@ -1069,6 +1111,7 @@ impl PreparedAsrEncoderArtifactValue {
             | Self::Whisper(_)
             | Self::GraniteSpeech(_)
             | Self::GraniteSpeech5(_)
+            | Self::Rumble(_)
             | Self::Lfm25Audio(_)
             | Self::Parakeet(_)
             | Self::Nemotron(_)

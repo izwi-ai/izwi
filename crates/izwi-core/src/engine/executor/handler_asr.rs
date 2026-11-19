@@ -55,6 +55,9 @@ use super::{
 use crate::models::architectures::granite_speech5::asr::{
     granite_speech5_auto_max_tokens_for_duration, GraniteSpeech5RequestOptions,
 };
+use crate::models::architectures::rumble::{
+    RumbleRequestOptions, RumbleTranscriptStyle, RUMBLE_DEFAULT_MAX_NEW_TOKENS,
+};
 use granite_speech5::{recover_granite_speech5_chunk, ChunkRecoveryLimits};
 
 #[path = "handler_asr/continuous.rs"]
@@ -162,6 +165,7 @@ fn resolve_asr_execution_audio(
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::RumbleAsr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Lfm3Audio
             | ModelFamily::NemotronAsr
@@ -245,6 +249,7 @@ enum PhysicalAsrRoute {
     VibeVoice,
     GraniteSpeech,
     GraniteSpeech5,
+    Rumble,
     Whisper,
     Parakeet,
     Nemotron,
@@ -258,6 +263,7 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         ModelFamily::VibeVoiceAsr => Ok(PhysicalAsrRoute::VibeVoice),
         ModelFamily::GraniteSpeechAsr => Ok(PhysicalAsrRoute::GraniteSpeech),
         ModelFamily::GraniteSpeech5Asr => Ok(PhysicalAsrRoute::GraniteSpeech5),
+        ModelFamily::RumbleAsr => Ok(PhysicalAsrRoute::Rumble),
         ModelFamily::WhisperAsr => Ok(PhysicalAsrRoute::Whisper),
         ModelFamily::ParakeetAsr => Ok(PhysicalAsrRoute::Parakeet),
         ModelFamily::NemotronAsr => Ok(PhysicalAsrRoute::Nemotron),
@@ -536,7 +542,7 @@ impl NativeExecutor {
         }
         if matches!(
             family,
-            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr | ModelFamily::RumbleAsr
         ) && request.uses_asr_retained_sequence()
         {
             return self.granite_speech_asr_sequence_request(
@@ -635,6 +641,11 @@ impl NativeExecutor {
             prompt: asr_prompt.map(str::to_string),
             translate_to: request.asr_task.translate_to.clone(),
             keywords: request.asr_task.keywords.clone(),
+        };
+        let rumble_request = RumbleRequestOptions {
+            language: language.map(str::to_string),
+            prompt: asr_prompt.map(str::to_string),
+            style: RumbleTranscriptStyle::from_request(&request.asr_task.style),
         };
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
@@ -915,6 +926,40 @@ impl NativeExecutor {
                                     redecode,
                                 )?
                             }
+                            PhysicalAsrRoute::Rumble => {
+                                if let Some(emit) = partial {
+                                    return with_single_invocation_cache(
+                                        request,
+                                        scheduled,
+                                        |cache| {
+                                            model.transcribe_rumble_physical(
+                                                chunk_audio,
+                                                sr,
+                                                &rumble_request,
+                                                chunk_generation_options.clone(),
+                                                cache,
+                                                Some(emit),
+                                            )
+                                        },
+                                    )
+                                    .map(|details| {
+                                        AsrChunkTranscription {
+                                            text: details.text,
+                                            diagnostics: details.diagnostics,
+                                        }
+                                    });
+                                }
+                                with_single_invocation_cache(request, scheduled, |cache| {
+                                    model.transcribe_rumble_physical(
+                                        chunk_audio,
+                                        sr,
+                                        &rumble_request,
+                                        chunk_generation_options.clone(),
+                                        cache,
+                                        None,
+                                    )
+                                })?
+                            }
                             PhysicalAsrRoute::Whisper => {
                                 if let Some(emit) = partial {
                                     return with_whisper_invocation_state(
@@ -1077,6 +1122,7 @@ impl NativeExecutor {
                             }
                         }
                     };
+                    let mut stream_diagnostics = None;
                     let text = match route {
                         PhysicalAsrRoute::Qwen3 => {
                             with_single_invocation_cache(request, scheduled, |cache| {
@@ -1132,6 +1178,23 @@ impl NativeExecutor {
                                     .map(|details| details.text)
                             })?
                         }
+                        PhysicalAsrRoute::Rumble => {
+                            let details =
+                                with_single_invocation_cache(request, scheduled, |cache| {
+                                    model.transcribe_rumble_physical(
+                                        samples,
+                                        sample_rate,
+                                        &rumble_request,
+                                        segment_generation_options.clone(),
+                                        cache,
+                                        Some(&mut emit),
+                                    )
+                                })?;
+                            // The stream's final event names the language
+                            // the model detected.
+                            stream_diagnostics = details.diagnostics;
+                            details.text
+                        }
                         PhysicalAsrRoute::Whisper => with_whisper_invocation_state(
                             request,
                             scheduled,
@@ -1183,7 +1246,7 @@ impl NativeExecutor {
                         &request.id,
                         &mut sequence,
                     )?;
-                    return Ok(AsrTranscriptionStep::Complete(text, None));
+                    return Ok(AsrTranscriptionStep::Complete(text, stream_diagnostics));
                 }
             }
             let details = match route {
@@ -1230,6 +1293,18 @@ impl NativeExecutor {
                             samples,
                             sample_rate,
                             &granite_speech5_request,
+                            segment_generation_options.clone(),
+                            cache,
+                            None,
+                        )
+                    })?
+                }
+                PhysicalAsrRoute::Rumble => {
+                    with_single_invocation_cache(request, scheduled, |cache| {
+                        model.transcribe_rumble_physical(
+                            samples,
+                            sample_rate,
+                            &rumble_request,
                             segment_generation_options.clone(),
                             cache,
                             None,
@@ -1419,11 +1494,44 @@ impl NativeExecutor {
         plan: &PlannedAsrChunks,
         chunked: ChunkedAsrTranscription,
     ) -> (String, Option<serde_json::Value>) {
+        let language = Self::chunked_asr_language(&chunked.chunk_diagnostics);
         let mut diagnostics = plan.diagnostics_with_chunk_transcriptions(chunked.chunk_diagnostics);
-        if let (Some(words), Some(root)) = (chunked.timestamp_words, diagnostics.as_object_mut()) {
-            root.insert("timestamp_words".to_string(), timestamp_words_json(&words));
+        if let Some(root) = diagnostics.as_object_mut() {
+            if let Some(words) = chunked.timestamp_words {
+                root.insert("timestamp_words".to_string(), timestamp_words_json(&words));
+            }
+            if let Some(language) = language {
+                root.insert("language".to_string(), serde_json::json!(language));
+            }
         }
         (chunked.text, Some(diagnostics))
+    }
+
+    /// The language of a chunked transcript: the one most of its chunks
+    /// reported as `language` in their model diagnostics, the earliest of
+    /// them on a tie. `None` when no chunk named one.
+    fn chunked_asr_language(chunk_diagnostics: &[serde_json::Value]) -> Option<String> {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for language in chunk_diagnostics
+            .iter()
+            .filter_map(|chunk| {
+                chunk
+                    .get("model_diagnostics")
+                    .and_then(|model| model.get("language"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .filter(|language| !language.trim().is_empty())
+        {
+            match counts.iter_mut().find(|(seen, _)| *seen == language) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((language, 1)),
+            }
+        }
+        let most = counts.iter().map(|(_, count)| *count).max()?;
+        counts
+            .into_iter()
+            .find(|(_, count)| *count == most)
+            .map(|(language, _)| language.to_string())
     }
 
     fn with_audio_decode_timing(
@@ -1508,6 +1616,11 @@ impl NativeExecutor {
             options.max_new_tokens = invocation_context.map_or(budget, |(context, rate)| {
                 budget.min(invocation_decode_room(context, rate, chunk_seconds))
             });
+        }
+        // Rumble's automatic budget is its generation config's; the model
+        // narrows any budget to the room its invocation context leaves.
+        if request.asr_auto_max_tokens && matches!(family, ModelFamily::RumbleAsr) {
+            options.max_new_tokens = base.max_new_tokens.min(RUMBLE_DEFAULT_MAX_NEW_TOKENS);
         }
         // VibeVoice's automatic budget is admitted at the reference ceiling;
         // each chunk decodes with its own duration budget.

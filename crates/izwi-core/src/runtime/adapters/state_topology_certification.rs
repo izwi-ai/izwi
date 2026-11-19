@@ -265,6 +265,9 @@ fn certified_topology(
         // Granite Speech 5.0 retains decoder pages for single-segment rows;
         // long audio leases them for one atomic invocation per chunk.
         (GraniteSpeech5Asr, Asr) => RetainedPagedAndInvocationPaged,
+        // Rumble retains decoder pages for rows of up to 30 s; longer audio
+        // leases them for one atomic invocation per chunk.
+        (RumbleAsr, Asr) => RetainedPagedAndInvocationPaged,
         // Nemotron 3.5 Transcribe rows commit attention pages, the Mamba SSM
         // state and the convolution history as one transaction; each stage
         // leases its activations as per-row scratch.

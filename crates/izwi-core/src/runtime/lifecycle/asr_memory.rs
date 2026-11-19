@@ -88,6 +88,9 @@ use crate::models::architectures::granite_speech5::asr::{
     GraniteSpeech5LoadRepresentation, GraniteSpeech5Weights,
 };
 use crate::models::architectures::lfm25_audio::conformer::lfm25_audio_conformer_projection;
+use crate::models::architectures::rumble::{
+    ensure_rumble_artifacts, rumble_weight_dtypes, RUMBLE_AUDIO_POSITIONS,
+};
 use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
 use crate::models::architectures::nemotron::asr::{
     nemotron_checkpoint_paths, nemotron_encoder_graph_device_bytes,
@@ -108,7 +111,8 @@ use crate::models::architectures::qwen3::core::{
     qwen3_quantized_projection_grouping_for_hidden_size,
 };
 use crate::models::architectures::qwen3::decode_graph::{
-    qwen3_decode_graph_device_bytes, QWEN3_ASR_DECODE_GRAPHS_ENV, VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
+    qwen3_decode_graph_device_bytes, QWEN3_ASR_DECODE_GRAPHS_ENV, RUMBLE_DECODE_GRAPHS_ENV,
+    VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
 };
 use crate::models::architectures::sortformer::diarization::{
     sortformer_checkpoint_paths, sortformer_extraction_is_current,
@@ -198,6 +202,7 @@ pub(super) fn is_asr_variant(variant: ModelVariant) -> bool {
         variant.family(),
         ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::RumbleAsr
             | ModelFamily::NemotronTranscribeAsr
     )
 }
@@ -287,6 +292,13 @@ pub(super) fn residency_plan(
         }
         _ if variant.family() == ModelFamily::NemotronTranscribeAsr => {
             nemotron_transcribe_plan(model_path, backend)
+        }
+        _ if variant.family() == ModelFamily::RumbleAsr => {
+            // The decoder's CUDA graphs allocate their memory on first use;
+            // only a load with the retained route takes them.
+            let graphs = rumble_decode_graph_device_bytes(backend);
+            rumble_plan(model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::VoxtralMini4BRealtime2602 => {
             // The language model's CUDA decode graphs allocate their memory
@@ -1897,6 +1909,18 @@ pub(super) fn precision_reload_plan(
             };
             plan
         }
+        // A lowered decoder or audio tower that fails its probe reloads at
+        // F32; a load already at F32 has nothing to fall back from.
+        ModelFamily::RumbleAsr => {
+            let (text_dtype, audio_dtype) = rumble_weight_dtypes(device)?;
+            if text_dtype == DType::F32 && audio_dtype == DType::F32 {
+                return Ok(None);
+            }
+            let Some(plan) = rumble_plan(model_path, device, backend, Precision::F32Reload)? else {
+                return Ok(None);
+            };
+            plan
+        }
         _ => return super::tts_memory::precision_reload_plan(variant, model_path, device),
     };
     tracing::info!(
@@ -1906,6 +1930,113 @@ pub(super) fn precision_reload_plan(
         "Priced the F32 reload of a lowered-precision load whose probe failed"
     );
     plan.resource_plan().map(Some)
+}
+
+/// Device bytes Rumble's CUDA decode graphs take on a `backend` load: none
+/// off CUDA, with their switch off, or on a load without the retained route.
+fn rumble_decode_graph_device_bytes(backend: BackendKind) -> u64 {
+    if crate::models::architectures::rumble::rumble_retained_decode_enabled(backend) {
+        qwen3_decode_graph_device_bytes(backend, RUMBLE_DECODE_GRAPHS_ENV)
+    } else {
+        0
+    }
+}
+
+/// Rumble's plan for the checkpoint in `model_path`, or `None` while its
+/// files are missing (the loader reports those).
+fn rumble_plan(
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+    precision: Precision,
+) -> Result<Option<AsrResidencyPlan>> {
+    let Ok(weights) = ensure_rumble_artifacts(model_path) else {
+        return Ok(None);
+    };
+    let Some(files) = census_of(std::slice::from_ref(&weights))? else {
+        return Ok(None);
+    };
+    let (text_dtype, audio_dtype) = match precision {
+        Precision::Selected => rumble_weight_dtypes(device)?,
+        Precision::F32Reload => (DType::F32, DType::F32),
+    };
+    price_rumble(
+        &files,
+        backend,
+        text_dtype,
+        audio_dtype,
+        qwen3_dense_projection_fusion_enabled(&device.device),
+    )
+    .map(Some)
+}
+
+/// Rumble (`RumbleAsrModel::load`): two `VarBuilder`s over the mapped
+/// checkpoint (`staged::metal_synced_safetensors`), the audio tower and
+/// projector at the audio dtype and the decoder (token table, layers, norm;
+/// the head is the token table) at the text dtype, plus the F32 audio
+/// position table built on the host. With fusion, each decoder layer's Q/K/V
+/// and gate/up are concatenated and the device synchronized.
+fn price_rumble(
+    files: &[CensusFile],
+    backend: BackendKind,
+    text_dtype: DType,
+    audio_dtype: DType,
+    fused_projections: bool,
+) -> Result<AsrResidencyPlan> {
+    const AUDIO: [&str; 2] = ["model.audio_tower.", "model.multi_modal_projector."];
+    const TEXT: &str = "model.language_model.";
+    let tensors = by_name(files);
+    let mut ledger = Ledger::synced(backend);
+    let mut grouped = BTreeSet::new();
+    // The audio tower and projector load first; below F32 their load-time
+    // probe reads the output back before the decoder loads.
+    for (name, tensor) in &tensors {
+        if AUDIO.iter().any(|prefix| name.starts_with(prefix)) {
+            ledger.var(tensor, Source::Mapped, &[audio_dtype])?;
+            grouped.insert(*name);
+        }
+    }
+    let d_model = dim(tensor(&tensors, "model.audio_tower.ln_post.weight")?, 0)?;
+    let positions = (RUMBLE_AUDIO_POSITIONS as u64)
+        .checked_mul(d_model)
+        .ok_or_else(overflow)?;
+    ledger.uploaded(positions, DType::F32)?;
+    if audio_dtype != DType::F32 {
+        ledger.barrier()?;
+    }
+    // `Qwen3Model::load_with_layout` reads the token table first; its upload
+    // reaches the sync interval, so the loader synchronizes right after it.
+    let table = format!("{TEXT}embed_tokens.weight");
+    ledger.var(tensor(&tensors, &table)?, Source::Mapped, &[text_dtype])?;
+    grouped.insert(table.as_str());
+    ledger.settle()?;
+    if fused_projections {
+        for name in tensors.keys() {
+            let Some(layer) = name.strip_suffix(".self_attn.q_proj.weight") else {
+                continue;
+            };
+            if !layer.starts_with(TEXT) {
+                continue;
+            }
+            for group in [
+                ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"].as_slice(),
+                ["mlp.gate_proj", "mlp.up_proj"].as_slice(),
+            ] {
+                let parts = group
+                    .iter()
+                    .map(|part| tensor(&tensors, &format!("{layer}.{part}.weight")))
+                    .collect::<Result<Vec<_>>>()?;
+                ledger.fused_exact_then_synced(&parts, Source::Mapped, text_dtype)?;
+                grouped.extend(parts.iter().map(|part| part.name.as_str()));
+            }
+        }
+    }
+    for (name, tensor) in &tensors {
+        if name.starts_with(TEXT) && !grouped.contains(*name) {
+            ledger.var(tensor, Source::Mapped, &[text_dtype])?;
+        }
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
 /// Qwen3-ForcedAligner (`Qwen3AsrModel::load`, safetensors): two
@@ -3883,6 +4014,7 @@ pub(super) mod tests {
                 Box::new(|b| granite_untied(GraniteCheckpointFamily::Speech5, b)),
             ),
             (ModelVariant::GraniteSpeech502BGguf, Box::new(granite5_gguf)),
+            (ModelVariant::Rumble2Flash, Box::new(rumble)),
             (ModelVariant::VibeVoiceAsr, Box::new(vibevoice)),
             (ModelVariant::VoxtralMini4BRealtime2602, Box::new(voxtral)),
             (ModelVariant::Lfm25Audio15BGguf, Box::new(lfm25_audio)),
@@ -3898,6 +4030,51 @@ pub(super) mod tests {
             })
             .collect::<Vec<_>>();
         assert_catalog_figures_cover_empty_devices(&rows);
+    }
+
+    /// Rumble-2-Flash as each backend's loader resolves it by default.
+    fn rumble(backend: BackendKind) -> AsrResidencyPlan {
+        let (text_dtype, audio_dtype) = rumble_weight_dtypes(&profile(backend)).unwrap();
+        price_rumble(
+            &census!("rumble_2_flash.json"),
+            backend,
+            text_dtype,
+            audio_dtype,
+            qwen3_dense_projection_fusion_policy(backend == BackendKind::Metal, None),
+        )
+        .unwrap()
+    }
+
+    /// Rumble's published tensors priced as its loader holds them: every
+    /// tensor once (the head is the token table), F32 on the CPU and Metal,
+    /// and on CUDA a BF16 decoder beside an F32 audio tower and projector.
+    #[test]
+    fn rumble_prices_its_published_census_per_backend() {
+        let _env = env_lock();
+        let files = census!("rumble_2_flash.json");
+        let tensors = by_name(&files);
+        assert_eq!(tensors.len(), 457);
+        let elements = |audio: bool| -> u64 {
+            tensors
+                .iter()
+                .filter(|(name, _)| name.starts_with("model.language_model.") != audio)
+                .map(|(_, tensor)| tensor.shape.iter().map(|dim| *dim as u64).product::<u64>())
+                .sum()
+        };
+        let (audio, text) = (elements(true), elements(false));
+        assert_eq!(audio + text, 508_631_552);
+        let positions = RUMBLE_AUDIO_POSITIONS as u64 * 896 * 4;
+        let cpu = rumble(BackendKind::Cpu).logical_resident_bytes;
+        assert_eq!(cpu, 4 * (audio + text) + positions);
+        let metal = rumble(BackendKind::Metal).logical_resident_bytes;
+        assert_eq!(metal, cpu, "Metal loads the same F32 weights, fused or not");
+        let cuda = rumble(BackendKind::Cuda).logical_resident_bytes;
+        assert_eq!(cuda, 4 * audio + 2 * text + positions);
+        // The F32 reload of the CUDA load is the CPU's resident set.
+        let reload = price_rumble(&files, BackendKind::Cuda, DType::F32, DType::F32, false)
+            .unwrap()
+            .logical_resident_bytes;
+        assert_eq!(reload, cpu);
     }
 
     fn vibevoice(backend: BackendKind) -> AsrResidencyPlan {

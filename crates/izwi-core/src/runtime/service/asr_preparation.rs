@@ -69,6 +69,32 @@ pub(super) fn granite_speech5_decodes_as_row(
         && prompt_tokens < context_limit
 }
 
+/// The decode budget a Rumble request of `prompt_tokens` runs a retained row
+/// with, or `None` when it runs as one atomic invocation instead. The
+/// automatic budget is the checkpoint's generation default; any budget is
+/// narrowed to the room the retained sequence leaves after the prompt, as
+/// the atomic route narrows it to its invocation. The row's KV claim (prompt
+/// and budget) then fits one retained sequence, which the retained pool
+/// always holds, so no row can wait on KV admission for good.
+pub(super) fn rumble_row_budget(
+    request: &EngineCoreRequest,
+    prompt_tokens: usize,
+    context_limit: usize,
+) -> Option<usize> {
+    let room = RUMBLE_SEQUENCE_TOKENS
+        .min(context_limit)
+        .checked_sub(prompt_tokens)
+        .filter(|room| *room > 0)?;
+    let requested = request.params.max_tokens.max(1);
+    let budget = if request.asr_auto_max_tokens {
+        requested.min(RUMBLE_DEFAULT_MAX_NEW_TOKENS)
+    } else {
+        requested
+    }
+    .min(room);
+    RumbleAsrModel::retained_sequence_fits(prompt_tokens, budget).then_some(budget)
+}
+
 /// Decodes a request's audio on the host worker, recording the time as its
 /// model's `decode_audio` phase.
 fn decode_asr_request_audio(request: &EngineCoreRequest) -> Result<(Vec<f32>, u32)> {
@@ -2379,6 +2405,254 @@ impl RuntimeService {
         }
     }
 
+    /// Rumble: decode the audio and plan its route on a host worker. Audio
+    /// of up to 30 s is encoded (through `RumbleEncoderBatcher`) into a
+    /// prompt artifact and runs as a retained row beside other requests;
+    /// longer audio runs on the atomic stage, which chunks it.
+    pub(super) async fn prepare_rumble_asr_shape_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::ASR
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::RumbleAsr)
+            || request.prepared_asr_execution_shape().is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated Rumble variant");
+        let model = self
+            .model_registry
+            .get_asr_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Rumble model {variant} has no effective context"
+                ))
+            })?;
+        let model_for_shape = model.clone();
+        let (prepared, row) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let mut request = request;
+                let (samples, sample_rate) = decode_asr_request_audio(&request)?;
+                let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                    &model_for_shape,
+                    variant,
+                    &request,
+                    Some(context_limit),
+                )?;
+                let plan = crate::engine::asr_route_plan(
+                    &samples,
+                    sample_rate,
+                    &capabilities,
+                    request.streaming,
+                );
+                let options = RumbleRequestOptions {
+                    language: request.asr_language_for_execution().map(str::to_string),
+                    prompt: request.asr_prompt_for_execution().map(str::to_string),
+                    style: RumbleTranscriptStyle::from_request(&request.asr_task.style),
+                };
+                // The log-mel runs here, on a host worker, and travels with
+                // the request, so the device job runs only the encoder. A
+                // single segment runs on the retained route when the loaded
+                // model offers it (`IZWI_RUMBLE_RETAINED_DECODE`).
+                let shaped = (!plan.requires_chunk_path()
+                    && model_for_shape.supports_resumable_prefill())
+                .then(|| {
+                    let started = Instant::now();
+                    let shaped = model_for_shape.rumble_retained_preparation_features(
+                        &samples,
+                        sample_rate,
+                        &options,
+                    );
+                    record_host_features(variant, started);
+                    shaped
+                })
+                .transpose()?
+                .and_then(|(features, geometry)| {
+                    rumble_row_budget(&request, geometry.prompt_tokens, context_limit)
+                        .map(|budget| (features, geometry, budget))
+                });
+                request.install_prepared_asr_audio(variant, samples, sample_rate)?;
+                match shaped {
+                    Some((features, geometry, budget)) => {
+                        // Admission claims the sequence's pages for
+                        // `max_tokens` in full: narrow the budget to the one
+                        // the decode uses, so concurrent rows share the
+                        // retained pool.
+                        request.params.max_tokens = budget;
+                        request.install_prepared_sequence_input_tokens(
+                            geometry.prompt_tokens,
+                            context_limit,
+                        )?;
+                        Ok((request, Some((geometry, options, features))))
+                    }
+                    None => {
+                        request.install_prepared_asr_long_form_atomic(plan)?;
+                        Ok((request, None))
+                    }
+                }
+            })
+            .await?;
+        let retained_host_bytes = u64::try_from(retained_engine_request_input_bytes(&prepared)?)
+            .map_err(|_| {
+                Error::Overloaded("Rumble retained input exceeds u64".into())
+            })?;
+        // The features are held beside the request until the encode drops
+        // them.
+        let features_host_bytes = match &row {
+            Some((_, _, features)) => u64::try_from(std::mem::size_of_val(features.flat.as_slice()))
+                .map_err(|_| Error::Overloaded("Rumble feature bytes overflow".into()))?,
+            None => 0,
+        };
+        let prepared_host_bytes = retained_host_bytes
+            .checked_add(features_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("Rumble prepared host bytes overflow".into())
+            })?;
+        job.record_materialized_usage(JobResourceObservation::host(prepared_host_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let Some((geometry, options, features)) = row else {
+            let (spec, observation) = self.coordinator_job_for_request(&prepared)?;
+            return match self
+                .coordinator
+                .admit_observed_from_preparation(bridge, spec, observation)
+                .await
+            {
+                Ok(job) => Ok((prepared, job)),
+                Err(failure) => {
+                    drop(prepared);
+                    let error = failure.error;
+                    drop(failure.bridge);
+                    Err(error)
+                }
+            };
+        };
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Rumble preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let preparation_contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Asr,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let artifact_host_bytes = geometry.language_bytes;
+        let total_retained_host_bytes = retained_host_bytes
+            .checked_add(artifact_host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("Rumble retained host bytes overflow".into())
+            })?;
+        let resources = asr_encoder_retained_resources(
+            self.backend_router.context().backend_kind,
+            total_retained_host_bytes
+                .checked_add(features_host_bytes)
+                .ok_or_else(|| {
+                    Error::Overloaded("Rumble prepared host bytes overflow".into())
+                })?,
+            geometry.retained_device_bytes,
+        )?;
+        let prep_spec = JobSpec {
+            request_id: prepared.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: prepared.priority,
+            workload_class: prepared.workload_class,
+            deadline: prepared.deadline,
+            resources,
+        };
+        let prep_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                prep_spec,
+                JobResourceObservation::host(prepared_host_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                return Err(error);
+            }
+        };
+        let outcome = self
+            .rumble_encoder_batcher
+            .submit(RumbleEncoderPending {
+                job: prep_job,
+                contract: preparation_contract,
+                model: model.clone(),
+                model_label: variant.dir_name(),
+                features,
+                request: options,
+                geometry,
+                retained_host_bytes: total_retained_host_bytes,
+                artifact_host_bytes,
+                cancellation: PreparationCancellation::default(),
+                response: None,
+            })
+            .await?;
+        let (artifact, bridge) = match outcome {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact.value, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(prepared.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(prepared.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        if artifact.prompt_tokens() != geometry.prompt_tokens
+            || artifact.audio_tokens() != geometry.audio_tokens
+            || artifact.resident_host_bytes() != artifact_host_bytes
+            || artifact.resident_tensor_bytes()? != geometry.retained_device_bytes
+        {
+            drop(artifact);
+            drop(prepared);
+            drop(bridge);
+            return Err(Error::InferenceError(
+                "Rumble artifact drifted from admitted geometry".into(),
+            ));
+        }
+        let mut prepared = prepared;
+        prepared.install_prepared_rumble_artifact(variant, artifact)?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                execution,
+                JobResourceObservation {
+                    host_bytes: total_retained_host_bytes,
+                    accelerator_bytes: geometry.retained_device_bytes,
+                },
+            )
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => {
+                drop(prepared);
+                let error = failure.error;
+                drop(failure.bridge);
+                Err(error)
+            }
+        }
+    }
+
     pub(super) async fn prepare_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -2399,6 +2673,9 @@ impl RuntimeService {
             .await?;
         let (request, job) = self
             .prepare_granite_speech5_asr_shape_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_rumble_asr_shape_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
             .prepare_parakeet_asr_shape_for_binding(request, job, residency_lease)

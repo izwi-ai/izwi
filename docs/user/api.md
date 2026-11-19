@@ -921,6 +921,7 @@ Multipart fields:
 | `target_language` | Izwi extension. Translate the speech into this language instead of transcribing it. Only models with speech translation accept it (`Granite-Speech-5.0-2B` and `Granite-Speech-5.0-2B-GGUF`: into English from fr, de, es, pt, ja, and from English into fr, de, es, pt, ja, it, zh; `Nemotron-3.5-Transcribe-30B-A4B-FP8`: to or from English for 31 of its languages, all but bn, id, mr, tl, ta, te, tr and vi); others return `400`. When `language` is also set, the pair must be one of these. The response `language` is the target. Word timestamps are not available for a translation (`timestamp_granularities[]` with it returns `400`). `Nemotron-3.5-Transcribe-30B-A4B-FP8` translates a recording longer than 30 seconds in segments cut at pauses and joins them in order, since on a long recording in one pass it returns a transcript in the spoken language; a stream then receives one delta per segment. |
 | `keywords` | Izwi extension. Terms to bias recognition toward: repeat the field, or separate terms with commas or newlines (JSON: an array). Only models with keyword biasing accept it (both Granite Speech 5.0 releases, up to 2,000 terms of at most 128 characters; `Nemotron-3.5-Transcribe-30B-A4B-FP8`, up to 64 terms of at most 80 characters, given to the model as "Context terms" with tags removed; not with `target_language`, which returns `400`); others return `400`. A long Granite list shortens the audio one invocation can hold. |
 | `speaker_labels` | Izwi extension. `true` asks a model that tags speakers (`Nemotron-3.5-Transcribe-30B-A4B-FP8`) to label them; others return `400`. Multipart takes `true`/`false` (or `1`/`0`, `yes`/`no`, `on`/`off`), JSON a boolean. The speaker turns come back in `verbose_json` as `speaker_turns` (below); `text` stays untagged. It cannot be combined with `target_language`, and naming a language the model does not label speakers in returns `400`. |
+| `digits`, `filler`, `verbatim` | Izwi extensions for models whose `route_capabilities` report `transcript_style` (`Rumble-2-Flash`); others return `400`. `digits`: write numbers as digits (`true`, the model's default) or as words. `filler`: keep fillers such as "um" and "uh" (`true`) or drop them (default). `verbatim`: keep repeated words (`true`, default) or collapse them. Multipart takes `true`/`false` (or `1`/`0`, `yes`/`no`, `on`/`off`), JSON a boolean; an omitted field leaves the model's default. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
 | `service_tier` | Optional `flex`, `default`, `auto` or `priority`; see [Audio Service Tier](#audio-service-tier). `json` and `verbose_json` answers and the `transcript.text.done` event carry the tier served when it is set. |
@@ -1478,6 +1479,12 @@ Models whose `route_capabilities` report `speech_translation` or
 as does a translation with `include_timestamps` or in speaker-attributed mode.
 The record stores both as `target_language` and `keywords`, keeps the spoken
 `language` the job named, and a retry asks for the same translation.
+
+Transcription jobs also accept `digits`, `filler` and `verbatim`, with the
+same meaning as on `/v1/audio/transcriptions`, for models whose
+`route_capabilities` report `transcript_style` (`Rumble-2-Flash`); others
+return `400`. The record stores the options the job set as
+`transcript_style`, and a retry asks for the same style.
 
 With `include_timestamps` (or `word_timestamps`), a model whose
 `route_capabilities` report `native_word_timestamps`

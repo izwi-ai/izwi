@@ -25,6 +25,7 @@ pub mod qwen3;
 pub mod qwen35;
 pub mod qwen36moe;
 pub mod qwen38;
+pub mod rumble;
 pub mod sortformer;
 pub mod vibevoice;
 pub mod voxtral;

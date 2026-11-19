@@ -321,6 +321,16 @@ impl LoadedModelBundleDraft {
         execution.seal_granite_speech5_asr_preparation(model)
     }
 
+    pub(crate) fn seal_rumble_asr_preparation(
+        &self,
+        model: &crate::models::architectures::rumble::RumbleAsrModel,
+    ) -> Result<()> {
+        let execution = self.capabilities.get(&CapabilityKind::Asr).ok_or_else(|| {
+            Error::ModelLoadError("Rumble loaded bundle has no ASR capability to seal".into())
+        })?;
+        execution.seal_rumble_asr_preparation(model)
+    }
+
     /// Installs each capability's test preparation seal at `max_batch_size`
     /// rows, as a load seals the model's measured preparation.
     #[cfg(test)]

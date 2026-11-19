@@ -80,6 +80,7 @@ Common models:
 | `Maya2-Native-2.5B` | TTS (English and 11 Indic languages, 20 voices, cloning across languages) | ~5.5 GB |
 | `Parakeet-TDT-0.6B-v3` | ASR (default) | ~2.5 GB |
 | `Qwen3-ASR-0.6B-GGUF` | ASR (compact) | ~1.0 GB |
+| `Rumble-2-Flash` | ASR (Reson8, compact multilingual, transcript style options) | ~1.0 GB |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | ASR (NVIDIA multilingual `.nemo`) | ~2.37 GB |
 | `Granite-Speech-4.1-2B-Plus` | ASR (IBM rich transcription) | ~4.2 GB |
 | `Granite-Speech-5.0-2B` | ASR and speech translation (IBM) | ~4.6 GB |

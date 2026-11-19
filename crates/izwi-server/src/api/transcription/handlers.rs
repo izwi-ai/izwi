@@ -56,7 +56,7 @@ use async_trait::async_trait;
 use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, AsrTaskOptions,
-    RuntimeRequestContext, RuntimeService, WindowedAlignment, WorkloadClass,
+    AsrTranscriptStyle, RuntimeRequestContext, RuntimeService, WindowedAlignment, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -102,6 +102,8 @@ struct ParsedTranscriptionCreateRequest {
     target_language: Option<String>,
     /// Terms to bias recognition toward (models with keyword biasing).
     keywords: Vec<String>,
+    /// How the transcript is written (models with style options).
+    style: AsrTranscriptStyle,
     include_timestamps: bool,
     stream: bool,
     generate_summary: bool,
@@ -112,6 +114,7 @@ struct ParsedTranscriptionCreateRequest {
 impl ParsedTranscriptionCreateRequest {
     fn task(&self) -> AsrTaskOptions {
         AsrTaskOptions::new(self.target_language.clone(), self.keywords.clone())
+            .with_style(self.style)
     }
 }
 
@@ -127,6 +130,8 @@ struct BatchTranscriptionRequest {
     target_language: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     keywords: Vec<String>,
+    #[serde(default, skip_serializing_if = "AsrTranscriptStyle::is_default")]
+    style: AsrTranscriptStyle,
     include_timestamps: bool,
     generate_summary: bool,
     min_speakers: Option<usize>,
@@ -144,6 +149,7 @@ impl BatchTranscriptionRequest {
             language: parsed.language.clone(),
             target_language: parsed.target_language.clone(),
             keywords: parsed.keywords.clone(),
+            style: parsed.style,
             include_timestamps: parsed.include_timestamps,
             generate_summary: parsed.generate_summary,
             min_speakers: parsed.min_speakers,
@@ -164,6 +170,7 @@ impl BatchTranscriptionRequest {
             language: self.language,
             target_language: self.target_language,
             keywords: self.keywords,
+            style: self.style,
             include_timestamps: self.include_timestamps,
             stream: false,
             generate_summary: self.generate_summary,
@@ -188,6 +195,12 @@ struct JsonCreateRequest {
     target_language: Option<String>,
     #[serde(default)]
     keywords: Option<KeywordsField>,
+    #[serde(default)]
+    digits: Option<bool>,
+    #[serde(default)]
+    filler: Option<bool>,
+    #[serde(default)]
+    verbatim: Option<bool>,
     #[serde(default)]
     include_timestamps: Option<bool>,
     #[serde(default)]
@@ -458,6 +471,7 @@ fn retry_create_request(
         language: source.language.clone(),
         target_language: source.target_language.clone(),
         keywords: source.keywords.clone(),
+        style: source.transcript_style,
         // Timed by an aligner, or by the model itself (no aligner id).
         include_timestamps: source.aligner_model_id.is_some() || !source.words.is_empty(),
         stream: false,
@@ -664,6 +678,7 @@ async fn create_pending_record(
             language: parsed.language.clone(),
             target_language: parsed.target_language.clone(),
             keywords: parsed.keywords.clone(),
+            transcript_style: parsed.style,
             processing_status: TranscriptionProcessingStatus::Pending,
             processing_error: None,
             processing_progress: None,
@@ -1783,6 +1798,11 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                 .keywords
                 .map(KeywordsField::into_keywords)
                 .unwrap_or_default(),
+            style: AsrTranscriptStyle {
+                digits: payload.digits,
+                filler: payload.filler,
+                verbatim: payload.verbatim,
+            },
             include_timestamps: payload
                 .include_timestamps
                 .or(payload.word_timestamps)
@@ -1886,6 +1906,20 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     })?;
                     out.keywords.extend(split_keywords(&text));
                 }
+                "digits" | "filler" | "verbatim" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart '{name}' field: {e}"
+                        ))
+                    })?;
+                    // An empty field leaves the model's default.
+                    let value = (!text.trim().is_empty()).then(|| parse_bool(text.as_str()));
+                    match name.as_str() {
+                        "digits" => out.style.digits = value,
+                        "filler" => out.style.filler = value,
+                        _ => out.style.verbatim = value,
+                    }
+                }
                 "include_timestamps" | "word_timestamps" => {
                     let text = field.text().await.map_err(|e| {
                         ApiError::bad_request(format!(
@@ -1978,7 +2012,8 @@ fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Resu
         Some(model_id),
         parsed.language.as_deref(),
         None,
-        &AsrTaskOptions::new(parsed.target_language.clone(), parsed.keywords.clone()),
+        &AsrTaskOptions::new(parsed.target_language.clone(), parsed.keywords.clone())
+            .with_style(parsed.style),
         false,
     )?;
     parsed.aligner_model_id = None;
@@ -2320,6 +2355,7 @@ mod tests {
                 language: None,
                 target_language: None,
                 keywords: Vec::new(),
+                transcript_style: Default::default(),
                 processing_status: Default::default(),
                 processing_error: None,
                 processing_progress: None,
@@ -2527,6 +2563,22 @@ mod tests {
             serde_json::to_value(BatchTranscriptionRequest::from_parsed(&plain)).unwrap();
         assert!(snapshot.get("target_language").is_none());
         assert!(snapshot.get("keywords").is_none());
+        assert!(snapshot.get("style").is_none());
+
+        let styled = ParsedTranscriptionCreateRequest {
+            style: izwi_core::AsrTranscriptStyle {
+                digits: Some(false),
+                ..Default::default()
+            },
+            ..ParsedTranscriptionCreateRequest::default()
+        };
+        let snapshot =
+            serde_json::to_value(BatchTranscriptionRequest::from_parsed(&styled)).unwrap();
+        assert_eq!(snapshot["style"], serde_json::json!({ "digits": false }));
+        let restored: BatchTranscriptionRequest = serde_json::from_value(snapshot).unwrap();
+        let restored = restored.into_parsed();
+        assert_eq!(restored.style, styled.style);
+        assert_eq!(restored.task().style.digits, Some(false));
 
         let translated = ParsedTranscriptionCreateRequest {
             target_language: Some("English".to_string()),
@@ -2685,6 +2737,69 @@ mod tests {
             .expect("request should parse");
         assert_eq!(parsed.target_language.as_deref(), Some("de"));
         assert_eq!(parsed.keywords, vec!["Izwi", "Granite", "Agentic AI"]);
+    }
+
+    #[tokio::test]
+    async fn create_requests_read_the_transcript_style() {
+        let request = axum::http::Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": wav_data_url("audio/wav"),
+                    "model": "Rumble-2-Flash",
+                    "digits": false,
+                    "verbatim": false
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+        let mut parsed = parse_create_request(request)
+            .await
+            .expect("request should parse");
+        assert_eq!(parsed.style.digits, Some(false));
+        assert_eq!(parsed.style.filler, None);
+        assert_eq!(parsed.style.verbatim, Some(false));
+        prepare_create_request(&mut parsed).expect("Rumble takes a transcript style");
+
+        let boundary = "izwi-transcription-boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&wav_bytes());
+        for (name, value) in [
+            ("model", "Parakeet-TDT-0.6B-v3"),
+            ("filler", "true"),
+            ("digits", ""),
+        ] {
+            body.extend_from_slice(
+                format!(
+                    "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .expect("request should build");
+        let mut parsed = parse_create_request(request)
+            .await
+            .expect("request should parse");
+        assert_eq!(parsed.style.filler, Some(true));
+        assert_eq!(parsed.style.digits, None);
+        // A model without style options refuses a set field.
+        assert_eq!(
+            prepare_create_request(&mut parsed).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]

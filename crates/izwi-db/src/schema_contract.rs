@@ -168,6 +168,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "owner_node_id",
             "target_language",
             "keywords_json",
+            "transcript_style_json",
         ],
     },
     RequiredSchemaTable {

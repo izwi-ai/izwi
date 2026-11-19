@@ -319,6 +319,7 @@ impl ModelVariant {
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::RumbleAsr
             | ModelFamily::SortformerDiarization
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm3Chat
@@ -395,6 +396,7 @@ impl ModelVariant {
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::RumbleAsr
             | ModelFamily::NemotronTranscribeAsr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Lfm3Audio
@@ -536,6 +538,10 @@ impl ModelVariant {
                 CudaSupportLevel::CandleCudaGeneric,
                 "Granite Speech 5.0 ASR uses dense Candle CUDA tensor kernels for the audio encoder, Q-Former projector, and YaRN Granite decoder once the native loader is selected; its RoPE tables are built on the host",
             ),
+            ModelFamily::RumbleAsr => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Rumble ASR runs its audio tower and projector on dense Candle CUDA tensor kernels in F32 and its Qwen3 text trunk in BF16 over paged KV once the native loader is selected; the mel front end runs on the host",
+            ),
             ModelFamily::NemotronTranscribeAsr => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
                 "Nemotron 3.5 Transcribe runs on Candle CUDA tensor kernels: its ModelOpt FP8 projections stay resident as raw E4M3 on the compact FP8 kernels (BF16 activations, W8A16, SM80+), runs the Mamba2 selective scan in an Izwi CUDA kernel with F32 state, routes the sigmoid MoE in F32 on the host and attends over paged KV; the mel front end, window plan and Sortformer cache bookkeeping run on the host; source review is not runtime validation",
@@ -646,6 +652,10 @@ impl ModelVariant {
             ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
                 "Granite Speech ships dense BF16 safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
+            ),
+            ModelFamily::RumbleAsr => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::Dense,
+                "Rumble ships dense BF16 safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
             ),
             ModelFamily::ChatterboxTts => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,

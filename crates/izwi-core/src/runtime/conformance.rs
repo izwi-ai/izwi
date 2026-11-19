@@ -13,9 +13,9 @@ use crate::backends::BackendKind;
 use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 57;
+pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 58;
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 85;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 86;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformanceExecutionClass {
@@ -442,7 +442,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            76
+            77
         );
         assert_eq!(
             manifest
@@ -613,5 +613,10 @@ mod tests {
                 1
             );
         }
+        // Rumble retains decoder pages for rows of up to 30 s and leases
+        // them for longer audio's atomic invocations.
+        let rumble = manifest_case(&manifest, ModelVariant::Rumble2Flash, CapabilityKind::Asr);
+        assert_eq!(rumble.retained_state, Managed);
+        assert_eq!(rumble.workspace, InvocationStateRequired);
     }
 }

@@ -170,6 +170,11 @@ function isGraniteSpeech5AsrVariant(variant: string): boolean {
   );
 }
 
+function isRumbleAsrVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return normalized === "rumble-2-flash" || normalized === "reson8/rumble-2-flash";
+}
+
 function isQwenAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -269,10 +274,11 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "transcription",
     label: "Transcription",
     description:
-      "Speech-to-text with Qwen3-ASR, Granite Speech, Nemotron ASR, Nemotron 3.5 Transcribe, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, and LFM3 Audio models",
+      "Speech-to-text with Qwen3-ASR, Rumble, Granite Speech, Nemotron ASR, Nemotron 3.5 Transcribe, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, and LFM3 Audio models",
     icon: "FileText",
     modelFilter: (variant) =>
       isQwenAsrVariant(variant) ||
+      isRumbleAsrVariant(variant) ||
       isGraniteSpeechAsrVariant(variant) ||
       isGraniteSpeech5AsrVariant(variant) ||
       isNemotronAsrVariant(variant) ||
@@ -285,7 +291,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isLfm3AudioVariant(variant),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
-      "Download and load a Qwen3-ASR, Granite Speech, Nemotron ASR, Nemotron 3.5 Transcribe, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, or LFM3 Audio model for speech transcription",
+      "Download and load a Qwen3-ASR, Rumble, Granite Speech, Nemotron ASR, Nemotron 3.5 Transcribe, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, or LFM3 Audio model for speech transcription",
   },
   chat: {
     id: "chat",

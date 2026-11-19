@@ -30,6 +30,10 @@ pub enum ModelFamily {
     /// Granite Speech 5.0: the 4.1 encoder, projector and Granite LM shapes
     /// with a YaRN language model and its own prompt contract.
     GraniteSpeech5Asr,
+    /// Reson8 Rumble: a windowed audio tower and projector feeding a Qwen3
+    /// text trunk, with its own vocabulary and prompt contract (transcript
+    /// style control tokens). Its own family.
+    RumbleAsr,
     /// Nemotron 3.5 Transcribe: a Parallel Expert Encoder (Transformer ASR
     /// encoder and a streaming Sortformer) over a Nemotron-H Mamba2/MoE
     /// decoder; one pass over up to an hour of audio.
@@ -67,6 +71,7 @@ impl ModelFamily {
             | Self::VibeVoiceAsr
             | Self::GraniteSpeechAsr
             | Self::GraniteSpeech5Asr
+            | Self::RumbleAsr
             | Self::NemotronTranscribeAsr
             | Self::Lfm25Audio
             | Self::Lfm3Audio
@@ -100,9 +105,9 @@ impl ModelFamily {
     /// of one file instead of holding it for the whole file. The chunks run
     /// on the chunk executor, whose state between chunks is host-only.
     /// VibeVoice's load-sealed state spec authenticates its long-form graph
-    /// as one atomic stage; offline Voxtral and Nemotron plan their chunks
-    /// inside the dispatch (no prepared long-form route); Parakeet never
-    /// chunks. Those keep one dispatch per file.
+    /// as one atomic stage; offline Voxtral, Nemotron and Rumble plan their
+    /// chunks inside the dispatch (no prepared long-form route); Parakeet
+    /// never chunks. Those keep one dispatch per file.
     pub fn dispatches_long_form_asr_by_chunk(self) -> bool {
         matches!(
             self,
@@ -143,6 +148,14 @@ impl ModelFamily {
         )
     }
 
+    /// Whether one ASR invocation may fill the model's audio window to its
+    /// last sample, with no planning margin: the window is a fixed feature
+    /// window the model checks itself, and a full one always fits the
+    /// model's own sequence. Rumble's 30 s window is such a window.
+    pub fn asr_single_pass_fills_invocation_window(self) -> bool {
+        matches!(self, Self::RumbleAsr)
+    }
+
     /// Whether the chunked ASR route can stream this family's text token by
     /// token while a chunk decodes. Granite's chunk decode replays earlier
     /// text as a prefix and may re-decode a looping chunk, so its chunk text is
@@ -153,6 +166,7 @@ impl ModelFamily {
             self,
             Self::WhisperAsr
                 | Self::Qwen3Asr
+                | Self::RumbleAsr
                 | Self::VibeVoiceAsr
                 | Self::ParakeetAsr
                 | Self::NemotronAsr
@@ -421,6 +435,7 @@ impl ModelVariant {
             Nemotron35AsrStreaming06B => ModelFamily::NemotronAsr,
             GraniteSpeech412B | GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
             GraniteSpeech502B | GraniteSpeech502BGguf => ModelFamily::GraniteSpeech5Asr,
+            Rumble2Flash => ModelFamily::RumbleAsr,
             Nemotron35Transcribe30BA4BFp8 => ModelFamily::NemotronTranscribeAsr,
             DiarStreamingSortformer4SpkV21 | Nemotron3Diarization => {
                 ModelFamily::SortformerDiarization
@@ -460,6 +475,7 @@ impl ModelVariant {
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::RumbleAsr
             | ModelFamily::NemotronTranscribeAsr => ModelTask::Asr,
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
@@ -556,6 +572,13 @@ fn is_nemotron_transcribe(normalized: &str) -> bool {
             .any(|other| normalized.contains(other))
 }
 
+/// Whether a normalized id names Reson8's Rumble (the catalog carries
+/// Rumble-2-Flash). Checked before the Qwen heuristics: the checkpoint's
+/// `qwen3_asr` model type must never route it to the Qwen3-ASR family.
+fn is_rumble(normalized: &str) -> bool {
+    normalized.contains("rumble")
+}
+
 pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
     use ModelVariant::*;
 
@@ -576,6 +599,8 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
                 Nemotron35Transcribe30BA4BFp8
             } else if normalized.contains("nemotron") && normalized.contains("asr") {
                 Nemotron35AsrStreaming06B
+            } else if is_rumble(&normalized) {
+                Rumble2Flash
             } else if let Some(granite_speech) = resolve_granite_speech_variant(&normalized) {
                 granite_speech
             } else if normalized.contains("vibevoice") && normalized.contains("asr") {
@@ -775,6 +800,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
 
     if normalized.contains("forcedaligner") {
         return Some(Qwen3ForcedAligner06B);
+    }
+
+    if is_rumble(normalized) {
+        return Some(Rumble2Flash);
     }
 
     if let Some(qwen_asr) = resolve_qwen3_asr_variant(normalized) {
@@ -1563,6 +1592,41 @@ mod tests {
         let granite = ModelVariant::GraniteSpeech412BPlus;
         assert!(granite.runs_speaker_attributed_asr_capability());
         assert!(!granite.supports_asr_speaker_tags());
+    }
+
+    #[test]
+    fn rumble_names_resolve_to_rumble_and_never_to_qwen3_asr() {
+        for input in [
+            "Rumble-2-Flash",
+            "Reson8/Rumble-2-Flash",
+            "rumble-2-flash",
+            "Rumble 2 Flash",
+        ] {
+            assert_eq!(
+                parse_model_variant(input).unwrap(),
+                ModelVariant::Rumble2Flash,
+                "{input}"
+            );
+        }
+        // Ids that also carry the checkpoint's `qwen3_asr` model type or a
+        // size the Qwen heuristics key on.
+        for input in ["rumble_2_flash", "rumble-2-flash-0.6b", "qwen3-asr-rumble-2-flash"] {
+            assert_eq!(
+                resolve_asr_model_variant(Some(input)),
+                ModelVariant::Rumble2Flash,
+                "{input}"
+            );
+        }
+        assert_eq!(ModelVariant::Rumble2Flash.family(), ModelFamily::RumbleAsr);
+        assert!(ModelFamily::RumbleAsr.hallucinates_on_non_speech());
+        assert!(!ModelFamily::RumbleAsr.dispatches_long_form_asr_by_chunk());
+        assert!(ModelFamily::RumbleAsr.asr_streams_within_chunk());
+        assert!(!ModelFamily::RumbleAsr.asr_fixed_encoder_window());
+        // Qwen3-ASR ids keep resolving to Qwen3-ASR.
+        assert_eq!(
+            resolve_asr_model_variant(Some("qwen3-asr-0.6b")),
+            ModelVariant::Qwen3Asr06BGguf
+        );
     }
 
     #[test]

@@ -37,6 +37,8 @@ use crate::kv::KvArenaId;
 pub(crate) const QWEN3_ASR_DECODE_GRAPHS_ENV: &str = "IZWI_QWEN3_ASR_DECODE_GRAPHS";
 /// VibeVoice-ASR's kill switch (a boolean; on when unset).
 pub(crate) const VIBEVOICE_ASR_DECODE_GRAPHS_ENV: &str = "IZWI_VIBEVOICE_ASR_DECODE_GRAPHS";
+/// Rumble's switch: its decoder is this trunk.
+pub(crate) const RUMBLE_DECODE_GRAPHS_ENV: &str = "IZWI_RUMBLE_DECODE_GRAPHS";
 
 const MIB: u64 = 1024 * 1024;
 
@@ -184,7 +186,11 @@ mod tests {
         let _env = crate::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for switch in [QWEN3_ASR_DECODE_GRAPHS_ENV, VIBEVOICE_ASR_DECODE_GRAPHS_ENV] {
+        for switch in [
+            QWEN3_ASR_DECODE_GRAPHS_ENV,
+            VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
+            RUMBLE_DECODE_GRAPHS_ENV,
+        ] {
             assert_eq!(qwen3_decode_graph_device_bytes(BackendKind::Cpu, switch), 0);
             assert_eq!(
                 qwen3_decode_graph_device_bytes(BackendKind::Metal, switch),

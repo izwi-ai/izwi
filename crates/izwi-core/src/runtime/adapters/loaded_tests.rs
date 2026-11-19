@@ -742,6 +742,10 @@ fn every_supported_model_capability_authors_an_exact_width_one_contract() {
                 assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
             } else if factory.id() == LoadedAdapterKind::FishS2Tts.factory_id()
                 || factory.id() == LoadedAdapterKind::FishDrama3Tts.factory_id()
+                || (factory.id() == LoadedAdapterKind::RumbleAsr.factory_id()
+                    && !crate::models::architectures::rumble::rumble_retained_decode_enabled(
+                        BackendKind::Cpu,
+                    ))
             {
                 // The factory implements native batching, but an unqualified
                 // scalar load must publish the scalar graph truthfully.
@@ -1263,6 +1267,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                             variant.family(),
                             crate::catalog::ModelFamily::GraniteSpeechAsr
                                 | crate::catalog::ModelFamily::GraniteSpeech5Asr
+                                | crate::catalog::ModelFamily::RumbleAsr
                         );
                     let whisper_asr = execution.metadata().capability == CapabilityKind::Asr
                         && variant.family() == crate::catalog::ModelFamily::WhisperAsr;
@@ -3073,6 +3078,117 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
             .stages
             .iter()
             .all(|stage| stage.output_visibility == OutputVisibility::AfterQuantumCommit));
+    }
+}
+
+/// Rumble's normal requirement (with or without native streaming) binds its
+/// retained sequence graph: encoder preparation batched at the engine rows,
+/// scalar exact prefill, and continuous decode priced per row. A long-form
+/// requirement binds the atomic stage, which chunks long audio inside its
+/// dispatch; with the retained route off (the default on CPU and Metal) it
+/// is the only graph. The model authors state for both graphs.
+#[test]
+fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
+    use crate::models::architectures::rumble::{
+        rumble_retained_decode_enabled, rumble_test_physical_state_spec,
+    };
+    for (backend, rows) in [
+        (BackendKind::Cpu, 1),
+        (BackendKind::Metal, 1),
+        (BackendKind::Cuda, 4),
+    ] {
+        // On by default on CUDA only.
+        let retained_route = rumble_retained_decode_enabled(backend);
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(rows, 1).unwrap(),
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            ModelVariant::Rumble2Flash,
+            backend,
+        )
+        .unwrap();
+        install_test_preparation_seals(&draft, backend, rows);
+        let adapter = draft.capabilities.get(&CapabilityKind::Asr).unwrap();
+        let long = adapter
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long.stages.len(), 1);
+        let stage = &long.stages[0];
+        assert_eq!(stage.name, "asr.rumble.long_form.atomic");
+        assert_eq!(stage.selector, StageWorkSelector::Atomic);
+        assert_eq!(stage.progress, StageProgressKind::Atomic);
+        for streaming in [
+            StreamingRequirements::NONE,
+            StreamingRequirements::transport_only(),
+            StreamingRequirements::native(true),
+        ] {
+            let normal = adapter.contract(streaming).unwrap();
+            if !retained_route {
+                // The atomic graph, as the same transport's long-form
+                // requirement binds it.
+                let long = adapter
+                    .contract(streaming.with_asr_long_form(true))
+                    .unwrap();
+                assert_eq!(normal.execution_profile.mode, ExecutionMode::Atomic);
+                assert_eq!(
+                    crate::kv::v2::stage_graph_fingerprint(&normal.stages).unwrap(),
+                    crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),
+                );
+                continue;
+            }
+            assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+            let names = normal
+                .stages
+                .iter()
+                .map(|stage| (stage.name.as_str(), stage.selector))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec![
+                    (
+                        "asr.encoder.rumble",
+                        StageWorkSelector::PreSequencePreparation
+                    ),
+                    (
+                        "asr.rumble.prefill.scalar",
+                        StageWorkSelector::SequencePrefill
+                    ),
+                    (
+                        "asr.rumble.decode.tensor_continuous",
+                        StageWorkSelector::SequenceDecode
+                    ),
+                ]
+            );
+            // The encoder batches at the engine rows, as a ragged batch
+            // with no padding; one row stays scalar and exact.
+            let preparation = &normal.stages[0];
+            assert_eq!(preparation.max_batch_size, rows);
+            assert_eq!(preparation.max_work_units, 10_000 * rows as u64);
+            assert_eq!(preparation.max_padding_basis_points, 0);
+            if rows > 1 {
+                assert_eq!(preparation.batch_mode, NativeBatchMode::Static);
+                assert_eq!(preparation.shape_policy, StageShapePolicy::Ragged);
+                assert_eq!(preparation.concurrency, ConcurrencyClass::Batchable);
+            } else {
+                assert_eq!(preparation.batch_mode, NativeBatchMode::None);
+                assert_eq!(preparation.shape_policy, StageShapePolicy::Exact);
+                assert_eq!(preparation.concurrency, ConcurrencyClass::Exclusive);
+            }
+            assert_eq!(normal.stages[1].max_batch_size, 1);
+            let decode = &normal.stages[2];
+            assert_eq!(decode.batch_mode, NativeBatchMode::Continuous);
+            assert!(decode.max_batch_size >= rows);
+            assert!(decode.workspace_per_row_bytes > 0);
+            assert_eq!(
+                decode.max_workspace_bytes,
+                decode.workspace_per_row_bytes * decode.max_batch_size as u64
+            );
+            let spec =
+                rumble_test_physical_state_spec(&[normal.stages.as_ref(), long.stages.as_ref()])
+                    .unwrap();
+            assert!(spec.retained.is_some());
+        }
     }
 }
 

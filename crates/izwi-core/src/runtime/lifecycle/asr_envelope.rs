@@ -308,6 +308,29 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             forced_alignment: None,
             encoder_rel_pos: None,
         },
+        // Rumble's audio tower after its ×8 convolution stem: 13 positions
+        // per second in 8 s attention windows, into a 14-layer decoder over
+        // a 99,630-token vocabulary.
+        _ if variant.family() == ModelFamily::RumbleAsr => AsrEnvelopeGeometry {
+            max_chunk_secs: CHUNK_SECS,
+            encoder_positions_per_sec: 13.0,
+            encoder_window_secs: Some(8.0),
+            encoder: stack(896, 3584, 14),
+            audio_tokens_per_sec: 13.0,
+            prompt_tokens: PROMPT_TEXT_TOKENS,
+            decoder: stack(1024, 3072, 16),
+            vocab: 99_630,
+            conv_stem: Some(ConvStemGeometry {
+                channels: 480,
+                mel_bins: MEL_BINS,
+                chunk_frames: MEL_FRAMES_PER_SEC,
+                output_rows: MEL_BINS / 8,
+                output_frames: 13,
+                conv_chunksize: 500,
+            }),
+            forced_alignment: None,
+            encoder_rel_pos: None,
+        },
         // The audio tower of Qwen3-ASR-1.7B (104-position ≈ 8 s attention
         // windows after the ×8 stem) under a 5,000-class timestamp head; the
         // prompt is the window's audio and about 3.5 tokens per word.
@@ -381,6 +404,13 @@ pub(crate) fn minimum_sequence_tokens(variant: ModelVariant) -> Option<u64> {
         ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
             asr_sequence_ceiling(PROMPT, rate, PLANNED_CHUNK_SECS, 768)
         }
+        // One planned chunk with the checkpoint's default decode budget.
+        _ if variant.family() == ModelFamily::RumbleAsr => asr_sequence_ceiling(
+            PROMPT,
+            rate,
+            PLANNED_CHUNK_SECS,
+            crate::models::architectures::rumble::RUMBLE_DEFAULT_MAX_NEW_TOKENS,
+        ),
         _ if variant.family() == ModelFamily::GraniteSpeechAsr => asr_sequence_ceiling(
             PROMPT,
             rate,
@@ -784,6 +814,11 @@ fn decoder_kv_geometry(variant: ModelVariant) -> Option<DecoderKvGeometry> {
                 kv_width: 512,
             }
         }
+        // Rumble's Qwen3 trunk: 14 layers, 8 KV heads of 128.
+        ModelVariant::Rumble2Flash => DecoderKvGeometry {
+            layers: 14,
+            kv_width: 1024,
+        },
         _ => return None,
     })
 }
@@ -884,7 +919,8 @@ pub(crate) fn cuda_decode_row_bytes(variant: ModelVariant) -> Result<Option<u64>
 mod tests {
     use super::*;
 
-    const ENVELOPE_VARIANTS: [ModelVariant; 11] = [
+    const ENVELOPE_VARIANTS: [ModelVariant; 12] = [
+        ModelVariant::Rumble2Flash,
         ModelVariant::WhisperLargeV3Turbo,
         ModelVariant::Qwen3Asr06BGguf,
         ModelVariant::Qwen3Asr17BGguf,
@@ -1179,6 +1215,7 @@ mod tests {
                         | ModelFamily::Voxtral
                         | ModelFamily::GraniteSpeechAsr
                         | ModelFamily::GraniteSpeech5Asr
+                        | ModelFamily::RumbleAsr
                 );
             assert_eq!(row(variant).is_some(), wide, "{variant}");
         }
@@ -1303,6 +1340,28 @@ mod tests {
         }
     }
 
+    /// A Rumble row holds 14 layers' BF16 K and V and a BF16 prompt
+    /// embedding over its 1,051-token minimum sequence (the 128-token prompt
+    /// reserve, one window's audio tokens and its 512-token budget) and an
+    /// F32 logits row: about 59 MiB, so 32 rows take about 1.9 GiB.
+    #[test]
+    fn a_rumble_cuda_decode_row_is_priced_for_the_width_fit() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        let rumble = cuda_decode_row_bytes(ModelVariant::Rumble2Flash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rumble, 1_051 * (2 * 14 * 1024 * 2 + 1024 * 2) + 99_630 * 4);
+        assert_eq!(rumble / MIB, 59);
+        for (headroom, width) in [(70 * GIB, 32), (13 * GIB, 32), (3 * GIB, 16), (GIB, 8)] {
+            assert_eq!(
+                crate::catalog::fit_asr_decode_width(32, 8, rumble, headroom),
+                width,
+                "{headroom}"
+            );
+        }
+    }
+
     /// The pinned decoder KV widths match the checkpoints' K projections.
     #[test]
     fn decoder_kv_geometry_matches_the_checkpoint_census() {
@@ -1363,6 +1422,11 @@ mod tests {
                     "../../../tests/fixtures/asr_residency/granite_speech_5_0_2b_gguf_q8_0.json"
                 ),
                 "blk.{i}.attn_k.weight",
+            ),
+            (
+                ModelVariant::Rumble2Flash,
+                include_str!("../../../tests/fixtures/asr_residency/rumble_2_flash.json"),
+                "model.language_model.layers.{i}.self_attn.k_proj.weight",
             ),
         ] {
             let geometry = decoder_kv_geometry(variant).unwrap();

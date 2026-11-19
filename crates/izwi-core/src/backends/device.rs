@@ -672,7 +672,9 @@ impl DeviceProfile {
                     })
                 }
             }
-            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr => {
+            ModelFamily::GraniteSpeechAsr
+            | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::RumbleAsr => {
                 if self.capabilities.supports_bf16 {
                     Some(DTypeSelection {
                         dtype: DType::BF16,

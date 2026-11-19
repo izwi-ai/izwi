@@ -466,6 +466,48 @@ describe("viewport-safe creation dialogs", () => {
     ).toBeInTheDocument();
   });
 
+  it("offers transcript style options only to a model that takes them", () => {
+    const props = {
+      isOpen: true,
+      onClose: vi.fn(),
+      selectedModelReady: true,
+      timestampAlignerModelId: "Qwen3-ForcedAligner-0.6B",
+      timestampAlignerReady: true,
+      onOpenModelManager: vi.fn(),
+      onModelRequired: vi.fn(),
+      onTimestampAlignerRequired: vi.fn(),
+      onCreated: vi.fn(),
+    };
+    const { rerender } = render(
+      <NewTranscriptionModal {...props} selectedModel="Qwen3-ASR-0.6B-GGUF" />,
+    );
+    expect(
+      screen.queryByRole("switch", { name: /Numbers as digits/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("switch", { name: /Keep filler words/i }),
+    ).not.toBeInTheDocument();
+
+    rerender(
+      <NewTranscriptionModal
+        {...props}
+        selectedModel="Rumble-2-Flash"
+        selectedModelSupportsTranscriptStyle
+      />,
+    );
+    // The switches start at the model's own defaults.
+    expect(screen.getByRole("switch", { name: /Numbers as digits/i })).toBeChecked();
+    expect(
+      screen.getByRole("switch", { name: /Keep filler words/i }),
+    ).not.toBeChecked();
+    expect(
+      screen.getByRole("switch", { name: /Keep repeated words/i }),
+    ).toBeChecked();
+    // Rumble takes no translation target or keyword list.
+    expect(screen.queryByLabelText("Translate to")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Keywords")).not.toBeInTheDocument();
+  });
+
   it("keeps the diarization title, capture actions, and final setting reachable", () => {
     render(
       <NewDiarizationModal

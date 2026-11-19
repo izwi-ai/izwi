@@ -5858,6 +5858,7 @@ mod tests {
             ModelFamily::VoxtralTts,
             ModelFamily::GraniteSpeechAsr,
             ModelFamily::GraniteSpeech5Asr,
+            ModelFamily::RumbleAsr,
         ] {
             assert!(stage_sets_batch_rows(family), "{family:?}");
         }

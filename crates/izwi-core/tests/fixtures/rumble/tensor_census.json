@@ -1,0 +1,2967 @@
+{
+"file": "model.safetensors",
+"revision": "92ec9141fb1178c5e77fd0020fe86a33c355060b",
+"tensors": {
+"model.audio_tower.conv2d1.bias": {
+"dtype": "BF16",
+"shape": [
+480
+]
+},
+"model.audio_tower.conv2d1.weight": {
+"dtype": "BF16",
+"shape": [
+480,
+1,
+3,
+3
+]
+},
+"model.audio_tower.conv2d2.bias": {
+"dtype": "BF16",
+"shape": [
+480
+]
+},
+"model.audio_tower.conv2d2.weight": {
+"dtype": "BF16",
+"shape": [
+480,
+480,
+3,
+3
+]
+},
+"model.audio_tower.conv2d3.bias": {
+"dtype": "BF16",
+"shape": [
+480
+]
+},
+"model.audio_tower.conv2d3.weight": {
+"dtype": "BF16",
+"shape": [
+480,
+480,
+3,
+3
+]
+},
+"model.audio_tower.conv_out.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+7680
+]
+},
+"model.audio_tower.layers.0.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.0.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.0.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.0.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.0.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.0.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.0.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.0.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.0.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.0.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.0.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.0.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.0.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.0.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.0.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.0.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.1.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.1.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.1.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.1.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.1.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.1.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.1.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.1.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.1.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.1.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.1.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.1.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.1.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.1.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.1.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.1.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.10.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.10.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.10.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.10.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.10.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.10.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.10.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.10.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.10.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.10.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.10.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.10.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.10.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.10.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.10.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.10.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.11.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.11.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.11.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.11.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.11.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.11.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.11.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.11.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.11.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.11.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.11.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.11.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.11.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.11.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.11.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.11.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.12.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.12.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.12.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.12.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.12.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.12.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.12.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.12.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.12.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.12.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.12.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.12.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.12.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.12.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.12.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.12.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.13.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.13.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.13.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.13.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.13.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.13.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.13.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.13.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.13.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.13.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.13.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.13.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.13.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.13.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.13.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.13.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.14.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.14.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.14.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.14.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.14.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.14.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.14.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.14.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.14.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.14.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.14.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.14.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.14.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.14.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.14.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.14.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.15.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.15.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.15.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.15.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.15.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.15.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.15.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.15.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.15.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.15.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.15.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.15.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.15.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.15.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.15.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.15.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.16.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.16.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.16.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.16.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.16.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.16.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.16.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.16.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.16.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.16.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.16.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.16.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.16.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.16.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.16.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.16.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.17.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.17.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.17.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.17.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.17.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.17.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.17.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.17.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.17.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.17.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.17.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.17.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.17.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.17.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.17.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.17.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.2.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.2.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.2.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.2.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.2.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.2.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.2.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.2.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.2.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.2.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.2.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.2.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.2.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.2.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.2.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.2.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.3.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.3.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.3.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.3.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.3.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.3.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.3.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.3.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.3.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.3.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.3.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.3.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.3.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.3.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.3.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.3.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.4.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.4.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.4.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.4.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.4.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.4.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.4.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.4.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.4.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.4.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.4.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.4.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.4.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.4.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.4.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.4.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.5.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.5.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.5.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.5.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.5.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.5.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.5.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.5.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.5.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.5.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.5.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.5.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.5.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.5.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.5.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.5.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.6.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.6.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.6.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.6.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.6.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.6.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.6.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.6.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.6.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.6.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.6.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.6.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.6.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.6.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.6.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.6.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.7.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.7.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.7.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.7.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.7.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.7.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.7.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.7.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.7.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.7.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.7.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.7.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.7.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.7.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.7.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.7.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.8.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.8.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.8.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.8.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.8.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.8.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.8.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.8.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.8.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.8.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.8.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.8.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.8.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.8.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.8.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.8.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.9.fc1.bias": {
+"dtype": "BF16",
+"shape": [
+3584
+]
+},
+"model.audio_tower.layers.9.fc1.weight": {
+"dtype": "BF16",
+"shape": [
+3584,
+896
+]
+},
+"model.audio_tower.layers.9.fc2.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.9.fc2.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+3584
+]
+},
+"model.audio_tower.layers.9.final_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.9.final_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.9.self_attn.k_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.9.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.9.self_attn.out_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.9.self_attn.out_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.9.self_attn.q_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.9.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.9.self_attn.v_proj.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.9.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.audio_tower.layers.9.self_attn_layer_norm.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.layers.9.self_attn_layer_norm.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.ln_post.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.audio_tower.ln_post.weight": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.language_model.embed_tokens.weight": {
+"dtype": "BF16",
+"shape": [
+99630,
+1024
+]
+},
+"model.language_model.layers.0.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.0.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.0.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.0.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.0.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.0.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.0.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.0.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.0.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.0.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.0.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.1.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.1.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.1.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.1.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.1.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.1.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.1.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.1.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.1.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.1.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.1.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.10.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.10.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.10.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.10.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.10.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.10.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.10.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.10.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.10.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.10.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.10.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.11.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.11.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.11.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.11.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.11.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.11.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.11.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.11.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.11.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.11.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.11.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.12.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.12.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.12.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.12.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.12.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.12.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.12.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.12.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.12.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.12.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.12.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.13.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.13.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.13.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.13.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.13.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.13.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.13.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.13.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.13.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.13.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.13.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.2.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.2.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.2.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.2.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.2.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.2.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.2.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.2.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.2.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.2.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.2.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.3.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.3.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.3.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.3.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.3.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.3.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.3.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.3.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.3.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.3.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.3.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.4.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.4.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.4.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.4.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.4.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.4.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.4.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.4.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.4.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.4.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.4.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.5.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.5.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.5.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.5.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.5.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.5.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.5.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.5.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.5.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.5.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.5.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.6.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.6.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.6.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.6.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.6.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.6.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.6.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.6.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.6.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.6.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.6.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.7.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.7.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.7.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.7.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.7.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.7.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.7.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.7.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.7.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.7.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.7.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.8.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.8.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.8.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.8.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.8.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.8.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.8.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.8.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.8.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.8.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.8.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.9.input_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.9.mlp.down_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+3072
+]
+},
+"model.language_model.layers.9.mlp.gate_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.9.mlp.up_proj.weight": {
+"dtype": "BF16",
+"shape": [
+3072,
+1024
+]
+},
+"model.language_model.layers.9.post_attention_layernorm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.language_model.layers.9.self_attn.k_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.9.self_attn.k_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.layers.9.self_attn.o_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+2048
+]
+},
+"model.language_model.layers.9.self_attn.q_norm.weight": {
+"dtype": "BF16",
+"shape": [
+128
+]
+},
+"model.language_model.layers.9.self_attn.q_proj.weight": {
+"dtype": "BF16",
+"shape": [
+2048,
+1024
+]
+},
+"model.language_model.layers.9.self_attn.v_proj.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+1024
+]
+},
+"model.language_model.norm.weight": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.multi_modal_projector.linear_1.bias": {
+"dtype": "BF16",
+"shape": [
+896
+]
+},
+"model.multi_modal_projector.linear_1.weight": {
+"dtype": "BF16",
+"shape": [
+896,
+896
+]
+},
+"model.multi_modal_projector.linear_2.bias": {
+"dtype": "BF16",
+"shape": [
+1024
+]
+},
+"model.multi_modal_projector.linear_2.weight": {
+"dtype": "BF16",
+"shape": [
+1024,
+896
+]
+}
+}
+}

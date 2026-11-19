@@ -77,6 +77,7 @@ const GRANITE_SPEECH_ASR_VARIANTS: &[ModelVariant] = &[
     ModelVariant::GraniteSpeech412B,
     ModelVariant::GraniteSpeech412BPlus,
 ];
+const RUMBLE_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::Rumble2Flash];
 const GRANITE_SPEECH5_ASR_VARIANTS: &[ModelVariant] = &[
     ModelVariant::GraniteSpeech502B,
     ModelVariant::GraniteSpeech502BGguf,
@@ -194,6 +195,11 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::GraniteSpeech5Asr,
         module_path: "crate::models::architectures::granite_speech5::asr",
         variants: GRANITE_SPEECH5_ASR_VARIANTS,
+    },
+    FamilyRegistration {
+        family: ModelFamily::RumbleAsr,
+        module_path: "crate::models::architectures::rumble",
+        variants: RUMBLE_ASR_VARIANTS,
     },
     FamilyRegistration {
         family: ModelFamily::NemotronTranscribeAsr,

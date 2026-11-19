@@ -186,6 +186,15 @@ pub enum ModelVariant {
         alias = "Granite Speech 5.0 2B GGUF"
     )]
     GraniteSpeech502BGguf,
+    /// Reson8 Rumble-2-Flash: 0.5B multilingual ASR (dense BF16
+    /// safetensors) with transcript style control tokens. Its own family.
+    #[serde(
+        rename = "Rumble-2-Flash",
+        alias = "Reson8/Rumble-2-Flash",
+        alias = "rumble-2-flash",
+        alias = "Rumble 2 Flash"
+    )]
+    Rumble2Flash,
     /// NVIDIA Nemotron 3.5 Transcribe 30B-A4B in ModelOpt FP8: a speech
     /// language model (a Parallel Expert Encoder with a Sortformer speaker
     /// encoder over a Nemotron-H Mamba2/MoE decoder) that transcribes up to
@@ -520,6 +529,9 @@ impl ModelVariant {
     /// The GGUF release as published 2026-10-15 (`granite-speech-5.0-2b-GGUF`).
     pub const GRANITE_SPEECH_5_0_2B_GGUF_ARTIFACT_REVISION: &'static str =
         "df3833f5e22e7d51c3f5dfedd4726260f7ec7cb5";
+    /// Rumble-2-Flash as published 2026-11-18.
+    pub const RUMBLE_2_FLASH_ARTIFACT_REVISION: &'static str =
+        "92ec9141fb1178c5e77fd0020fe86a33c355060b";
     pub const FISH_S2_PRO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const LFM25_AUDIO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const FISH_S2_PRO_FRAME_RATE_HZ: f32 = 21.5;
@@ -569,6 +581,7 @@ impl ModelVariant {
             Self::GraniteSpeech412B => Some(Self::GRANITE_SPEECH_4_1_2B_ARTIFACT_REVISION),
             Self::GraniteSpeech412BPlus => Some(Self::GRANITE_SPEECH_4_1_2B_PLUS_ARTIFACT_REVISION),
             Self::GraniteSpeech502B => Some(Self::GRANITE_SPEECH_5_0_2B_ARTIFACT_REVISION),
+            Self::Rumble2Flash => Some(Self::RUMBLE_2_FLASH_ARTIFACT_REVISION),
             Self::Nemotron35Transcribe30BA4BFp8 => {
                 Some(Self::NEMOTRON_3_5_TRANSCRIBE_FP8_ARTIFACT_REVISION)
             }
@@ -614,6 +627,7 @@ impl ModelVariant {
             Self::GraniteSpeech412B => "ibm-granite/granite-speech-4.1-2b",
             Self::GraniteSpeech412BPlus => "ibm-granite/granite-speech-4.1-2b-plus",
             Self::GraniteSpeech502B => "ibm-granite/granite-speech-5.0-2b",
+            Self::Rumble2Flash => "Reson8/Rumble-2-Flash",
             Self::GraniteSpeech502BGguf => "ibm-granite/granite-speech-5.0-2b-GGUF",
             Self::Nemotron35Transcribe30BA4BFp8 => {
                 "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8"
@@ -678,6 +692,7 @@ impl ModelVariant {
             Self::GraniteSpeech412B => "Granite Speech 4.1 2B",
             Self::GraniteSpeech412BPlus => "Granite Speech 4.1 2B Plus",
             Self::GraniteSpeech502B => "Granite Speech 5.0 2B",
+            Self::Rumble2Flash => "Rumble 2 Flash",
             Self::GraniteSpeech502BGguf => "Granite Speech 5.0 2B GGUF",
             Self::Nemotron35Transcribe30BA4BFp8 => "Nemotron 3.5 Transcribe 30B-A4B FP8",
             Self::DiarStreamingSortformer4SpkV21 => "Streaming Sortformer 4spk v2.1",
@@ -741,6 +756,7 @@ impl ModelVariant {
             Self::GraniteSpeech412B => "Granite-Speech-4.1-2B",
             Self::GraniteSpeech412BPlus => "Granite-Speech-4.1-2B-Plus",
             Self::GraniteSpeech502B => "Granite-Speech-5.0-2B",
+            Self::Rumble2Flash => "Rumble-2-Flash",
             Self::GraniteSpeech502BGguf => "Granite-Speech-5.0-2B-GGUF",
             Self::Nemotron35Transcribe30BA4BFp8 => "Nemotron-3.5-Transcribe-30B-A4B-FP8",
             Self::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1",
@@ -809,6 +825,8 @@ impl ModelVariant {
             Self::GraniteSpeech412B => 4_626_414_392,   // safetensors index metadata total_size
             Self::GraniteSpeech412BPlus => 4_223_757_112, // safetensors index metadata total_size
             Self::GraniteSpeech502B => 4_626_414_392,   // model.safetensors tensor bytes
+            // model.safetensors, tokenizer.json and configs (HF tree @92ec9141)
+            Self::Rumble2Flash => 1_024_749_357,
             Self::GraniteSpeech502BGguf => 3_122_684_382, // Q8_0 + mmproj GGUFs and companions
             // The seven weight files, the index, configs and tokenizer at the
             // pinned revision (the MTP head is downloaded, never loaded).
@@ -893,6 +911,7 @@ impl ModelVariant {
             Self::GraniteSpeech412BPlus => 9.5,
             // The same weights as 4.1 with a 16k-token decoder context.
             Self::GraniteSpeech502B => 10.0,
+            Self::Rumble2Flash => 4.0,
             Self::GraniteSpeech502BGguf => 5.0,
             // About 31 GiB resident as raw FP8 on Metal and CUDA, 33 GiB as
             // CPU Q8_0, before rows.
@@ -998,6 +1017,10 @@ impl ModelVariant {
             Self::GraniteSpeech412BPlus => [9.5, 5.5, 4.5],
             Self::GraniteSpeech412B | Self::GraniteSpeech502B => [10.0, 6.0, 5.0],
             Self::GraniteSpeech502BGguf => [5.0, 4.0, 3.0],
+            // 0.51B parameters: F32 on CPU and Metal (whose loader holds its
+            // staged uploads until the fence), a BF16 decoder and an F32
+            // audio tower on CUDA.
+            Self::Rumble2Flash => [3.5, 4.0, 2.0],
             Self::VibeVoiceAsr => [32.5, 17.5, 16.0],
             Self::VoxtralMini4BRealtime2602 => [18.5, 10.0, 9.0],
             Self::Lfm25Audio15BGguf => [2.5, 2.5, 1.5],
@@ -1027,6 +1050,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::NemotronAsr
                 | crate::catalog::ModelFamily::GraniteSpeechAsr
                 | crate::catalog::ModelFamily::GraniteSpeech5Asr
+                | crate::catalog::ModelFamily::RumbleAsr
                 | crate::catalog::ModelFamily::NemotronTranscribeAsr
         )
     }
@@ -1094,6 +1118,13 @@ impl ModelVariant {
                 | Self::GraniteSpeech502BGguf
                 | Self::Nemotron35Transcribe30BA4BFp8
         )
+    }
+
+    /// Whether a transcription request may choose how this model writes its
+    /// transcript: numbers as digits or words, fillers kept or dropped,
+    /// repeated words kept or collapsed (Rumble's control tokens).
+    pub fn supports_asr_transcript_style(&self) -> bool {
+        matches!(self, Self::Rumble2Flash)
     }
 
     /// Whether this model diarizes a recording on its own (speaker tags,
@@ -1198,6 +1229,7 @@ impl ModelVariant {
             | Self::GraniteSpeech412BPlus
             | Self::GraniteSpeech502B
             | Self::GraniteSpeech502BGguf
+            | Self::Rumble2Flash
             | Self::Qwen3827BFp8
             | Self::Qwen36Moe35BA3BFp8
             | Self::Maya13B
@@ -1877,6 +1909,7 @@ impl ModelVariant {
             Self::GraniteSpeech412BPlus,
             Self::GraniteSpeech502B,
             Self::GraniteSpeech502BGguf,
+            Self::Rumble2Flash,
             Self::Nemotron35Transcribe30BA4BFp8,
             Self::DiarStreamingSortformer4SpkV21,
             Self::Nemotron3Diarization,
@@ -2833,6 +2866,50 @@ mod tests {
         assert!(ModelVariant::GraniteSpeech412BPlus.supports_speaker_attributed_asr());
         assert!(!variant.is_quantized());
         assert!(!variant.is_gguf());
+    }
+
+    #[test]
+    fn rumble_2_flash_is_an_enabled_asr_variant_of_its_own_family() {
+        let variant = ModelVariant::Rumble2Flash;
+        assert!(variant.is_asr());
+        assert!(variant.is_enabled());
+        assert_eq!(variant.family(), crate::catalog::ModelFamily::RumbleAsr);
+        assert_ne!(
+            variant.family(),
+            ModelVariant::Qwen3Asr06BGguf.family(),
+            "Rumble is a family of its own, not a Qwen3-ASR checkpoint"
+        );
+        assert_eq!(variant.primary_task(), ModelTask::Asr);
+        assert_eq!(variant.repo_id(), "Reson8/Rumble-2-Flash");
+        assert_eq!(variant.dir_name(), "Rumble-2-Flash");
+        assert_eq!(variant.display_name(), "Rumble 2 Flash");
+        assert_eq!(variant.estimated_size(), 1_024_749_357);
+        assert_eq!(
+            variant.artifact_revision(),
+            Some("92ec9141fb1178c5e77fd0020fe86a33c355060b")
+        );
+        assert_eq!(variant.license_label(), Some("Apache-2.0"));
+        assert!(!variant.is_quantized());
+        assert!(!variant.is_gguf());
+        assert!(!variant.is_qwen_asr_gguf());
+        assert!(ModelVariant::all().contains(&variant));
+        // It transcribes, serves live ASR and the diarization pipeline, and
+        // takes none of the task options other models add.
+        assert!(variant.runs_speech_to_text_jobs());
+        assert!(variant.serves_live_asr());
+        assert!(variant.serves_diarization_pipeline_asr());
+        assert!(!variant.supports_asr_translation());
+        assert!(!variant.supports_asr_keyword_biasing());
+        assert!(!variant.supports_speaker_attributed_asr());
+        assert!(!variant.supports_native_word_timestamps());
+        assert!(variant.supports_asr_transcript_style());
+        assert!(!ModelVariant::Qwen3Asr06BGguf.supports_asr_transcript_style());
+        let serialized = serde_json::to_string(&variant).unwrap();
+        assert_eq!(serialized, "\"Rumble-2-Flash\"");
+        for alias in ["Rumble-2-Flash", "Reson8/Rumble-2-Flash", "rumble-2-flash"] {
+            let parsed: ModelVariant = serde_json::from_str(&format!("\"{alias}\"")).unwrap();
+            assert_eq!(parsed, variant, "{alias}");
+        }
     }
 
     #[test]

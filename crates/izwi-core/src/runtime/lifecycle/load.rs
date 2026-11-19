@@ -137,6 +137,7 @@ enum LoadedAsrStatePublicationRoute {
     Parakeet,
     NemotronOffline,
     GraniteSpeech5,
+    Rumble,
     /// Allocated by `allocate_nemotron_transcribe_state` (retained rows).
     NemotronTranscribe,
     LegacyCache,
@@ -152,6 +153,7 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
         crate::catalog::ModelFamily::GraniteSpeech5Asr => {
             LoadedAsrStatePublicationRoute::GraniteSpeech5
         }
+        crate::catalog::ModelFamily::RumbleAsr => LoadedAsrStatePublicationRoute::Rumble,
         crate::catalog::ModelFamily::NemotronTranscribeAsr => {
             LoadedAsrStatePublicationRoute::NemotronTranscribe
         }
@@ -207,6 +209,7 @@ fn uses_asr_model_registry(variant: ModelVariant) -> bool {
             | crate::catalog::ModelFamily::NemotronAsr
             | crate::catalog::ModelFamily::GraniteSpeechAsr
             | crate::catalog::ModelFamily::GraniteSpeech5Asr
+            | crate::catalog::ModelFamily::RumbleAsr
             | crate::catalog::ModelFamily::NemotronTranscribeAsr
             | crate::catalog::ModelFamily::Qwen3ForcedAligner
     )
@@ -315,21 +318,55 @@ fn asr_shared_pool_tokens(
         .max(context_tokens)
 }
 
-/// Refuses a Granite Speech 5.0 retained pool whose `reach` is short of one
-/// longest retained sequence (`sequence_tokens`): preparation sends a
-/// request to the retained route whenever its prompt and budget fit that
-/// sequence, and a claim the pool can never hold would wait on KV
-/// admission forever.
-fn granite_speech5_retained_reach_holds_a_sequence(
+/// A family whose ASR capability pairs a retained sequence graph with an
+/// atomic graph, and the switch that turns its retained route off.
+#[derive(Debug, Clone, Copy)]
+struct RetainedSequenceAsrFamily {
+    name: &'static str,
+    switch: &'static str,
+}
+
+/// The state such a family's model authors for its graphs.
+struct RetainedSequenceAsrState {
+    descriptor: crate::kv::v2::CapabilityStateDescriptorV2,
+    retained: Option<crate::kv::v2::InferenceStateContract>,
+    /// The longest retained sequence.
+    retained_max_tokens: Option<usize>,
+    invocation: crate::kv::v2::InferenceStateContract,
+}
+
+/// Refuses a retained pool whose `reach` is short of one longest retained
+/// sequence (`sequence_tokens`): preparation sends a request to the
+/// retained route whenever its prompt and budget fit that sequence, and a
+/// claim the pool can never hold would wait on KV admission forever.
+fn retained_reach_holds_a_sequence(
+    family: RetainedSequenceAsrFamily,
     reach: u64,
     sequence_tokens: usize,
 ) -> Result<()> {
     if reach < sequence_tokens as u64 {
         return Err(Error::ModelLoadError(format!(
-            "Granite Speech 5.0 retained decoder pages reach {reach} tokens, short of one {sequence_tokens}-token retained sequence; free memory, raise the context, or set IZWI_GRANITE_SPEECH5_RETAINED_DECODE=false"
+            "{} retained decoder pages reach {reach} tokens, short of one {sequence_tokens}-token retained sequence; free memory, raise the context, or set {}=false",
+            family.name, family.switch
         )));
     }
     Ok(())
+}
+
+/// [`retained_reach_holds_a_sequence`] for Granite Speech 5.0.
+#[cfg(test)]
+fn granite_speech5_retained_reach_holds_a_sequence(
+    reach: u64,
+    sequence_tokens: usize,
+) -> Result<()> {
+    retained_reach_holds_a_sequence(
+        RetainedSequenceAsrFamily {
+            name: "Granite Speech 5.0",
+            switch: "IZWI_GRANITE_SPEECH5_RETAINED_DECODE",
+        },
+        reach,
+        sequence_tokens,
+    )
 }
 
 /// The retained-state floor of a TTS variant, in tokens per sequence: one
@@ -1112,6 +1149,22 @@ impl ModelLifecycleController {
                     )));
                 };
                 bundle_draft.seal_granite_speech5_asr_preparation(model)?;
+            } else if variant.family() == crate::catalog::ModelFamily::RumbleAsr {
+                let loaded = self
+                    .model_registry
+                    .get_loading_asr(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "instantiated Rumble ASR model {variant} is missing before adapter sealing"
+                        ))
+                    })?;
+                let NativeAsrModel::Rumble(model) = loaded.as_ref() else {
+                    return Err(Error::ModelLoadError(format!(
+                        "instantiated model {variant} does not expose Rumble ASR geometry"
+                    )));
+                };
+                bundle_draft.seal_rumble_asr_preparation(model)?;
             } else if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
                 let model = self
                     .model_registry
