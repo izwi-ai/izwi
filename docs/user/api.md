@@ -1480,6 +1480,12 @@ as does a translation with `include_timestamps` or in speaker-attributed mode.
 The record stores both as `target_language` and `keywords`, keeps the spoken
 `language` the job named, and a retry asks for the same translation.
 
+Transcription jobs also accept `digits`, `filler` and `verbatim`, with the
+same meaning as on `/v1/audio/transcriptions`, for models whose
+`route_capabilities` report `transcript_style` (`Rumble-2-Flash`); others
+return `400`. The record stores the options the job set as
+`transcript_style`, and a retry asks for the same style.
+
 With `include_timestamps` (or `word_timestamps`), a model whose
 `route_capabilities` report `native_word_timestamps`
 (`Nemotron-3.5-Transcribe-30B-A4B-FP8`) times the words itself: no

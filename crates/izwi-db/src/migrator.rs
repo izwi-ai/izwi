@@ -53,6 +53,7 @@ impl Schema {
                 (16, "voice consent recordings"),
                 (17, "uploaded and server-written files"),
                 (18, "batches and their finished lines"),
+                (19, "transcription transcript style"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -247,6 +248,9 @@ async fn apply_migration<C: ConnectionTrait>(
                 db.execute_unprepared(&dialect_ddl(backend, statement))
                     .await?;
             }
+        }
+        (Schema::App, 19) => {
+            ensure_column(db, &TRANSCRIPTION_STYLE_COLUMN).await?;
         }
         (Schema::App, 13) => {
             if backend == DbBackend::Postgres {
@@ -1219,6 +1223,15 @@ const TRANSCRIPTION_TASK_COLUMNS: &[CompatibilityColumn] = &[
     },
 ];
 
+/// Migration 19: how a transcription job asked its transcript to be written
+/// (numbers as digits or words, fillers, repeated words), so a retry asks
+/// the same. JSON of the options the request set; null when it set none.
+const TRANSCRIPTION_STYLE_COLUMN: CompatibilityColumn = CompatibilityColumn {
+    table: "transcription_records",
+    column: "transcript_style_json",
+    definition: "TEXT NULL",
+};
+
 /// Migration 14: the language a saved voice's reference audio is spoken in,
 /// for models that clone across languages (Maya 2 Native); null for voices
 /// saved before, which those models infer from the transcript.
@@ -1960,6 +1973,8 @@ pub(crate) fn postgres_schema_sql() -> String {
     for statement in BATCHES_SCHEMA {
         push(statement);
     }
+    // Migration 19.
+    push(&add_column(&TRANSCRIPTION_STYLE_COLUMN));
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -2226,6 +2241,33 @@ mod tests {
                 .await
                 .unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn a_database_at_migration_18_gains_the_transcript_style_column() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        let column = &TRANSCRIPTION_STYLE_COLUMN;
+        db.execute_unprepared(&format!(
+            "ALTER TABLE {} DROP COLUMN {}",
+            column.table, column.column
+        ))
+        .await
+        .expect("column drops");
+        db.execute_unprepared(
+            "DELETE FROM schema_migrations WHERE component = 'app' AND version = 19",
+        )
+        .await
+        .expect("version row deletes");
+        assert!(!table_has_column(db, column.table, column.column)
+            .await
+            .unwrap());
+
+        Migrator::up(db).await.expect("the database upgrades");
+        assert!(table_has_column(db, column.table, column.column)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

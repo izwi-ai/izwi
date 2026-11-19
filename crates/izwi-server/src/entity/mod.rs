@@ -210,6 +210,7 @@ pub mod transcription_records {
         pub owner_node_id: Option<String>,
         pub target_language: Option<String>,
         pub keywords_json: String,
+        pub transcript_style_json: Option<String>,
     }
     empty_relation!();
 }

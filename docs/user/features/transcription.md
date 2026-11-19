@@ -363,8 +363,11 @@ curl -X POST http://localhost:8080/v1/audio/transcriptions \
   -F digits=false -F filler=true
 ```
 
-The fields are on `/v1/audio/transcriptions`. A model without style options
-answers `400` when one is set; `route_capabilities.transcript_style` on
+The fields are on `/v1/audio/transcriptions` and on transcription jobs
+(`/v1/speech-to-text/jobs`), which store them so a retry asks for the same
+style. In the app, the options appear in the new-transcription dialog when
+the selected model takes them. A model without style options answers `400`
+when one is set; `route_capabilities.transcript_style` on
 `/v1/admin/models` says which models take them.
 
 ### Context, timestamps and long recordings

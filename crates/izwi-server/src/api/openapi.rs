@@ -1605,6 +1605,25 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
             "description": "For transcription jobs, terms to bias recognition toward. Multipart repeats the field or separates terms with commas or newlines. Only models whose route_capabilities report keyword_biasing accept it."
         }),
     );
+    for (name, description) in [
+        (
+            "digits",
+            "For transcription jobs, write numbers as digits (true, the model's default) or as words. Only models whose route_capabilities report transcript_style accept it.",
+        ),
+        (
+            "filler",
+            "For transcription jobs, keep fillers such as \"um\" and \"uh\" (true) or drop them (the model's default). Only models whose route_capabilities report transcript_style accept it.",
+        ),
+        (
+            "verbatim",
+            "For transcription jobs, keep repeated words (true, the model's default) or collapse them. Only models whose route_capabilities report transcript_style accept it.",
+        ),
+    ] {
+        properties.insert(
+            name.to_string(),
+            json!({ "type": "boolean", "description": description }),
+        );
+    }
     properties.insert(
         "include_timestamps".to_string(),
         json!({

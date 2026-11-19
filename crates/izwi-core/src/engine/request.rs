@@ -220,13 +220,18 @@ pub struct AsrEngineInput {
 /// How a transcript is written, for models that take the choice
 /// (`ModelVariant::supports_asr_transcript_style`). `None` leaves a setting
 /// at the model's default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct AsrTranscriptStyle {
     /// Numbers as digits (`true`) or as words (`false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digits: Option<bool>,
     /// Keep fillers such as "um" and "uh" (`true`) or drop them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filler: Option<bool>,
     /// Keep repeated words (`true`) or collapse them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbatim: Option<bool>,
 }
 
