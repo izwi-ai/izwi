@@ -24,6 +24,7 @@ Voice Studio saved voice library instead of these built-in speaker IDs.
 | VibeVoice-1.5B | Reference voice or saved voice only; no built-in presets |
 | FishAudio-S2-Pro | Reference voice or saved voice only |
 | FishAudio-Drama-3 | No presets: a voice set by the sampling `seed`, or a reference or saved voice (transcript needed) |
+| Audio8-TTS-Realistic-Air | No presets: a voice of the model's own, repeatable with `seed`, or a reference or saved voice (transcript needed) |
 | Chatterbox-500M, Chatterbox-Multilingual-500M | One built-in voice (`default`), or a reference or saved voice (no transcript needed) |
 | Maya1-3B | Nine described voices, or a description of your own in `instructions` |
 | Maya2-Native-2.5B | 20 named voices, or a reference or saved voice (transcript needed) |

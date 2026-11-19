@@ -1698,7 +1698,7 @@ Reusable voice clone references:
 
 Use `saved_voice_id` on `/v1/audio/speech` or first-party generation routes to reuse a saved voice without resending reference audio.
 
-A voice saved without a transcript works with `Chatterbox-500M` and `Chatterbox-Multilingual-500M`, which clone from audio alone. Models that need a transcript (Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro, Fish Audio Drama 3 and Maya 2 Native) return `400` for it, asking for a voice saved with one.
+A voice saved without a transcript works with `Chatterbox-500M` and `Chatterbox-Multilingual-500M`, which clone from audio alone. Models that need a transcript (Audio8 TTS Realistic Air, Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro, Fish Audio Drama 3 and Maya 2 Native) return `400` for it, asking for a voice saved with one.
 
 `POST /v1/voices` also takes an optional `reference_language`: the language the
 reference is spoken in, one of Maya 2 Native's 12 codes (any other value
@@ -2045,11 +2045,12 @@ Speech model capabilities, when present:
 ```
 
 A model whose text-to-speech records journal their audio as it is generated
-(Fish S2 Pro and Fish Audio Drama 3) also reports
+(Fish S2 Pro, Fish Audio Drama 3 and Audio8 TTS Realistic Air) also reports
 `"supports_in_progress_replay": true`: an unfinished record of it can be played
 from its start.
 
-A model that speaks without any voice input (Fish Audio Drama 3) also reports
+A model that speaks without any voice input (Fish Audio Drama 3, Audio8 TTS
+Realistic Air) also reports
 `"supports_seeded_voice": true`: a request with no reference gets a voice its
 sampling `seed` sets, so a reference is optional. The field is present only
 when it is `true`. `reference_transcript_required` says whether a reference

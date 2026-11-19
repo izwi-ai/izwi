@@ -261,8 +261,9 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `Chatterbox-500M` | ~3.2 GB | English reference voice, emotion control | Slow |
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages, reference voice, emotion control | Slow |
 | `FishAudio-Drama-3` | ~41.5 GB | Seeded or reference voice, dialogue of up to 16 speakers, performance tags, 44.1 kHz | Slow; needs about 40 GB of memory |
+| `Audio8-TTS-Realistic-Air` | ~2.6 GB | 23 languages, seeded or reference voice, 44.1 kHz | Medium |
 
-For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B`.  
+For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Audio8-TTS-Realistic-Air`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B`.  
 For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603`, `LFM2.5-Audio-1.5B-GGUF`, `LFM3-Audio-2B-GGUF` or `Maya2-Native-2.5B`.  
 For prompt-based voice design, use **VoiceDesign** variants.
 `Kokoro-82M` requires `espeak-ng` to be installed separately.
@@ -293,6 +294,16 @@ transcribes speech and answers in voice chat.
 `FishAudio-Drama-3` (44.1 kHz, Fish Audio Community License v1.0) speaks
 without any voice input, or clones a reference voice; see
 [Fish Audio Drama 3](#fish-audio-drama-3) below.
+`Audio8-TTS-Realistic-Air` (44.1 kHz, Apache-2.0) speaks 23 languages,
+reading the language from the text. It needs no voice input: without a
+reference it speaks in a voice of its own, and the same `seed` and text give
+the same audio; with reference audio and its transcript, or a saved voice
+that has one, it clones that voice. It streams, has no speed control or
+voice design, and speaks long text in segments of about 300 characters,
+keeping the first segment's voice for the rest. One request runs at about
+real time on an Apple M1 Pro with Metal and about four times slower than
+real time on its CPU. A sampled take can end with a stray extra word;
+generate again, or with another `seed`, if it does.
 For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
 ---

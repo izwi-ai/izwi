@@ -52,7 +52,7 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 | `--speaker-reference <N=AUDIO[:TRANSCRIPT_FILE]>` | A reference voice for dialogue speaker `N` (0 to 15): an audio file and a file holding its transcript. Repeatable, up to 8 references; `FishAudio-Drama-3` only | — |
 | `--speaker-voice <N=SAVED_ID>` | A saved voice (with a transcript) for dialogue speaker `N`. Repeatable; `FishAudio-Drama-3` only | — |
 | `--script <FILE.jsonl>` | A dialogue instead of `<TEXT>`: one `{"speaker": N, "text": "..."}` object per line; `FishAudio-Drama-3` only | — |
-| `--seed <N>` | Sampling seed: the same seed and inputs give the same audio; with `FishAudio-Drama-3` it also sets the voice of a speaker without a reference | random |
+| `--seed <N>` | Sampling seed: the same seed and inputs give the same audio; with `FishAudio-Drama-3` and `Audio8-TTS-Realistic-Air` it also sets the voice when there is no reference | random |
 | `--instructions <TEXT>`, `--voice-description <TEXT>` | Voice direction for voice-design models; for `Maya1-3B`, the description of the voice to speak with (replaces `--speaker`) | — |
 | `-o, --output <PATH>` | Output file path | `izwi_output_<timestamp>.wav` in the current directory |
 | `-f, --format <FORMAT>` | `wav`, `mp3`, `opus` (Ogg; `ogg` also works), `flac`, or `pcm` (raw 16-bit little-endian mono at the model's rate, no header). `--stream` writes WAV. | `wav` |
@@ -131,7 +131,7 @@ izwi tts "Hello from a built-in CustomVoice speaker" \
 
 ### Reference-audio voice cloning
 
-Base, VibeVoice, FishAudio-S2-Pro and FishAudio-Drama-3 models can clone from a reference audio sample.
+Base, VibeVoice, FishAudio-S2-Pro, FishAudio-Drama-3 and Audio8-TTS-Realistic-Air models can clone from a reference audio sample.
 Provide the audio and matching transcript together:
 
 ```bash
@@ -263,6 +263,29 @@ audio as it is generated. Sampling follows Liquid AI's defaults (temperature 1.0
 top-k 128); `--temperature` overrides the temperature. It refuses
 `--reference-audio`, `--saved-voice-id`, `--instructions` and `--speed`.
 
+### Audio8 TTS Realistic Air
+
+`Audio8-TTS-Realistic-Air` needs no voice input. Without a reference it
+speaks in a voice of its own, and `--seed` makes the take repeatable:
+
+```bash
+izwi tts "Guten Morgen, wie geht es Ihnen heute?" \
+  --model Audio8-TTS-Realistic-Air \
+  --seed 7 \
+  --output morning.wav
+```
+
+With a reference clip and its exact transcript (or a saved voice that has
+one) it speaks in that voice:
+
+```bash
+izwi tts "The weather is lovely today." \
+  --model Audio8-TTS-Realistic-Air \
+  --reference-audio speaker.wav \
+  --reference-text "The exact words spoken in speaker.wav." \
+  --output cloned.wav
+```
+
 ### Fish Audio Drama 3
 
 `FishAudio-Drama-3` needs no voice input. Without a reference, `--seed` sets
@@ -387,6 +410,7 @@ Izwi saves the streamed audio, then plays it.
 | `VibeVoice-1.5B` | Long-form/reference voice | Reference-voice TTS with long-form positioning |
 | `FishAudio-S2-Pro` | Reference voice | Voice cloning only: needs `--reference-audio` + `--reference-text` or `--saved-voice-id` |
 | `FishAudio-Drama-3` | Seeded/reference voice | Speaks without a voice input, or clones from `--reference-audio` + `--reference-text` or `--saved-voice-id`; dialogue of up to 16 speakers (`--script`, `--speaker-reference`, `--speaker-voice`); performance tags in the text, 44.1 kHz output, Fish Audio Community License v1.0 |
+| `Audio8-TTS-Realistic-Air` | Seeded/reference voice | 23 languages; speaks without a voice input, or clones from `--reference-audio` + `--reference-text` or `--saved-voice-id`; 44.1 kHz output, Apache-2.0 |
 | `Voxtral-4B-TTS-2603` | Preset voices | 20 built-in voices, 24 kHz output, CC BY-NC 4.0 |
 | `Chatterbox-500M` | Built-in/reference voice | English; built-in `default` voice or cloning from `--reference-audio` alone; watermarked, 24 kHz output, MIT |
 | `Chatterbox-Multilingual-500M` | Built-in/reference voice | Chatterbox in 22 languages chosen with `--language`; watermarked, 24 kHz output, MIT |

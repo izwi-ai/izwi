@@ -131,6 +131,18 @@ of the Qwen3-ASR model code in Hugging Face Transformers
 Team and the Alibaba Qwen team, Apache License, Version 2.0) and of the
 chat template published with the checkpoint.
 
+The Audio8 text-to-speech family
+(crates/izwi-core/src/models/architectures/audio8) runs Edge0's
+Audio8-TTS-Realistic-Air (https://huggingface.co/Edge0/Audio8-TTS-Realistic-Air,
+Apache License, Version 2.0), which izwi downloads unmodified. Its NOTICE
+reads: "audio8_tts. The model architecture is inspired by the DualAR design
+used in Fish Audio S2 Pro." The family includes Rust ports of:
+
+* Audio8 TTS's inference code (https://github.com/Edge0-AI/Audio8_TTS and
+  the model repository's own Python): the prompt layout, the DualAR
+  generation loop and sampler, and the audio codec. Apache License,
+  Version 2.0.
+
 The Fish Audio S2 Pro and Fish Audio Drama 3 text-to-speech families
 (crates/izwi-core/src/models/architectures/fish_s2 and fish_drama3) run
 Fish Audio's open-weight checkpoints, which izwi downloads unmodified:
