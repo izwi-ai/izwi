@@ -153,6 +153,7 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | `Whisper-Large-v3-Turbo` | Whisper ASR option |
 | `Qwen3-ASR-0.6B-GGUF` | Smaller Qwen3 ASR |
 | `Qwen3-ASR-1.7B-GGUF` | Higher-accuracy Qwen3 ASR |
+| `Rumble-2-Flash` | Reson8's compact 0.5B multilingual ASR (45 languages, language detection); takes transcript style options: numbers as digits or words, fillers kept or dropped, repeated words kept or collapsed |
 | `VibeVoice-ASR` | Microsoft long-form ASR checkpoint |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | NVIDIA multilingual FastConformer-RNNT `.nemo`; native artifact/config/tokenizer and streaming-state support |
 | `Nemotron-3.5-Transcribe-30B-A4B-FP8` | NVIDIA's 30B speech language model in FP8: one pass of up to 60 minutes in 40 languages, translation to or from English, context terms, speaker labels and its own word timestamps; offline only; needs about 32 GiB of memory |
@@ -255,6 +256,9 @@ izwi pull Nemotron-3.5-ASR-Streaming-0.6B
 
 # Download NVIDIA Nemotron 3.5 Transcribe (34.7 GB; needs about 32 GiB of memory)
 izwi pull Nemotron-3.5-Transcribe-30B-A4B-FP8
+
+# Download Reson8 Rumble 2 Flash (compact multilingual ASR, 1.0 GB)
+izwi pull Rumble-2-Flash
 
 # Download IBM Granite Speech (punctuated ASR, and rich ASR with speaker turns)
 izwi pull Granite-Speech-4.1-2B

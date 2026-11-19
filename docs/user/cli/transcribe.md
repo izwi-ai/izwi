@@ -128,6 +128,20 @@ whole instruction, so it cannot be combined with `--translate-to`,
 A one-hour WAV is larger than the upload limit; send long recordings as MP3 or
 M4A. See [Transcription](/features/transcription#nemotron-35-transcribe).
 
+### Rumble 2 Flash transcript style
+
+```bash
+# Numbers written out, fillers kept, repeated words collapsed
+izwi transcribe meeting.wav \
+  --model Rumble-2-Flash \
+  --numbers words --keep-fillers --collapse-repeats
+```
+
+`Rumble-2-Flash` detects the language unless `--language` names it. Each
+style flag is optional and leaves the model's default when omitted; a model
+without style options refuses them. See
+[Transcription](/features/transcription#rumble-2-flash).
+
 ### LFM3 Audio transcription
 
 ```bash
@@ -238,6 +252,7 @@ the words. The `text` field stays untagged.
 | `Whisper-Large-v3-Turbo` | 1.5 GB | Medium | Strong multilingual baseline |
 | `Qwen3-ASR-0.6B-GGUF` | 1.0 GB | Fast | Good |
 | `Qwen3-ASR-1.7B-GGUF` | 2.5 GB | Medium | Better |
+| `Rumble-2-Flash` | 1.0 GB | Fast | Reson8's 0.5B multilingual ASR; transcript style options (`--numbers`, `--keep-fillers`, `--collapse-repeats`) |
 | `VibeVoice-ASR` | 16.2 GB | Medium | Microsoft long-form ASR checkpoint |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | 2.37 GB | Medium | 40-locale NVIDIA FastConformer-RNNT; native offline transcription with prompt-conditioned language control |
 | `Granite-Speech-4.1-2B` | 4.6 GB | Medium | IBM ASR with punctuated, capitalized transcripts |

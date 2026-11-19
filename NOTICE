@@ -121,6 +121,16 @@ Rust ports of:
   (c) 2001-2002 Enthought, Inc. 2003, SciPy Developers. All rights
   reserved. BSD 3-Clause License, below.
 
+The Rumble ASR family (crates/izwi-core/src/models/architectures/rumble)
+runs Reson8's Rumble-2-Flash checkpoint
+(https://huggingface.co/Reson8/Rumble-2-Flash), which izwi downloads
+unmodified. Reson8 licenses it under the Apache License, Version 2.0. The
+family's audio tower, feature extraction and prompt contract are Rust ports
+of the Qwen3-ASR model code in Hugging Face Transformers
+(https://github.com/huggingface/transformers, Copyright The HuggingFace
+Team and the Alibaba Qwen team, Apache License, Version 2.0) and of the
+chat template published with the checkpoint.
+
 The Fish Audio S2 Pro and Fish Audio Drama 3 text-to-speech families
 (crates/izwi-core/src/models/architectures/fish_s2 and fish_drama3) run
 Fish Audio's open-weight checkpoints, which izwi downloads unmodified:
