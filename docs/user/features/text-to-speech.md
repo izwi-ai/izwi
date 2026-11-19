@@ -174,6 +174,13 @@ and min-p. With Chatterbox Multilingual it also asks which language the text is
 in. With Maya 2 Native it asks the same, with **Auto-detect** (the default) to
 read the language from the text's script, and offers its inline tags.
 
+With Ming 3.0 TTS the dialog lists its 85 built-in voices and offers a saved
+voice (its transcript is optional) and **Your own voice**, a description that
+replaces the built-in one. For a voice recorded in several emotions, or a
+saved voice, an **Emotion** picker appears. It also asks the language
+(**Auto-detect** reads Chinese or English from the text) and offers its inline
+sounds such as `[Laughter]`.
+
 With Fish Audio Drama 3 the saved voice is optional (**None (seeded voice)**)
 and the dialog has a **Seed**, filled with a new number each time it opens;
 keep it to get the same voice again. **Dialogue**, beside **Single voice**,
@@ -262,9 +269,10 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages, reference voice, emotion control | Slow |
 | `FishAudio-Drama-3` | ~41.5 GB | Seeded or reference voice, dialogue of up to 16 speakers, performance tags, 44.1 kHz | Slow; needs about 40 GB of memory |
 | `Audio8-TTS-Realistic-Air` | ~2.6 GB | 23 languages, seeded or reference voice, 44.1 kHz | Medium |
+| `Ming-3.0-tts-0.5B` | ~3.0 GB | 85 voices, reference voice, voice design, emotions, 44.1 kHz | Medium |
 
-For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Audio8-TTS-Realistic-Air`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M` or `Maya2-Native-2.5B`.  
-For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603`, `LFM2.5-Audio-1.5B-GGUF`, `LFM3-Audio-2B-GGUF` or `Maya2-Native-2.5B`.  
+For reference-audio cloning, use **Base** variants, `VibeVoice-1.5B`, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Audio8-TTS-Realistic-Air`, `Chatterbox-500M`, `Chatterbox-Multilingual-500M`, `Maya2-Native-2.5B` or `Ming-3.0-tts-0.5B`.  
+For built-in voice presets, use `Kokoro-82M`, **CustomVoice** variants, `Voxtral-4B-TTS-2603`, `LFM2.5-Audio-1.5B-GGUF`, `LFM3-Audio-2B-GGUF`, `Maya2-Native-2.5B` or `Ming-3.0-tts-0.5B`.  
 For prompt-based voice design, use **VoiceDesign** variants.
 `Kokoro-82M` requires `espeak-ng` to be installed separately.
 `Voxtral-4B-TTS-2603` supports 20 preset voices and emits 24 kHz audio. Its

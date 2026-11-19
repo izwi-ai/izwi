@@ -27,6 +27,7 @@ Those endpoints only show variants that are enabled for download/use.
 | Maya1 (voice design from a description; emotion tags) | `Maya1-3B` |
 | Maya1 GGUF (the same, Q8_0 decoder) | `Maya1-3B-GGUF` |
 | Maya 2 Native (English and 11 Indic languages; 20 voices; reference-voice cloning) | `Maya2-Native-2.5B` |
+| Ming 3.0 TTS (Chinese, English and five more languages; 85 voices; cloning; voice design; emotions) | `Ming-3.0-tts-0.5B` |
 | Kokoro | `Kokoro-82M` |
 | LFM2.5 Audio (built-in speakers) | `LFM2.5-Audio-1.5B-GGUF` |
 | LFM3 Audio (two built-in voices; 19 locales; also ASR and voice chat) | `LFM3-Audio-2B-GGUF` (Q4_K_M, default), `LFM3-Audio-2B-Q8_0-GGUF` |
@@ -102,6 +103,19 @@ Those endpoints only show variants that are enabled for download/use.
 > its decoder quantized to Q8_0 (llama.cpp's conversion, published as
 > `mradermacher/maya1-GGUF`): about 3.6 GB to download and half the weight
 > memory, with the same voices and tags.
+
+> `Ming-3.0-tts-0.5B` is inclusionAI's Ming 3.0 TTS (MIT). A Qwen2.5-0.5B
+> language model conditions a flow-matching head that produces one audio
+> latent every 80 ms, and a transformer VAE turns the latents into 44.1 kHz
+> audio. It speaks Chinese and English, and German, Spanish, French, Korean and
+> Japanese when `language` names them. A voice is one of 85 built-in voices
+> (see [Voice Presets](/models/voice-presets#ming-3-0-tts)), a reference clip
+> (its transcript is optional and improves the clone), or a description in
+> `instructions`. A request may also ask for one of seven emotions, a
+> speaking rate, pitch or volume level, or Cantonese or Sichuanese, and the
+> text may carry sounds such as `[Laughter]` and `[Sigh]`. The download is
+> about 3.0 GB: the checkpoint, and CAM++'s speaker encoder from
+> `funasr/campplus` for cloning.
 
 > `Maya2-Native-2.5B` is Maya Research's Maya 2 Native (Apache-2.0), a TTS
 > model for Assamese, Bengali, English, Gujarati, Hindi, Kannada, Malayalam,
@@ -300,6 +314,9 @@ izwi pull Maya1-3B-GGUF
 
 # Download Maya Research Maya 2 Native (about 5.5 GB)
 izwi pull Maya2-Native-2.5B
+
+# Download inclusionAI Ming 3.0 TTS (about 3.0 GB)
+izwi pull Ming-3.0-tts-0.5B
 
 # Download Fish Audio Drama 3 (about 41.5 GB; needs about 40 GB of memory)
 izwi pull FishAudio-Drama-3

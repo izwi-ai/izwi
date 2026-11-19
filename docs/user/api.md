@@ -456,6 +456,7 @@ Request fields:
 | `exaggeration` | Chatterbox only. Emotion intensity, 0 to 2 (default `0.5`). |
 | `cfg_weight` | Chatterbox only. Classifier-free guidance weight, 0 to 1 (default `0.5`); `0` turns guidance off. For expressive or fast-talking reference voices, try about `0.3` with `exaggeration` around `0.7` or higher. |
 | `min_p` | Chatterbox only. Min-p sampling threshold, 0 to 1 (default `0.05`). |
+| `emotion`, `dialect`, `speaking_rate`, `pitch`, `volume` | `Ming-3.0-tts-0.5B` only; any other model returns `400`. See its specifics below. |
 | `max_tokens`, `max_output_tokens` | Optional output token budget aliases. |
 | `instructions` | Voice-design prompt for voice-design models; for `Maya1-3B`, the description of the voice to speak with, replacing `voice`. At most 4,096 characters. |
 | `reference_audio` (`ref_audio`) | Audio for voice cloning: base64, a data URL, or an `http(s)` URL on a host `IZWI_ALLOWED_MEDIA_DOMAINS` allows (unset, URLs return `400`). URLs must resolve to public addresses only, and at most 10 MiB is fetched in 30 s. |
@@ -513,6 +514,37 @@ out of range returns `400`.
   `max_tokens`, Izwi sets a budget from the text and splits text longer than
   about 160 characters into sentences of up to about 11 s, each with the same
   description.
+
+`Ming-3.0-tts-0.5B` specifics:
+
+- It speaks Chinese and English (read from the text), and German, Spanish,
+  French, Korean and Japanese when `language` names them (`de`, `es`, `fr`,
+  `ko`, `ja`, or the English name). Any other language returns `400`.
+- Its voice is one of 85 built-in voices that `voice` names (`US_Emma`,
+  `UK_George`, `UK_Charlotte`, and 82 Chinese voices; OpenAI's names map to the
+  English ones, see [Voice Presets](/models/voice-presets#ming-3-0-tts)), a
+  clone of `reference_audio` (or a saved voice) with an optional
+  `reference_text` that improves the clone, or a description in
+  `instructions`. Without any, the default voice of the text's language
+  speaks. A reference must last at least 1 s, and at most 20 s with a
+  transcript.
+- One control per request: `emotion` (`neutral`, `happy`, `sad`, `angry`,
+  `fearful`, `disgusted`, `surprised`), `dialect` (`cantonese`,
+  `sichuanese`), the levels `speaking_rate`, `pitch` and `volume` (`low`,
+  `medium`, `high`, any of the three together), or `instructions`. A built-in
+  voice takes only an `emotion` it was recorded in
+  (`speech_capabilities.emotions` lists all seven; [Voice
+  Presets](/models/voice-presets#ming-3-0-tts) lists each voice's). A clone
+  takes any one control. With no voice, the model picks one to perform the
+  control. Combinations it was not trained on return `400`. `speed` returns
+  `400`; use `speaking_rate`.
+- Inline sounds in `input`, written exactly: `[Breathing]`, `[Cough]`,
+  `[Sigh]`, `[Laughter]`, `[Uhm]`, `[Surprise-ah]`, `[Surprise-oh]`,
+  `[Dissatisfaction-hnn]`, `[Confirmation-en]`, `[Question-ei]`,
+  `[Question-ah]`, `[Question-en]`, `[Question-oh]`, `[Question-huh]`.
+- `cfg_scale` sets the guidance scale (default `2.0`) and `seed` the voice
+  noise: the same seed gives the same audio. Output is 44.1 kHz. Text longer
+  than about 12 s of speech is spoken in sentences, each in the same voice.
 
 `Maya2-Native-2.5B` specifics:
 

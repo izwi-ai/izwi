@@ -120,6 +120,19 @@ izwi tts "आपका ऑर्डर कल शाम तक पहुँच �
   --output cloned-hindi.wav
 ```
 
+`Ming-3.0-tts-0.5B` clones from reference audio alone or with its
+transcript. With the transcript it continues the reference's own audio and
+the clone is closer; a reference with a transcript may last up to 20 seconds.
+A clone can take one control, such as `--emotion sad` or `--speaking-rate low`:
+
+```bash
+izwi tts "And now the same voice reads something new." \
+  --model Ming-3.0-tts-0.5B \
+  --reference-audio samples/reference.wav \
+  --reference-text "This is the exact text spoken in the reference sample." \
+  --output cloned-ming.wav
+```
+
 `FishAudio-Drama-3` clones from reference audio and its transcript, but the
 reference is optional: without one it speaks in a voice its sampling seed sets
 (see [Text-to-Speech](/features/text-to-speech#fish-audio-drama-3)). A
@@ -245,6 +258,7 @@ its own.
 | `Chatterbox-500M` | ~3.2 GB | English; clones from audio alone, no transcript needed |
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages (set `language`); clones from audio alone |
 | `Maya2-Native-2.5B` | ~5.5 GB | English and 11 Indic languages; needs a transcript; clones across languages |
+| `Ming-3.0-tts-0.5B` | ~3.0 GB | Chinese, English and five more languages; transcript optional (it improves the clone); takes an emotion, dialect or speaking-rate/pitch/volume level |
 
 Larger models produce more accurate voice clones.
 
