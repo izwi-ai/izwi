@@ -84,6 +84,19 @@ export function isFishDrama3Variant(variant: string): boolean {
   );
 }
 
+/** Audio8 TTS Realistic Air: a voice the seed sets, or one cloned from a
+ * reference clip and its transcript. */
+export function isAudio8Variant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "audio8-tts-realistic-air" ||
+    normalized === "edge0/audio8-tts-realistic-air" ||
+    normalized === "audio8 tts realistic air" ||
+    normalized === "audio8-realistic-air" ||
+    normalized === "audio8"
+  );
+}
+
 export function isChatterboxVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -216,7 +229,7 @@ export function getSpeakerProfilesForVariant(variant: string | null): SpeakerPro
     return [];
   }
   // No built-in voices: the seed or a reference voice sets the voice.
-  if (isFishDrama3Variant(variant)) {
+  if (isFishDrama3Variant(variant) || isAudio8Variant(variant)) {
     return [];
   }
   if (isChatterboxVariant(variant)) {
@@ -263,10 +276,11 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isVibeVoiceTtsVariant(variant) ||
       isFishS2TtsVariant(variant) ||
       isFishDrama3Variant(variant) ||
+      isAudio8Variant(variant) ||
       isMaya2Variant(variant),
     emptyStateTitle: "No Base Model Loaded",
     emptyStateDescription:
-      "Load a Base, VibeVoice, Fish S2, Fish Drama 3, or Maya 2 Native model to clone voices from reference audio",
+      "Load a Base, VibeVoice, Fish S2, Fish Drama 3, Audio8, or Maya 2 Native model to clone voices from reference audio",
   },
   "voice-design": {
     id: "voice-design",

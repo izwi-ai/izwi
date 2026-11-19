@@ -35,6 +35,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -100,6 +102,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -234,6 +238,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -342,6 +348,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -1211,6 +1219,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -1346,6 +1356,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::Audio8Tts(_)
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
@@ -1369,6 +1380,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::Audio8Tts(_)
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
@@ -1408,6 +1420,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::Audio8Tts(_)
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)

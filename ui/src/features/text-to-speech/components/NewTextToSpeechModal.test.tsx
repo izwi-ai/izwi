@@ -39,6 +39,13 @@ const DRAMA3 = model("FishAudio-Drama-3", {
   inline_tags: ["[sighs]", "[laughs]"],
 });
 
+// Audio8: one voice, set by the seed or a saved reference; no dialogue.
+const AUDIO8 = model("Audio8-TTS-Realistic-Air", {
+  supports_seeded_voice: true,
+  max_speakers: 1,
+  max_references: 1,
+});
+
 function savedVoice(
   id: string,
   name: string,
@@ -109,6 +116,31 @@ describe("NewTextToSpeechModal with Fish Audio Drama 3", () => {
     expect(await screen.findByText("Saved voice")).toBeInTheDocument();
     expect(screen.queryByRole("radiogroup", { name: "Speech mode" })).toBeNull();
     expect(screen.queryByLabelText("Seed")).toBeNull();
+  });
+
+  it("lets Audio8 speak from the seed or a saved voice, without Dialogue", async () => {
+    const onCreateStream = renderModal(
+      AUDIO8,
+      vi.fn().mockResolvedValue({ id: "record" }),
+    );
+    expect(screen.queryByRole("radiogroup", { name: "Speech mode" })).toBeNull();
+    expect(await screen.findByText("Saved voice (optional)")).toBeInTheDocument();
+    const voice = screen.getByRole("combobox", { name: "Saved voice" });
+    expect(voice).toHaveTextContent("None (seeded voice)");
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Script" }), {
+      target: { value: "A short line." },
+    });
+    fireEvent.change(screen.getByLabelText("Seed"), { target: { value: "7" } });
+    fireEvent.click(screen.getByRole("button", { name: /Create generation/ }));
+    await waitFor(() => expect(onCreateStream).toHaveBeenCalledTimes(1));
+    const seeded = onCreateStream.mock.calls[0][0];
+    expect(seeded).toMatchObject({
+      model_id: "Audio8-TTS-Realistic-Air",
+      text: "A short line.",
+      seed: 7,
+    });
+    expect(seeded.saved_voice_id).toBeUndefined();
   });
 
   it("speaks a single voice without a reference, from the seed", async () => {

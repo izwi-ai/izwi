@@ -1936,6 +1936,87 @@ impl ModelLifecycleController {
         }
         Ok(())
     }
+    /// Audio8 TTS: retained and invocation state.
+    ///
+    /// Boxed, and resolved without a future for every other family: the load
+    /// awaits each family's allocation in turn, and inline this one's future
+    /// would be a temporary in the load's poll frame under every model's
+    /// load, deep enough to take a debug build past a 2 MiB thread stack.
+    pub(super) fn allocate_audio8_tts_state<'a>(
+        &'a self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        backend: BackendKind,
+        bundle_draft: &'a LoadedModelBundleDraft,
+        state_publications: &'a mut HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        if variant.family() != crate::catalog::ModelFamily::Audio8Tts {
+            return Box::pin(std::future::ready(Ok(())));
+        }
+        Box::pin(self.allocate_audio8_tts_state_inline(
+            variant,
+            model_instance_id,
+            backend,
+            bundle_draft,
+            state_publications,
+        ))
+    }
+
+    async fn allocate_audio8_tts_state_inline(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        backend: BackendKind,
+        bundle_draft: &LoadedModelBundleDraft,
+        state_publications: &mut HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> Result<()> {
+        if variant.family() == crate::catalog::ModelFamily::Audio8Tts {
+            if !managed_kv_backend_compiled(backend) {
+                return Err(Error::ModelLoadError(format!(
+                    "loaded model {variant} requires physical TTS invocation state, but the {backend:?} build has no direct paged-attention runtime"
+                )));
+            }
+            let model = self
+                .model_registry
+                .get_loading_audio8_tts(variant)
+                .await
+                .ok_or_else(|| {
+                    Error::ModelLoadError(format!(
+                        "loaded Audio8 TTS model {variant} is missing from the registry"
+                    ))
+                })?;
+            let headroom = match self.coordinator.resource_authority().planning_headroom_bytes(backend)? {
+                ResourceAmount::Known(bytes) => Some(bytes),
+                _ => None,
+            };
+            let native_batching = match crate::env::value("IZWI_AUDIO8_NATIVE_BATCHING") {
+                Some(value) => izwi_env::parse_bool("IZWI_AUDIO8_NATIVE_BATCHING", &value)
+                    .map_err(|error| Error::ConfigError(error.to_string()))?,
+                None => crate::runtime::audio8_capacity::audio8_native_batching_default(backend),
+            };
+            // Automatic staged rows are sized for tensor-width launches. Audio8
+            // fits its own autoregressive width (no tensor arena backs its
+            // transactions), so it reads an automatic limit as automatic.
+            let row_limits = if self.core_engine.config().automatic_row_limits.staged_transactions {
+                std::borrow::Cow::Owned(crate::config::EngineConfig { max_staged_transactions: 0, ..self.config.clone() })
+            } else {
+                std::borrow::Cow::Borrowed(&self.config)
+            };
+            let capacity = crate::runtime::audio8_capacity::Audio8ServingCapacity::resolve(
+                model.config(), &row_limits, headroom, native_batching,
+                model.state_element_bytes(),
+            )?;
+            tracing::info!(?capacity, ?backend, "Sealing Audio8 serving capacity; device throughput qualification is separate");
+            bundle_draft.seal_fish_capacity(capacity.clone())?;
+            state_publications.extend(self.load_audio8_state_publications(
+                variant, model_instance_id, bundle_draft,
+                self.config.max_sequence_length.explicit_tokens().unwrap_or(model.config().max_seq_len).min(model.config().max_seq_len),
+                &capacity,
+                |graphs| model.physical_state_spec(graphs),
+            ).await?);
+        }
+        Ok(())
+    }
 
     /// Fish Audio Drama 3 (§7.2–7.3): its own capacity, sealed into its
     /// adapter through Fish S2's interface; one retained state of four

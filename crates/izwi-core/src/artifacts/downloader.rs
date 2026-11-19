@@ -272,6 +272,21 @@ const FISH_S2_PRO_FILES: &[&str] = &[
     "tokenizer_config.json",
 ];
 
+/// Audio8 TTS Realistic Air's root checkpoint. The repository's `llama-cpp/`
+/// export (3.76 GB of F32 GGUF for another runtime) is not downloaded.
+const AUDIO8_FILES: &[&str] = &[
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "config.json",
+    "generation_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "model.safetensors",
+    "codec.pth",
+];
+
 fn vibevoice_tokenizer_repo(variant: ModelVariant) -> Option<&'static str> {
     match variant {
         ModelVariant::VibeVoice15BTts => Some("Qwen/Qwen2.5-1.5B"),
@@ -2061,6 +2076,9 @@ impl ModelDownloader {
             ModelFamily::FishS2Tts => FISH_S2_PRO_FILES
                 .iter()
                 .all(|file| path.join(file).exists()),
+            ModelFamily::Audio8Tts => AUDIO8_FILES
+                .iter()
+                .all(|file| path.join(file).exists()),
             ModelFamily::FishDrama3Tts => fish_drama3_bundle_is_complete(&path),
             // The watermarker is needed only while the watermark is on.
             ModelFamily::ChatterboxTts => chatterbox_files(variant).iter().all(|file| {
@@ -2766,6 +2784,10 @@ impl ModelDownloader {
                 files
             }
             ModelFamily::FishS2Tts => FISH_S2_PRO_FILES
+                .iter()
+                .map(|file| (*file).to_string())
+                .collect(),
+            ModelFamily::Audio8Tts => AUDIO8_FILES
                 .iter()
                 .map(|file| (*file).to_string())
                 .collect(),
@@ -5066,6 +5088,45 @@ mod tests {
         assert!(!downloader.is_downloaded(variant));
 
         std::fs::write(model_dir.join(FISH_S2_PRO_FILES.last().unwrap()), [0u8])
+            .expect("last fish s2 asset");
+        assert!(downloader.is_downloaded(variant));
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+    #[test]
+    fn audio8_files_are_the_root_checkpoint_at_its_pin() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Audio8TtsRealisticAir;
+        let files = downloader.get_model_files(variant);
+        for file in crate::models::architectures::audio8::artifacts::AUDIO8_REQUIRED_FILES {
+            assert!(files.contains(&file.to_string()), "{file}");
+        }
+        assert!(files.iter().all(|file| !file.starts_with("llama-cpp")));
+
+        let specs = downloader.get_model_file_specs(variant);
+        assert!(specs
+            .iter()
+            .all(|spec| spec.source_repo == "Edge0/Audio8-TTS-Realistic-Air"));
+        assert!(specs
+            .iter()
+            .all(|spec| spec.source_revision == ModelVariant::AUDIO8_ARTIFACT_REVISION));
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn audio8_is_downloaded_only_when_required_assets_exist() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Audio8TtsRealisticAir;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+
+        for file in AUDIO8_FILES.iter().take(AUDIO8_FILES.len() - 1) {
+            std::fs::write(model_dir.join(file), [0u8]).expect("partial fish s2 asset");
+        }
+        assert!(!downloader.is_downloaded(variant));
+
+        std::fs::write(model_dir.join(AUDIO8_FILES.last().unwrap()), [0u8])
             .expect("last fish s2 asset");
         assert!(downloader.is_downloaded(variant));
 

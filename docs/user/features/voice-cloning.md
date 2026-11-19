@@ -48,7 +48,8 @@ Voice cloning now lives inside the unified **Voices** workspace.
    - Single speaker
 
 The reference transcript is marked optional: Chatterbox clones from the audio
-alone, while Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro, Fish Audio Drama 3
+alone, while Qwen3-TTS Base, VibeVoice, Fish Audio S2 Pro, Fish Audio Drama 3,
+Audio8 TTS Realistic Air
 and Maya 2 Native need it. With Maya 2 Native, the dialog also asks for the
 language of the recording, or detects it from the transcript; the voice can
 then speak any of the model's languages.
@@ -68,7 +69,7 @@ then speak any of the model's languages.
 
 ## Using the CLI
 
-Use `izwi tts` with a Base, VibeVoice, `FishAudio-S2-Pro`, `FishAudio-Drama-3` or `Maya2-Native-2.5B` TTS model and
+Use `izwi tts` with a Base, VibeVoice, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Audio8-TTS-Realistic-Air` or `Maya2-Native-2.5B` TTS model and
 provide both the reference audio and its transcript:
 
 ```bash
@@ -240,6 +241,7 @@ its own.
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice |
 | `FishAudio-S2-Pro` | ~11.5 GB | Reference voice or saved voice only |
 | `FishAudio-Drama-3` | ~41.5 GB | Needs a transcript; reference clips up to 60 s; a reference per speaker for dialogue (up to 8); also speaks without a reference |
+| `Audio8-TTS-Realistic-Air` | ~2.6 GB | 23 languages; needs a transcript; reference clips up to 30 s; also speaks without a reference |
 | `Chatterbox-500M` | ~3.2 GB | English; clones from audio alone, no transcript needed |
 | `Chatterbox-Multilingual-500M` | ~3.3 GB | 22 languages (set `language`); clones from audio alone |
 | `Maya2-Native-2.5B` | ~5.5 GB | English and 11 Indic languages; needs a transcript; clones across languages |

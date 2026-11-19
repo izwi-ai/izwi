@@ -327,6 +327,31 @@ SHA-256:
 
 ---
 
+## Audio8 TTS Realistic Air
+
+`Audio8-TTS-Realistic-Air` (about 2.6 GB) needs the root checkpoint of
+`Edge0/Audio8-TTS-Realistic-Air` at a pinned revision. The repository's
+`llama-cpp/` folder (3.76 GB of F32 GGUF for another runtime) is not used:
+
+```bash
+MODEL_DIR="<izwi-models-path>/Audio8-TTS-Realistic-Air"
+
+huggingface-cli download Edge0/Audio8-TTS-Realistic-Air \
+  README.md LICENSE NOTICE config.json generation_config.json \
+  special_tokens_map.json tokenizer.json tokenizer_config.json \
+  model.safetensors codec.pth \
+  --revision 6bf7a980759d8022a66922ee975dab99229a2dd9 \
+  --local-dir "$MODEL_DIR"
+```
+
+| File | Size (bytes) | SHA-256 |
+|------|--------------|---------|
+| `model.safetensors` | 1,202,342,528 | `f590053e980a45ebcbb2e787cff4f2dead932b2b61e5cf54d05664d9764e12d8` |
+| `codec.pth` | 1,349,857,559 | `c310505aa11fe2f6cc63b8d3130dc7e77e73227774f5c62575769b1f47a8d048` |
+| `tokenizer.json` | 12,217,872 | `f24e08099d45a8adf3f52f5f0b03276e433bb9d689bb15fcbcc48ce58744588b` |
+
+---
+
 ## Fish Audio Drama 3
 
 `FishAudio-Drama-3` (about 41.5 GB) needs the 24 files of `fishaudio/drama-3`

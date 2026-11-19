@@ -1539,6 +1539,16 @@ mod tests {
         assert!(s2["speech_capabilities"]["supports_seeded_voice"].is_null());
         assert_eq!(s2["license"], "Fish Audio Research License");
         assert!(s2["license_notice"].is_null());
+        // Audio8 speaks without a voice input too, in one voice: it reports
+        // the seeded voice and none of the dialogue fields.
+        let audio8 = model(ModelVariant::Audio8TtsRealisticAir);
+        assert_eq!(audio8["speech_capabilities"]["supports_seeded_voice"], true);
+        assert_eq!(
+            audio8["speech_capabilities"]["reference_transcript_required"],
+            true
+        );
+        assert_eq!(audio8["license"], "Apache-2.0");
+        assert!(audio8["license_notice"].is_null());
         for variant in ModelVariant::all()
             .iter()
             .filter(|variant| **variant != ModelVariant::FishAudioDrama3)
@@ -1550,7 +1560,13 @@ mod tests {
                 "max_speakers",
                 "max_references",
             ] {
-                assert!(speech[field].is_null(), "{variant}: {field}");
+                let seeded_audio8 = field == "supports_seeded_voice"
+                    && *variant == ModelVariant::Audio8TtsRealisticAir;
+                assert_eq!(
+                    speech[field].is_null(),
+                    !seeded_audio8,
+                    "{variant}: {field}"
+                );
             }
         }
     }

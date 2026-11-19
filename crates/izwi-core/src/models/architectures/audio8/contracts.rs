@@ -1,0 +1,309 @@
+//! Source-backed Audio8 parity contracts.
+//!
+//! These are the small invariants the native Rust port depends on. They mirror
+//! the published `ArkttsModel` reference without pulling model execution into
+//! tests that should stay cheap.
+
+use crate::error::{Error, Result};
+use crate::models::architectures::audio8::config::Audio8Config;
+
+pub const IM_END_TOKEN: &str = "<|im_end|>";
+pub const MODALITY_VOICE_TOKEN: &str = "<|voice|>";
+pub const SPEAKER_ASSISTANT_TOKEN: &str = "<|speaker:assistant|>";
+pub const SEMANTIC_TOKEN_TEMPLATE_PREFIX: &str = "<|semantic:";
+pub const SEMANTIC_TOKEN_TEMPLATE_SUFFIX: &str = "|>";
+
+/// Tokens only the prompt builder writes: the ChatML turn markers, the
+/// modality markers and the semantic band (by its prefix). The tokenizer
+/// maps each to one special id, and the target text and the reference
+/// transcript go into the prompt as written, so a caller's copy would
+/// rewrite the prompt's structure. The speech routes refuse caller text
+/// holding one; any other text, `[tags]` and `<|speaker:N|>` included, is
+/// content.
+pub const CONTROL_TOKENS: [&str; 6] = [
+    "<|im_start|>",
+    IM_END_TOKEN,
+    MODALITY_VOICE_TOKEN,
+    "<|text|>",
+    "<|interleave|>",
+    SEMANTIC_TOKEN_TEMPLATE_PREFIX,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Audio8DacContract {
+    pub sample_rate: u32,
+    pub encoder_rates: &'static [usize],
+    pub decoder_rates: &'static [usize],
+    pub semantic_codebooks: usize,
+    pub residual_codebooks: usize,
+    pub semantic_codebook_size: usize,
+    pub residual_codebook_size: usize,
+    pub codebook_dim: usize,
+    pub latent_dim: usize,
+}
+
+impl Audio8DacContract {
+    pub const CURRENT: Self = Self {
+        sample_rate: 44_100,
+        encoder_rates: &[2, 4, 8, 8],
+        decoder_rates: &[8, 8, 4, 2],
+        semantic_codebooks: 1,
+        residual_codebooks: 9,
+        semantic_codebook_size: 4096,
+        residual_codebook_size: 1024,
+        codebook_dim: 8,
+        latent_dim: 1024,
+    };
+
+    pub fn total_codebooks(&self) -> usize {
+        self.semantic_codebooks + self.residual_codebooks
+    }
+
+    pub fn hop_length(&self) -> Result<usize> {
+        checked_product(self.encoder_rates, "Audio8 DAC encoder rates")
+    }
+
+    pub fn frame_length(&self) -> Result<usize> {
+        self.hop_length()?
+            .checked_mul(4)
+            .ok_or_else(|| Error::ConfigError("Audio8 DAC frame length overflowed".to_string()))
+    }
+
+    pub fn frame_rate_hz(&self) -> Result<f32> {
+        Ok(self.sample_rate as f32 / self.frame_length()? as f32)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Audio8PromptTensorShape {
+    pub rows: usize,
+    pub seq_len: usize,
+}
+
+impl Audio8PromptTensorShape {
+    pub fn from_config(config: &Audio8Config, seq_len: usize) -> Self {
+        Self {
+            rows: config.num_codebooks + 1,
+            seq_len,
+        }
+    }
+
+    pub fn validate(&self, config: &Audio8Config) -> Result<()> {
+        let expected = config.num_codebooks + 1;
+        if self.rows != expected {
+            return Err(Error::InvalidInput(format!(
+                "Audio8 prompt tensor must have {expected} rows, got {}",
+                self.rows
+            )));
+        }
+        if self.seq_len == 0 {
+            return Err(Error::InvalidInput(
+                "Audio8 prompt tensor sequence length cannot be zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Published tensor name to the name the slow and fast transformers load.
+/// The checkpoint is flat: `layers.N.*` is the slow transformer,
+/// `fast_layers.N.*` the fast one, and the embeddings and norms sit at the
+/// top level.
+pub fn remap_audio8_key(key: &str) -> String {
+    if key == "embeddings.weight" {
+        return "embed_tokens.weight".to_string();
+    }
+    key.replace(".attention.wqkv.", ".self_attn.qkv_proj.")
+        .replace(".attention.wo.", ".self_attn.o_proj.")
+        .replace(".attention_norm.", ".input_layernorm.")
+        .replace(".ffn_norm.", ".post_attention_layernorm.")
+        .replace(".feed_forward.w1.", ".mlp.gate_proj.")
+        .replace(".feed_forward.w3.", ".mlp.up_proj.")
+        .replace(".feed_forward.w2.", ".mlp.down_proj.")
+}
+
+pub fn semantic_token_id(config: &Audio8Config, semantic_code: u32) -> Result<u32> {
+    let max_code = u32::try_from(config.codebook_size.saturating_sub(1))
+        .map_err(|_| Error::ConfigError("Audio8 codebook size does not fit in u32".to_string()))?;
+    if semantic_code > max_code {
+        return Err(Error::InvalidInput(format!(
+            "Audio8 semantic code {semantic_code} exceeds max code {max_code}"
+        )));
+    }
+    config
+        .semantic_start_token_id
+        .checked_add(semantic_code)
+        .ok_or_else(|| Error::ConfigError("Audio8 semantic token id overflowed".to_string()))
+}
+
+pub fn semantic_code_from_token_id(config: &Audio8Config, token_id: u32) -> Result<u32> {
+    if token_id < config.semantic_start_token_id || token_id > config.semantic_end_token_id {
+        return Err(Error::InvalidInput(format!(
+            "Audio8 token id {token_id} is outside semantic range {}..={}",
+            config.semantic_start_token_id, config.semantic_end_token_id
+        )));
+    }
+    Ok(token_id - config.semantic_start_token_id)
+}
+
+pub fn build_semantic_allowed_mask(
+    vocab_size: usize,
+    config: &Audio8Config,
+    im_end_token_id: u32,
+) -> Result<Vec<bool>> {
+    if config.semantic_end_token_id as usize >= vocab_size {
+        return Err(Error::ConfigError(format!(
+            "Audio8 semantic end id {} exceeds vocab size {vocab_size}",
+            config.semantic_end_token_id
+        )));
+    }
+    if im_end_token_id as usize >= vocab_size {
+        return Err(Error::ConfigError(format!(
+            "Audio8 im_end id {im_end_token_id} exceeds vocab size {vocab_size}"
+        )));
+    }
+
+    let mut mask = vec![false; vocab_size];
+    for token_id in config.semantic_start_token_id..=config.semantic_end_token_id {
+        mask[token_id as usize] = true;
+    }
+    mask[im_end_token_id as usize] = true;
+    Ok(mask)
+}
+
+fn checked_product(values: &[usize], label: &str) -> Result<usize> {
+    values.iter().try_fold(1usize, |acc, value| {
+        acc.checked_mul(*value)
+            .ok_or_else(|| Error::ConfigError(format!("{label} product overflowed")))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> Audio8Config {
+        crate::models::architectures::audio8::config::current_config()
+    }
+
+    #[test]
+    fn remaps_published_tensor_names() {
+        for (source, expected) in [
+            ("embeddings.weight", "embed_tokens.weight"),
+            ("norm.weight", "norm.weight"),
+            ("codebook_embeddings.weight", "codebook_embeddings.weight"),
+            (
+                "layers.0.attention.wqkv.weight",
+                "layers.0.self_attn.qkv_proj.weight",
+            ),
+            (
+                "layers.0.attention.wqkv.bias",
+                "layers.0.self_attn.qkv_proj.bias",
+            ),
+            (
+                "layers.23.attention.wo.weight",
+                "layers.23.self_attn.o_proj.weight",
+            ),
+            (
+                "layers.0.attention_norm.weight",
+                "layers.0.input_layernorm.weight",
+            ),
+            (
+                "layers.0.ffn_norm.weight",
+                "layers.0.post_attention_layernorm.weight",
+            ),
+            (
+                "layers.0.feed_forward.w1.weight",
+                "layers.0.mlp.gate_proj.weight",
+            ),
+            (
+                "layers.0.feed_forward.w3.weight",
+                "layers.0.mlp.up_proj.weight",
+            ),
+            (
+                "layers.0.feed_forward.w2.weight",
+                "layers.0.mlp.down_proj.weight",
+            ),
+            (
+                "fast_layers.3.attention.wqkv.weight",
+                "fast_layers.3.self_attn.qkv_proj.weight",
+            ),
+            ("fast_embeddings.weight", "fast_embeddings.weight"),
+            ("fast_norm.weight", "fast_norm.weight"),
+            ("fast_output.weight", "fast_output.weight"),
+        ] {
+            assert_eq!(remap_audio8_key(source), expected);
+        }
+    }
+
+    #[test]
+    fn semantic_token_mapping_is_inclusive_and_contiguous() {
+        let config = config();
+        assert_eq!(
+            semantic_token_id(&config, 0).unwrap(),
+            config.semantic_start_token_id
+        );
+        assert_eq!(
+            semantic_token_id(&config, 4095).unwrap(),
+            config.semantic_end_token_id
+        );
+        assert_eq!(
+            semantic_code_from_token_id(&config, config.semantic_start_token_id).unwrap(),
+            0
+        );
+        assert_eq!(
+            semantic_code_from_token_id(&config, config.semantic_end_token_id).unwrap(),
+            4095
+        );
+        assert!(semantic_token_id(&config, 4096).is_err());
+        assert!(semantic_code_from_token_id(&config, config.semantic_start_token_id - 1).is_err());
+    }
+
+    #[test]
+    fn semantic_allowed_mask_admits_only_semantic_range_and_im_end() {
+        let config = config();
+        let im_end_id = config.eos_token_id;
+        let mask = build_semantic_allowed_mask(config.text_config.vocab_size, &config, im_end_id)
+            .expect("mask");
+        let allowed = mask.iter().filter(|allowed| **allowed).count();
+        assert_eq!(allowed, config.semantic_vocab_size() + 1);
+        assert!(mask[config.semantic_start_token_id as usize]);
+        assert!(mask[config.semantic_end_token_id as usize]);
+        assert!(mask[im_end_id as usize]);
+        assert!(!mask[(config.semantic_start_token_id - 1) as usize]);
+    }
+
+    #[test]
+    fn prompt_tensor_shape_has_main_row_plus_codebook_rows() {
+        let config = config();
+        let shape = Audio8PromptTensorShape::from_config(&config, 17);
+        assert_eq!(shape.rows, 11);
+        assert_eq!(shape.seq_len, 17);
+        shape.validate(&config).unwrap();
+        assert!(Audio8PromptTensorShape {
+            rows: 10,
+            seq_len: 17
+        }
+        .validate(&config)
+        .is_err());
+        assert!(Audio8PromptTensorShape {
+            rows: 11,
+            seq_len: 0
+        }
+        .validate(&config)
+        .is_err());
+    }
+
+    #[test]
+    fn dac_contract_matches_published_codec_config() {
+        let contract = Audio8DacContract::CURRENT;
+        assert_eq!(contract.sample_rate, 44_100);
+        assert_eq!(contract.total_codebooks(), 10);
+        assert_eq!(contract.hop_length().unwrap(), 512);
+        assert_eq!(contract.frame_length().unwrap(), 2048);
+        let frame_rate = contract.frame_rate_hz().unwrap();
+        assert!((frame_rate - 21.533).abs() < 0.01);
+        assert_eq!(contract.semantic_codebook_size, 4096);
+        assert_eq!(contract.residual_codebook_size, 1024);
+    }
+}

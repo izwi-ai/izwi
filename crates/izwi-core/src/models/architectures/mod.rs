@@ -5,6 +5,7 @@
 //! 2. Export that family here.
 //! 3. Wire loading in `crate::models::registry`.
 
+pub mod audio8;
 pub mod chatterbox;
 pub mod fish_drama3;
 pub mod fish_s2;

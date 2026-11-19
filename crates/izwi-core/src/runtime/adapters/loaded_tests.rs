@@ -742,6 +742,7 @@ fn every_supported_model_capability_authors_an_exact_width_one_contract() {
                 assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
             } else if factory.id() == LoadedAdapterKind::FishS2Tts.factory_id()
                 || factory.id() == LoadedAdapterKind::FishDrama3Tts.factory_id()
+                || factory.id() == LoadedAdapterKind::Audio8Tts.factory_id()
                 || (factory.id() == LoadedAdapterKind::RumbleAsr.factory_id()
                     && !crate::models::architectures::rumble::rumble_retained_decode_enabled(
                         BackendKind::Cpu,
@@ -1285,10 +1286,14 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         == crate::catalog::ModelFamily::Qwen3Tts;
                     let kokoro_tts = execution.metadata().capability == CapabilityKind::Tts
                         && variant.family() == crate::catalog::ModelFamily::KokoroTts;
-                    // S2's route shape, S2's and Drama 3's.
+                    // S2's route shape: S2's, Drama 3's and Audio8's.
                     let fish_s2_tts = FishS2PhysicalTtsAdapterFactory
                         .supports(execution.metadata(), BackendKind::Cpu)
-                        || variant.family() == crate::catalog::ModelFamily::FishDrama3Tts;
+                        || matches!(
+                            variant.family(),
+                            crate::catalog::ModelFamily::FishDrama3Tts
+                                | crate::catalog::ModelFamily::Audio8Tts
+                        );
                     let retained_tts = execution.metadata().capability == CapabilityKind::Tts
                         && matches!(
                             variant.family(),

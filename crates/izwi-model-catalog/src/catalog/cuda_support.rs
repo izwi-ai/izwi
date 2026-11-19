@@ -309,6 +309,7 @@ impl ModelVariant {
             | ModelFamily::VoxtralTts
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts
+            | ModelFamily::Audio8Tts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts
@@ -391,6 +392,7 @@ impl ModelVariant {
             | ModelFamily::VoxtralTts
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts
+            | ModelFamily::Audio8Tts
             | ModelFamily::FishDrama3Tts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
@@ -567,6 +569,7 @@ impl ModelVariant {
             ModelFamily::Qwen3Tts
             | ModelFamily::KokoroTts
             | ModelFamily::FishS2Tts
+            | ModelFamily::Audio8Tts
             | ModelFamily::ParakeetAsr
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr

@@ -275,6 +275,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -341,6 +343,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: Some(params),
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -398,6 +402,66 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: Some(artifact),
             fish_s2_tts_params: Some(params),
+            audio8_tts: None,
+            audio8_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
+            maya2_tts: None,
+            maya2_tts_params: None,
+            lfm3_audio: None,
+            nemotron_transcribe: None,
+            sov_transcribe: None,
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+    pub(crate) fn install_audio8_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: Audio8TtsModelLease,
+        artifact: Arc<Audio8PreparedArtifact>,
+        params: Audio8GenerationParams,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::Audio8Tts
+            || artifact.prompt_tokens() == 0
+            || artifact.prompt_tokens() >= max_sequence_tokens
+            || params.max_frames == 0
+        {
+            return Err(Error::InvalidInput(format!(
+                "Audio8 TTS request {} preparation does not match its routed model/context",
+                self.id
+            )));
+        }
+        // Validate exact reference + text + full output room before admission.
+        crate::models::architectures::audio8::effective_frame_budget(
+            artifact.prompt_tokens(),
+            max_sequence_tokens,
+            max_sequence_tokens,
+            params.max_frames,
+        )?;
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt_tokens());
+        self.params.max_tokens = params.max_frames;
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::Audio8Tts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            audio8_tts: Some(artifact),
+            audio8_tts_params: Some(params),
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -448,6 +512,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: Some(artifact),
@@ -498,6 +564,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -548,6 +616,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -600,6 +670,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -659,6 +731,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: Some(artifact),
             fish_drama3_tts_params: Some(params),
             voxtral_tts: None,
@@ -827,6 +901,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -888,6 +964,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -1004,6 +1082,8 @@ impl EngineCoreRequest {
             vibevoice_tts_params: None,
             fish_s2_tts: None,
             fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
             fish_drama3_tts: None,
             fish_drama3_tts_params: None,
             voxtral_tts: None,
@@ -1116,6 +1196,18 @@ impl EngineCoreRequest {
                 _ => None,
             }))
     }
+    pub(crate) fn prepared_audio8_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<Audio8TtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::Audio8Tts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
 
     pub(crate) fn prepared_fish_s2_tts_artifact_for_executor(
         &self,
@@ -1126,6 +1218,15 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| ready.fish_s2_tts.clone()))
     }
+    pub(crate) fn prepared_audio8_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<Audio8PreparedArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.audio8_tts.clone()))
+    }
 
     pub(crate) fn fish_s2_tts_generation_params_for_executor(
         &self,
@@ -1135,6 +1236,15 @@ impl EngineCoreRequest {
             .incremental_model_execution_ready
             .as_ref()
             .and_then(|ready| ready.fish_s2_tts_params.clone()))
+    }
+    pub(crate) fn audio8_tts_generation_params_for_executor(
+        &self,
+    ) -> Result<Option<Audio8GenerationParams>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.audio8_tts_params.clone()))
     }
 
     /// The decode quanta a Fish Audio Drama 3 request may take: one per
@@ -1372,6 +1482,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::Audio8Tts(_)
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
@@ -1397,6 +1508,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::Lfm25AudioTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::Audio8Tts(_)
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)

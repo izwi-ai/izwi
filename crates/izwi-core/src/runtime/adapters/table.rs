@@ -34,6 +34,7 @@ pub(crate) enum LoadedAdapterKind {
     Lfm25AudioTts,
     VibeVoiceTts,
     FishS2Tts,
+    Audio8Tts,
     FishDrama3Tts,
     VoxtralTts,
     ChatterboxTts,
@@ -69,6 +70,7 @@ impl LoadedAdapterKind {
             Self::Lfm25AudioTts => "builtin.lfm25_audio_tts.physical_sequence",
             Self::VibeVoiceTts => "builtin.vibevoice_tts.physical_sequence",
             Self::FishS2Tts => "builtin.fish_s2_tts.physical_sequence",
+            Self::Audio8Tts => "builtin.audio8_tts.physical_sequence",
             Self::FishDrama3Tts => "builtin.fish_drama3_tts.physical_sequence",
             Self::VoxtralTts => "builtin.voxtral_tts.physical_sequence",
             Self::ChatterboxTts => "builtin.chatterbox_tts.physical_sequence",
@@ -267,6 +269,13 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
             RetainedAndInvocation,
         )
         .chunked(),
+        row(
+            F::Audio8Tts,
+            C::Tts,
+            Loaded::Audio8Tts,
+            RetainedAndInvocation,
+        )
+        .chunked(),
         // Streams on its TTS route: a streamed request renders windows while
         // T3 runs; otherwise the acoustic stage renders the whole utterance
         // once T3 has stopped.
@@ -289,6 +298,13 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
             F::FishS2Tts,
             C::StreamingTts,
             Loaded::FishS2Tts,
+            RetainedAndInvocation,
+        )
+        .chunked(),
+        row(
+            F::Audio8Tts,
+            C::StreamingTts,
+            Loaded::Audio8Tts,
             RetainedAndInvocation,
         )
         .chunked(),

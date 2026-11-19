@@ -583,6 +583,12 @@ impl RuntimeService {
                 .await?
                 .artifact_fingerprint()
                 .map(str::to_owned),
+            crate::catalog::ModelFamily::Audio8Tts => self
+                .model_registry
+                .get_audio8_tts(variant)
+                .await?
+                .artifact_fingerprint()
+                .map(str::to_owned),
             crate::catalog::ModelFamily::FishDrama3Tts => self
                 .model_registry
                 .get_fish_drama3_tts(variant)
@@ -607,6 +613,10 @@ impl RuntimeService {
             }
             crate::catalog::ModelFamily::FishS2Tts => {
                 let model = self.model_registry.get_fish_s2_tts(variant).await?;
+                serde_json::to_value(model.diagnostics()).ok()
+            }
+            crate::catalog::ModelFamily::Audio8Tts => {
+                let model = self.model_registry.get_audio8_tts(variant).await?;
                 serde_json::to_value(model.diagnostics()).ok()
             }
             crate::catalog::ModelFamily::FishDrama3Tts => {

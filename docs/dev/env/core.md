@@ -26,6 +26,22 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_ASR_STREAM_CHUNK_OVERLAP_SECS` | number | 0.45 (audio <=12s) else min(long-form overlap, 1.0) | first use | Overrides the overlap in seconds between low-latency streaming ASR chunks (capped at 45% of target). |
 | `IZWI_ASR_STREAM_CHUNK_SILENCE_SEARCH_SECS` | number | 0.75 (audio <=12s) else 1.5 | first use | Overrides the silence-search window in seconds around streaming ASR chunk boundaries (capped at half the target). |
 | `IZWI_ASR_STREAM_CHUNK_TARGET_SECS` | number | 2.4 (audio <=12s) else min(long-form target, 6) | first use | Overrides the preferred chunk length in seconds for low-latency streaming ASR chunk planning. |
+| `IZWI_AUDIO8_BACKEND` | choice | auto (smoke.rs); required in streaming_smoke.rs | test harness | Backend for Audio8 smoke tests: auto, cpu, metal, cuda (streaming smoke rejects auto). |
+| `IZWI_AUDIO8_BATCHED_SAMPLING` | flag | `true` | first use | Draws an Audio8 step's semantic tokens (CUDA and Metal) and fast codes (each depth) for every row from one device pass and one readback, uploading each frame's sampling noise once for all rows; false samples each row on its own. |
+| `IZWI_AUDIO8_CODEBOOK_FIXTURE` | path | unset (test fails) | test harness | JSON file of real codebook frames for the ignored Audio8 CUDA codec stream test. |
+| `IZWI_AUDIO8_CODEC_PATH` | path | unset (test fails) | test harness | Path to Audio8's codec.pth for the ignored CUDA codec stream test. |
+| `IZWI_AUDIO8_DTYPE` | choice | Audio8 per-backend dtype policy | model load | Overrides the Audio8 TTS weight dtype (f32, f16 or bf16, where the backend runs it); also used by the load memory estimate. The codec always loads F32. |
+| `IZWI_AUDIO8_FAST_GRAPHS` | flag | `true` | first use | On CUDA, Audio8 runs each frame's fast transformer (the slow hidden state and nine codebook depths, with each row's KV dense inside the frame, and each depth's codes drawn on the device from noise drawn before the frame) as a CUDA graph at 32 rows, spare rows zero, one graph per input dtype and sampling policy. A load-time self-check compares replays with the eager frame bit for bit; a mismatch or CUDA error keeps every frame on the eager paged path. Any false value turns the graphs off; `fast_graphs` in the model diagnostics reports why they are off, captures, replays, fallbacks and graphed and eager frames. |
+| `IZWI_AUDIO8_MODEL_DIR` | path | unset (test fails) | test harness | Audio8 TTS Realistic Air model directory; must end in the variant directory name. |
+| `IZWI_AUDIO8_NATIVE_BATCHING` | flag | true on CUDA, false on CPU and Metal | model load | Decodes concurrent Audio8 TTS requests as rows of one batch when the model loads; false keeps one row at a time. |
+| `IZWI_AUDIO8_REFERENCE_TEXT` | text | contents of data/fox.md | test harness | Transcript of the reference WAV; required when IZWI_AUDIO8_REFERENCE_WAV is set. |
+| `IZWI_AUDIO8_REFERENCE_WAV` | path | `data/fox.wav` | test harness | Reference voice WAV that conditions Audio8 smoke synthesis; `none` speaks with no reference. |
+| `IZWI_AUDIO8_SMOKE_CONTEXT` | integer | `2048` | test harness | Max sequence length for the Audio8 smoke runtime; an unparsable value fails the test. |
+| `IZWI_AUDIO8_SMOKE_MAX_FRAMES` | integer | `512` | test harness | Max generated frames (max_tokens) for the Audio8 smoke request. |
+| `IZWI_AUDIO8_SMOKE_OUTPUT_WAV` | path | unset (no file written) | test harness | When set, writes the generated Audio8 smoke audio to this WAV path. |
+| `IZWI_AUDIO8_SMOKE_TEMPERATURE` | number | `0.0` | test harness | Sampling temperature for the Audio8 smoke request. |
+| `IZWI_AUDIO8_SMOKE_TOP_P` | number | `1.0` | test harness | Top-p for the Audio8 smoke request. |
+| `IZWI_AUDIO8_TARGET_TEXT` | text | the reference transcript | test harness | Text the Audio8 smoke test synthesizes. |
 | `IZWI_BACKEND` | choice | `auto` | startup | Selects the execution backend: auto, cpu, metal (alias mps) or cuda (alias gpu); unknown values ignored. |
 | `IZWI_BATCHED_DEVICE_SAMPLING` | flag | `true` | first use | Kill switch: false plans each sampled chat row's device candidates on its own in a batched decode step instead of in one pass for all rows (CUDA, Metal). |
 | `IZWI_BUFFER_POOL` | flag | `true` | model load | Enables the global pre-allocated inference buffer pool (initialized by Qwen3 ASR load). |

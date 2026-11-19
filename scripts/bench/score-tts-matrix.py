@@ -133,6 +133,16 @@ def family_cases(family, reference):
             ("expressive", "short",
              {"voice": "default", "exaggeration": 0.9, "cfg_weight": 0.3}, False),
         ],
+        # Audio8: a voice its seed sets, a cloned one, streaming, numbers, and
+        # "long" as a segment plan that keeps the first segment's voice.
+        "audio8": [
+            ("short", "short", seeded, False),
+            ("clone", "short", dict(clone, **seeded), False),
+            ("med", "med", seeded, False),
+            ("med_stream", "med", seeded, True),
+            ("num", "num", seeded, False),
+            ("long", "long", seeded, False),
+        ],
         # Fish Audio Drama 3: a voice its seed sets, a cloned one, chunked
         # streaming, tags, a referenced speaker beside a seeded one, and
         # "long" as a chunk session of about five chunks with history.

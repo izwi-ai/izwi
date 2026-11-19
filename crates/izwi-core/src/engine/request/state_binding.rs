@@ -515,6 +515,29 @@ impl EngineCoreRequest {
                 )));
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::Audio8Tts(_)) {
+            let prepared = ready.audio8_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Audio8 TTS request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            let params = ready.audio8_tts_params.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Audio8 TTS request {} is missing its sealed generation geometry",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::Audio8Tts
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt_tokens())
+                || self.params.max_tokens != params.max_frames
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Audio8 TTS request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         if matches!(&ready.model, PreparedIncrementalModel::FishDrama3Tts(_)) {
             let prepared = ready.fish_drama3_tts.as_ref().ok_or_else(|| {
                 Error::InvalidInput(format!(
@@ -738,6 +761,13 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::Audio8Tts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::Audio8Tts
+                    && ready.audio8_tts.is_some()
+                    && ready.audio8_tts_params.is_some() =>
+            {
+                Ok(())
+            }
             (PreparedIncrementalModel::FishDrama3Tts(_), TaskType::TTS)
                 if ready.model_variant.family() == ModelFamily::FishDrama3Tts
                     && ready.fish_drama3_tts.is_some()
@@ -854,6 +884,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::QwenTts(_) => None,
                 PreparedIncrementalModel::VibeVoiceTts(_)
                 | PreparedIncrementalModel::FishS2Tts(_)
+                | PreparedIncrementalModel::Audio8Tts(_)
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)

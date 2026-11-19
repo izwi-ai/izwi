@@ -13,9 +13,9 @@ use crate::backends::BackendKind;
 use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 59;
+pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 60;
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 87;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 89;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformanceExecutionClass {
@@ -449,7 +449,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            78
+            80
         );
         assert_eq!(
             manifest
@@ -560,6 +560,11 @@ mod tests {
             (ModelVariant::FishAudioS2Pro, CapabilityKind::StreamingTts),
             (ModelVariant::FishAudioDrama3, CapabilityKind::Tts),
             (ModelVariant::FishAudioDrama3, CapabilityKind::StreamingTts),
+            (ModelVariant::Audio8TtsRealisticAir, CapabilityKind::Tts),
+            (
+                ModelVariant::Audio8TtsRealisticAir,
+                CapabilityKind::StreamingTts,
+            ),
             (ModelVariant::WhisperLargeV3Turbo, CapabilityKind::Asr),
             (ModelVariant::VibeVoiceAsr, CapabilityKind::Asr),
             (ModelVariant::ParakeetTdt06BV3, CapabilityKind::Asr),

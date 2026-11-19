@@ -3967,6 +3967,17 @@ impl NativeExecutor {
         if ordered_requests.first().is_some_and(|request| {
             request
                 .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::Audio8Tts)
+        }) {
+            return self.audio8_tts_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
+        if ordered_requests.first().is_some_and(|request| {
+            request
+                .model_variant
                 .is_some_and(|variant| variant.family() == ModelFamily::FishDrama3Tts)
         }) {
             return self.fish_drama3_tts_batch_with_managed(

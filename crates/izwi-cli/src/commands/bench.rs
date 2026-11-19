@@ -6669,7 +6669,7 @@ concurrent = [1, 2]
         let text = std::fs::read_to_string(path).expect("CUDA family manifest");
         let manifest: BenchmarkManifest = toml::from_str(&text).expect("valid CUDA manifest");
         let cases = expand_manifest_cases(&manifest).expect("unique CUDA cases");
-        assert_eq!(cases.len(), 19);
+        assert_eq!(cases.len(), 20);
         assert!(cases.iter().all(|case| case.model.is_some()));
         assert!(cases
             .iter()
@@ -6737,6 +6737,7 @@ concurrent = [1, 2]
             ("Voxtral-Mini-4B-Realtime-2602", "asr"),
             ("Whisper-Large-v3-Turbo", "asr"),
             ("FishAudio-S2-Pro", "tts"),
+            ("Audio8-TTS-Realistic-Air", "tts"),
             ("Chatterbox-500M", "tts"),
             (DRAMA3, "tts"),
         ]
@@ -6752,7 +6753,7 @@ concurrent = [1, 2]
             let manifest: BenchmarkManifest =
                 toml::from_str(&text).expect("valid audio performance manifest");
             let cases = expand_manifest_cases(&manifest).expect("unique audio performance cases");
-            assert_eq!(cases.len(), 68 + drama3_widths.len(), "{name}");
+            assert_eq!(cases.len(), 72 + drama3_widths.len(), "{name}");
             assert!(
                 cases
                     .iter()
@@ -6784,7 +6785,7 @@ concurrent = [1, 2]
                         .iter()
                         .filter(|case| case.concurrent == Some(concurrency))
                         .count(),
-                    17,
+                    18,
                     "{name} c{concurrency}"
                 );
             }

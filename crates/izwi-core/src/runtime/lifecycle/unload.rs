@@ -140,6 +140,10 @@ impl ModelLifecycleController {
                 self.model_registry.unload_fish_s2_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
+            ModelFamily::Audio8Tts => {
+                self.model_registry.unload_audio8_tts(variant).await;
+                self.clear_active_tts_variant(variant).await;
+            }
             ModelFamily::ChatterboxTts => {
                 self.model_registry.unload_chatterbox_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;

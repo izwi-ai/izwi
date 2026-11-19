@@ -270,6 +270,9 @@ pub(super) struct VibeVoicePhysicalTtsAdapterFactory;
 pub(super) struct FishS2PhysicalTtsAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct Audio8PhysicalTtsAdapterFactory;
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct FishDrama3PhysicalTtsAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
@@ -595,6 +598,32 @@ impl LoadedExecutionAdapterFactory for FishS2PhysicalTtsAdapterFactory {
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
         Ok(Arc::new(FishS2TtsExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+        )))
+    }
+}
+impl LoadedExecutionAdapterFactory for Audio8PhysicalTtsAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::Audio8Tts.factory_id()
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::Audio8Tts, metadata, backend_kind)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(Audio8TtsExecutionAdapter::new(
             context.execution_group_id,
             context.model_instance_id,
             metadata,
@@ -992,6 +1021,7 @@ pub(in crate::runtime::adapters) fn built_in_loaded_adapter_factories() -> Vec<A
         Arc::new(Lfm25AudioPhysicalTtsAdapterFactory),
         Arc::new(VibeVoicePhysicalTtsAdapterFactory),
         Arc::new(FishS2PhysicalTtsAdapterFactory),
+        Arc::new(Audio8PhysicalTtsAdapterFactory),
         Arc::new(FishDrama3PhysicalTtsAdapterFactory),
         Arc::new(VoxtralPhysicalTtsAdapterFactory),
         Arc::new(ChatterboxPhysicalTtsAdapterFactory),

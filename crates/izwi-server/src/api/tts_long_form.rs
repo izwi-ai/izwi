@@ -90,6 +90,21 @@ pub(crate) fn append_segment(joined: &mut Vec<f32>, segment: &[f32], sample_rate
     joined.extend(pause_then_segment(segment, sample_rate));
 }
 
+/// Characters in one Audio8 segment: about 55 English words, 20 s of speech
+/// and 750 frames of automatic budget, which fits the model's 2,048
+/// positions beside a full 30 s reference and its transcript.
+const AUDIO8_SEGMENT_MAX_CHARS: usize = 300;
+/// What a CJK ideograph, kana or Hangul syllable counts as toward
+/// [`AUDIO8_SEGMENT_MAX_CHARS`].
+const AUDIO8_CJK_CHAR_WEIGHT: usize = 4;
+
+fn is_cjk_syllabic(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff |
+        0xac00..=0xd7af | 0x20000..=0x3134f
+    )
+}
+
 fn chunk_max_chars() -> usize {
     configured_chunk_max_chars().unwrap_or(DEFAULT_CHUNK_MAX_CHARS)
 }
@@ -244,7 +259,8 @@ fn check_speech_plan_pcm(frames: usize) -> Result<(), izwi_core::Error> {
 
 impl SpeechTextPlan {
     /// The plan of `variant`'s speech: a chunk session for a model that
-    /// continues speech across chunks, else Fish S2's segment plan.
+    /// continues speech across chunks, else a segment plan sized for the
+    /// model (Fish S2, Audio8).
     pub fn for_variant(
         variant: ModelVariant,
         text: &str,
@@ -253,7 +269,7 @@ impl SpeechTextPlan {
         if variant.continues_speech_across_chunks() {
             Self::chunk_session(variant, text, max_output_frames)
         } else {
-            Self::fish(text, max_output_frames)
+            Self::segment_plan(variant, text, max_output_frames)
         }
     }
 
@@ -435,16 +451,44 @@ impl SpeechTextPlan {
         })
     }
 
+    /// Fish S2's segment plan.
+    #[cfg(test)]
     pub fn fish(text: &str, max_output_frames: usize) -> Result<Self, izwi_core::Error> {
+        Self::segment_plan(ModelVariant::FishAudioS2Pro, text, max_output_frames)
+    }
+
+    /// Segments of at most the model's target length, cut at sentence ends
+    /// where it can. Audio8's prompt, reference frames and output share
+    /// 2,048 positions and one request speaks at most 1,024 frames (47 s),
+    /// so its segments are shorter and a CJK character, which takes about as
+    /// long to say as a short word, counts as four.
+    fn segment_plan(
+        variant: ModelVariant,
+        text: &str,
+        max_output_frames: usize,
+    ) -> Result<Self, izwi_core::Error> {
         use sha2::{Digest, Sha256};
         check_speech_text_bytes(text)?;
+        let audio8 = variant.family() == izwi_core::ModelFamily::Audio8Tts;
+        let weight = |ch: char| -> usize {
+            if audio8 && is_cjk_syllabic(ch) {
+                AUDIO8_CJK_CHAR_WEIGHT
+            } else {
+                1
+            }
+        };
         let mut segments = Vec::new();
         let mut start = 0;
         let mut chars = 0;
         let mut boundary = None;
         let mut sentence_boundary = None;
-        // Keep Fish segments comfortably below its per-call context/output limit.
-        let target = chunk_max_chars().min(480);
+        // Keep segments comfortably below the model's per-call context and
+        // output limits.
+        let target = chunk_max_chars().min(if audio8 {
+            AUDIO8_SEGMENT_MAX_CHARS
+        } else {
+            480
+        });
         for (offset, ch) in text.char_indices() {
             if chars >= target {
                 let end = sentence_boundary
@@ -453,11 +497,11 @@ impl SpeechTextPlan {
                     .unwrap_or(offset);
                 segments.push(start..end);
                 start = end;
-                chars = text[start..offset].chars().count();
+                chars = text[start..offset].chars().map(weight).sum();
                 boundary = None;
                 sentence_boundary = None;
             }
-            chars += 1;
+            chars += weight(ch);
             if matches!(ch, '。' | '！' | '？' | '\n' | ';' | '；') {
                 sentence_boundary = Some(offset + ch.len_utf8());
             } else if matches!(ch, '.' | '!' | '?')
@@ -483,7 +527,7 @@ impl SpeechTextPlan {
         // Blank layout alone is not an inference segment. Byte ranges still
         // identify original content for durable progress and recovery.
         segments.retain(|range| !text[range.clone()].trim().is_empty());
-        if segments.len() > 1 && !crate::env_config::tuning().fish_long_form_enabled {
+        if segments.len() > 1 && !audio8 && !crate::env_config::tuning().fish_long_form_enabled {
             return Err(izwi_core::Error::InvalidInput(
                 "Fish long-form generation is disabled by this deployment".into(),
             ));
@@ -493,7 +537,7 @@ impl SpeechTextPlan {
             .try_fold(0usize, |total, range| {
                 total.checked_add(
                     crate::api::tts_policy::resolve_tts_output_frames(
-                        ModelVariant::FishAudioS2Pro,
+                        variant,
                         &text[range.clone()],
                         None,
                     )
@@ -1212,6 +1256,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
     } else {
         None
     };
+    let mut voice_anchor = SegmentVoiceAnchor::for_request(variant, &base);
     while let Some(planned) = ranges.pop_front() {
         let range = planned.range.clone();
         if let Some(progress) = progress.as_deref_mut() {
@@ -1247,6 +1292,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         request.config.streaming = true;
         request.config.options.max_tokens =
             plan.segment_frames(variant, &request.text).min(remaining);
+        voice_anchor.apply(&mut request);
         if let Some(history) = &history {
             // Each chunk's prompt holds the earlier chunks with their codes,
             // and chunk i samples from seed + i (the family's session).
@@ -1328,6 +1374,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
                 ));
             }
             rate = Some(actual);
+            voice_anchor.collect(&chunk.samples, actual);
             segment_duration += chunk.samples.len() as f32 / actual as f32;
             chunk.request_id = base.id.clone();
             chunk.is_final = false;
@@ -1357,6 +1404,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         if let Err(error) = result {
             // Exact tokenized reference+text fit is checked inside admitted model
             // preparation. Replan only before this segment has published audio.
+            voice_anchor.discard_segment();
             if !emitted && error.kind() == izwi_core::ErrorKind::ContextLengthExceeded {
                 if let Some(halves) = plan.halve(&base.text, &planned) {
                     for half in halves.into_iter().rev() {
@@ -1372,6 +1420,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
                 "Speech segment completed without audio or accounting".into(),
             ));
         }
+        voice_anchor.finish_segment(&planned.text)?;
         if let Some(history) = history.as_mut() {
             let codes = segment_codes.ok_or_else(|| {
                 izwi_core::Error::InferenceError(
@@ -1429,6 +1478,101 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
     Ok(take)
 }
 
+/// One voice through a segment plan that was given none.
+///
+/// A model that speaks without a reference (Audio8) picks its voice anew in
+/// each request, so a long text would change speaker at every segment. The
+/// first segment's audio and text become the reference of the rest: the
+/// model clones the voice it chose. A request that brings its own
+/// reference, or a model that needs one, keeps what it was given.
+///
+/// The anchor is not journaled: a plan recovered after a restart anchors on
+/// the first segment it speaks then.
+enum SegmentVoiceAnchor {
+    /// The request has a voice, or the model does not pick one.
+    Off,
+    /// Collecting the current segment's audio, at its sample rate.
+    Collecting { samples: Vec<f32>, sample_rate: u32 },
+    /// The reference later segments speak with.
+    Set { audio: String, text: String },
+}
+
+impl SegmentVoiceAnchor {
+    /// The longest anchor kept: the reference limit every speech route
+    /// applies. A longer first segment is not used, and the next one is.
+    const MAX_SECS: u64 = izwi_core::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS;
+
+    fn for_request(variant: ModelVariant, base: &GenerationRequest) -> Self {
+        let anchors = variant.family() == izwi_core::ModelFamily::Audio8Tts
+            && base.reference_audio.is_none()
+            && base.speaker_references.is_empty();
+        if anchors {
+            Self::Collecting {
+                samples: Vec::new(),
+                sample_rate: 0,
+            }
+        } else {
+            Self::Off
+        }
+    }
+
+    /// Give `request` the anchored voice, once there is one.
+    fn apply(&self, request: &mut GenerationRequest) {
+        if let Self::Set { audio, text } = self {
+            request.reference_audio = Some(audio.clone());
+            request.reference_text = Some(text.clone());
+        }
+    }
+
+    fn collect(&mut self, chunk: &[f32], rate: u32) {
+        if let Self::Collecting {
+            samples,
+            sample_rate,
+        } = self
+        {
+            *sample_rate = rate;
+            samples.extend_from_slice(chunk);
+        }
+    }
+
+    /// Drop what a failed segment published; it is spoken again.
+    fn discard_segment(&mut self) {
+        if let Self::Collecting { samples, .. } = self {
+            samples.clear();
+        }
+    }
+
+    /// The segment that just finished spoke `text`: keep it as the voice of
+    /// the segments after it.
+    fn finish_segment(&mut self, text: &str) -> Result<(), izwi_core::Error> {
+        let Self::Collecting {
+            samples,
+            sample_rate,
+        } = self
+        else {
+            return Ok(());
+        };
+        let text = text.trim();
+        let limit = (*sample_rate as u64).saturating_mul(Self::MAX_SECS);
+        if samples.is_empty()
+            || *sample_rate == 0
+            || text.is_empty()
+            || samples.len() as u64 > limit
+        {
+            samples.clear();
+            return Ok(());
+        }
+        use base64::Engine as _;
+        let wav = izwi_core::audio::AudioEncoder::new(*sample_rate, 1)
+            .encode(samples, izwi_core::audio::AudioFormat::Wav)?;
+        *self = Self::Set {
+            audio: base64::engine::general_purpose::STANDARD.encode(wav),
+            text: text.to_string(),
+        };
+        Ok(())
+    }
+}
+
 /// Send one published chunk under the next output sequence.
 async fn send_published(
     output: &tokio::sync::mpsc::Sender<izwi_core::AudioChunk>,
@@ -1455,6 +1599,110 @@ impl Drop for AbortSpeechTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With no reference, Audio8's first segment becomes the voice of the
+    /// rest; a request with its own voice, another model, a failed segment
+    /// and a segment too long to be a reference leave the request as it was.
+    #[test]
+    fn audio8_anchors_later_segments_on_the_first_ones_voice() {
+        use base64::Engine as _;
+        let audio8 = ModelVariant::Audio8TtsRealisticAir;
+        let base = GenerationRequest::new("One. Two.").with_model_variant(audio8);
+        let mut anchor = SegmentVoiceAnchor::for_request(audio8, &base);
+        let mut first = base.clone();
+        anchor.apply(&mut first);
+        assert!(
+            first.reference_audio.is_none(),
+            "the first segment has no voice yet"
+        );
+
+        // A failed attempt's audio is dropped before the segment is retried.
+        anchor.collect(&[0.9; 100], 44_100);
+        anchor.discard_segment();
+        anchor.collect(&[0.25; 2_048], 44_100);
+        anchor.collect(&[-0.25; 2_048], 44_100);
+        anchor.finish_segment(" One. ").unwrap();
+        let mut second = base.clone();
+        anchor.apply(&mut second);
+        assert_eq!(second.reference_text.as_deref(), Some("One."));
+        let wav = base64::engine::general_purpose::STANDARD
+            .decode(second.reference_audio.as_deref().unwrap())
+            .unwrap();
+        let reader = hound::WavReader::new(std::io::Cursor::new(wav)).unwrap();
+        assert_eq!(reader.spec().sample_rate, 44_100);
+        assert_eq!(reader.len(), 4_096);
+        // Later segments leave the anchor alone.
+        anchor.collect(&[0.5; 2_048], 44_100);
+        anchor.finish_segment("Two.").unwrap();
+        let mut third = base.clone();
+        anchor.apply(&mut third);
+        assert_eq!(third.reference_text.as_deref(), Some("One."));
+
+        // A segment longer than a reference may be is skipped; the next is used.
+        let mut anchor = SegmentVoiceAnchor::for_request(audio8, &base);
+        anchor.collect(&vec![0.1; 31 * 8_000], 8_000);
+        anchor.finish_segment("Too long.").unwrap();
+        assert!(matches!(anchor, SegmentVoiceAnchor::Collecting { .. }));
+        anchor.collect(&[0.1; 8_000], 8_000);
+        anchor.finish_segment("Short.").unwrap();
+        assert!(matches!(anchor, SegmentVoiceAnchor::Set { .. }));
+
+        let mut voiced = base.clone();
+        voiced.reference_audio = Some("AAAA".into());
+        assert!(matches!(
+            SegmentVoiceAnchor::for_request(audio8, &voiced),
+            SegmentVoiceAnchor::Off
+        ));
+        assert!(matches!(
+            SegmentVoiceAnchor::for_request(ModelVariant::FishAudioS2Pro, &base),
+            SegmentVoiceAnchor::Off
+        ));
+    }
+
+    /// Audio8 speaks long text as a segment plan of its own size: segments
+    /// short enough that each one's automatic budget stays under the
+    /// model's 1,024-frame cap, CJK text included, cut at sentence ends.
+    #[test]
+    fn audio8_plans_short_segments_inside_its_frame_cap() {
+        let audio8 = ModelVariant::Audio8TtsRealisticAir;
+        let cap = ModelVariant::AUDIO8_MAX_OUTPUT_FRAMES;
+        let english = "The committee reviewed every proposal in detail. ".repeat(40);
+        let plan = SpeechTextPlan::for_variant(audio8, &english, 0).unwrap();
+        assert!(!plan.is_chunk_session());
+        let fish = SpeechTextPlan::for_variant(ModelVariant::FishAudioS2Pro, &english, 0).unwrap();
+        assert!(plan.segments.len() > fish.segments.len());
+        let chinese = "今天天气很好，我们一起去公园散步吧。".repeat(40);
+        for (text, plan) in [
+            (&english, plan),
+            (
+                &chinese,
+                SpeechTextPlan::for_variant(audio8, &chinese, 0).unwrap(),
+            ),
+        ] {
+            assert!(plan.segments.len() > 1);
+            assert_eq!(plan.segments.first().unwrap().start, 0);
+            assert_eq!(plan.segments.last().unwrap().end, text.len());
+            for pair in plan.segments.windows(2) {
+                assert_eq!(pair[0].end, pair[1].start);
+            }
+            for range in &plan.segments {
+                let segment = &text[range.clone()];
+                let frames =
+                    crate::api::tts_policy::resolve_tts_output_frames(audio8, segment, None)
+                        .unwrap();
+                assert!(
+                    frames < cap,
+                    "{} chars budget {frames}",
+                    segment.chars().count()
+                );
+                let last = segment.trim_end().chars().last().unwrap();
+                assert!(matches!(last, '.' | '。'), "cut mid-sentence: {segment:?}");
+            }
+        }
+        // A short text is one segment with its own budget.
+        let short = SpeechTextPlan::for_variant(audio8, "Hello there.", 0).unwrap();
+        assert_eq!(short.segments.len(), 1);
+    }
 
     /// Streamed segments reach the consumer as one utterance: numbered in
     /// order under the request's id, the second opening with the pause, only

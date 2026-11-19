@@ -76,6 +76,9 @@ export function getModelProviderLabel(variant: string): string {
   }
   if (variant.startsWith("Voxtral-")) return "Mistral AI";
   if (variant.startsWith("Kokoro-")) return "hexgrad";
+  if (variant.startsWith("Audio8-") || variant.startsWith("Edge0/")) {
+    return "Edge0";
+  }
   if (variant.startsWith("FishAudio-") || variant.startsWith("fishaudio/")) {
     return "Fish Audio";
   }
@@ -233,6 +236,21 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     category: "tts",
     capabilities: ["Text to Speech", "Voice Cloning", "Reference Voice"],
     size: "10.7 GB",
+  },
+  "Audio8-TTS-Realistic-Air": {
+    shortName: "Audio8 Realistic Air",
+    fullName: "Audio8 TTS Realistic Air",
+    description:
+      "Compact multilingual text-to-speech in 23 languages: a voice set by the seed, or cloned from a reference clip and its transcript.",
+    category: "tts",
+    capabilities: [
+      "Text to Speech",
+      "Voice Cloning",
+      "Multilingual",
+      "Streaming",
+      "44.1 kHz",
+    ],
+    size: "2.57 GB",
   },
   "FishAudio-Drama-3": {
     shortName: "Fish Drama 3",

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::model::ModelVariant;
+use crate::models::architectures::audio8::Audio8RetainedState;
 use crate::models::architectures::chatterbox::retained::ChatterboxRetainedState;
 use crate::models::architectures::fish_drama3::{FishDrama3AudioStream, FishDrama3RequestState};
 use crate::models::architectures::fish_s2::FishS2RetainedState;
@@ -24,10 +25,10 @@ use crate::models::architectures::voxtral::realtime::{
 };
 use crate::models::architectures::voxtral::tts::retained::VoxtralTtsRetainedState;
 use crate::models::registry::{
-    AsrModelLease, ChatterboxTtsModelLease, FishDrama3TtsModelLease, FishS2TtsModelLease,
-    Lfm25AudioModelLease, Maya1TtsModelLease, Maya2TtsModelLease, NativeAsrDecodeState,
-    NativeAsrModel, NativeChatDecodeState, NativeChatReplayCheckpoint, QwenTtsModelLease,
-    VibeVoiceTtsModelLease, VoxtralModelLease, VoxtralTtsModelLease,
+    AsrModelLease, Audio8TtsModelLease, ChatterboxTtsModelLease, FishDrama3TtsModelLease,
+    FishS2TtsModelLease, Lfm25AudioModelLease, Maya1TtsModelLease, Maya2TtsModelLease,
+    NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, NativeChatReplayCheckpoint,
+    QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -214,6 +215,20 @@ pub(super) struct ActiveFishS2TtsDecode {
     pub(super) last_frames_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) codec: crate::models::architectures::fish_s2::dac::FishS2DacStreamState,
+    pub(super) audio_samples: Vec<f32>,
+    pub(super) total_audio_samples: usize,
+    pub(super) collect_audio_samples: bool,
+    pub(super) codec_ms: f64,
+    pub(super) execution_started: std::time::Instant,
+    pub(super) first_audio_ms: Option<f64>,
+}
+pub(super) struct ActiveAudio8TtsDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: Audio8TtsModelLease,
+    pub(super) state: Audio8RetainedState,
+    pub(super) last_frames_generated: usize,
+    pub(super) stream_sequence: usize,
+    pub(super) codec: crate::models::architectures::audio8::dac::Audio8DacStreamState,
     pub(super) audio_samples: Vec<f32>,
     pub(super) total_audio_samples: usize,
     pub(super) collect_audio_samples: bool,

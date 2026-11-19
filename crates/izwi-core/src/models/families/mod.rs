@@ -66,6 +66,7 @@ const MAYA1_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Maya13B, ModelVarian
 const MAYA2_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Maya2Native25B];
 const VIBEVOICE_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::VibeVoice15BTts];
 const FISH_S2_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::FishAudioS2Pro];
+const AUDIO8_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::Audio8TtsRealisticAir];
 const FISH_DRAMA3_TTS_VARIANTS: &[ModelVariant] = &[ModelVariant::FishAudioDrama3];
 const PARAKEET_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::ParakeetTdt06BV3];
 const WHISPER_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::WhisperLargeV3Turbo];
@@ -141,6 +142,11 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::FishS2Tts,
         module_path: "crate::models::architectures::fish_s2",
         variants: FISH_S2_TTS_VARIANTS,
+    },
+    FamilyRegistration {
+        family: ModelFamily::Audio8Tts,
+        module_path: "crate::models::architectures::audio8",
+        variants: AUDIO8_TTS_VARIANTS,
     },
     FamilyRegistration {
         family: ModelFamily::FishDrama3Tts,

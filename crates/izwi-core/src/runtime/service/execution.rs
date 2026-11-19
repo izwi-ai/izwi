@@ -314,6 +314,16 @@ impl RuntimeService {
                     crate::models::architectures::fish_drama3::FishDrama3DacConfig::current()
                         .streaming_history_bound_bytes()?,
                 )
+            } else if request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::Audio8Tts)
+            {
+                (
+                    ModelVariant::AUDIO8_MAX_OUTPUT_FRAMES,
+                    crate::models::architectures::audio8::AUDIO8_AUDIO_CHUNK_FRAMES,
+                    crate::models::architectures::audio8::dac::Audio8DacConfig::current()
+                        .streaming_history_bound_bytes()?,
+                )
             } else {
                 (
                     ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES,
@@ -371,6 +381,18 @@ impl RuntimeService {
         {
             if let Some(artifact) = request.prepared_fish_s2_tts_artifact_for_executor()? {
                 add_fish_s2_artifact_to_admission(
+                    self.backend_router.context().backend_kind,
+                    &mut spec,
+                    &mut observation,
+                    artifact.retained_bytes()?,
+                )?;
+            }
+        }
+        if request.task_type == TaskType::TTS
+            && request.model_variant == Some(ModelVariant::Audio8TtsRealisticAir)
+        {
+            if let Some(artifact) = request.prepared_audio8_tts_artifact_for_executor()? {
+                add_audio8_artifact_to_admission(
                     self.backend_router.context().backend_kind,
                     &mut spec,
                     &mut observation,
