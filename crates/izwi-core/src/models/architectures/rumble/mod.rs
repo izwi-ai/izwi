@@ -11,9 +11,12 @@
 //! also load; the audio tower, projector, front end, tokenizer, prompt and
 //! transcript handling are Rumble's own.
 //!
-//! Every request runs as atomic invocations on a lifecycle-owned paged KV
-//! lease: audio of up to 30 s is one invocation, and longer audio is cut
-//! into chunks by the generic ASR route.
+//! Audio of up to 30 s runs as a retained row (`retained.rs`): its audio is
+//! encoded into a prompt artifact, the prompt prefills onto retained decoder
+//! pages, and it decodes beside other rows, one batched step per token.
+//! Longer audio is cut into chunks by the generic ASR route, each an atomic
+//! invocation on a lifecycle-owned paged KV lease; with
+//! `IZWI_RUMBLE_RETAINED_DECODE` off every request runs that way.
 
 mod audio_tower;
 mod checkpoint;
@@ -41,6 +44,8 @@ pub use frontend::{
     RumbleAudioFeatures, RUMBLE_AUDIO_TOKENS_PER_SECOND, RUMBLE_MAX_AUDIO_SECONDS,
     RUMBLE_SAMPLE_RATE,
 };
+#[cfg(test)]
+pub(crate) use model::rumble_test_physical_state_spec;
 pub(crate) use model::RumblePhysicalStateSpec;
 pub use model::{
     RumbleAsrModel, RumbleGenerationOptions, RumbleRequestOptions, RumbleTranscription,
@@ -52,8 +57,9 @@ pub use prompt::{
     RUMBLE_DETECTED_LANGUAGES, RUMBLE_FORCED_LANGUAGES, RUMBLE_MAX_CONTEXT_TOKENS,
 };
 pub(crate) use retained::{
-    RumbleDecodeCheckpoint, RumbleDecodeState, RumbleDecodeStep, RumblePreparedGeometry,
-    RumblePreparedPromptArtifact,
+    rumble_retained_decode_enabled, RumbleAsrPreparationStageSeal, RumbleDecodeCheckpoint,
+    RumbleDecodeState, RumbleDecodeStep, RumblePreparedGeometry, RumblePreparedPromptArtifact,
+    RUMBLE_RETAINED_DECODE_ENV,
 };
 pub use tokenizer::{RumbleSpecialTokens, RumbleTokenizer};
 pub use transcript::{split_rumble_output, RumbleOutput};

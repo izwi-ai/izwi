@@ -51,6 +51,8 @@ pub(crate) struct RumblePreparedPromptArtifact {
     audio_tokens: usize,
     /// The language the assistant turn was prefilled with.
     forced_language: Option<String>,
+    /// The transcript style the system turn asked for.
+    style: super::prompt::RumbleTranscriptStyle,
 }
 
 impl RumblePreparedPromptArtifact {
@@ -101,12 +103,14 @@ pub(crate) struct RumblePreparedGeometry {
 }
 
 impl RumblePreparedGeometry {
-    pub(crate) fn work_cost(self) -> crate::engine::WorkCost {
-        crate::engine::WorkCost::new(
+    /// The row's preparation work: its audio tokens, and every element it
+    /// materializes (the preparation is exact, with no padding).
+    pub(crate) fn work_cost(self) -> Result<crate::engine::WorkCost> {
+        Ok(crate::engine::WorkCost::new(
             self.audio_tokens as u64,
-            self.embedding_elements,
+            self.materialized_tensor_elements()?,
             self.preparation_workspace_bytes,
-        )
+        ))
     }
 
     /// Elements the row materializes: its features and its prompt.
@@ -244,6 +248,11 @@ impl RumbleDecodeState {
             "forced_language": self.artifact.forced_language,
             "audio_tokens": self.artifact.audio_tokens,
             "prompt_tokens": self.artifact.prompt_tokens,
+            "style": {
+                "digits": self.artifact.style.digits,
+                "fillers": self.artifact.style.fillers,
+                "verbatim": self.artifact.style.verbatim,
+            },
             "generated_tokens": self.generated_ids.len(),
             "max_new_tokens": self.max_new_tokens,
             "stop_reason": self.stop_reason,
@@ -658,6 +667,7 @@ impl RumbleAsrModel {
             prompt_tokens: prompt.ids.len(),
             audio_tokens: prompt.audio_tokens,
             forced_language: prompt.forced_language,
+            style: request.style,
         }))
     }
 

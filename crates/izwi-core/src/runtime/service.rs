@@ -80,6 +80,11 @@ use crate::models::architectures::granite_speech5::asr::{
     GraniteSpeech5RequestOptions,
 };
 use crate::models::architectures::kokoro::kokoro_output_budget;
+use crate::models::architectures::rumble::{
+    RumbleAsrModel, RumbleAudioFeatures, RumblePreparedGeometry, RumblePreparedPromptArtifact,
+    RumbleRequestOptions, RumbleTranscriptStyle, RUMBLE_DEFAULT_MAX_NEW_TOKENS,
+    RUMBLE_SEQUENCE_TOKENS,
+};
 use crate::models::architectures::lfm3_audio::physical::Lfm3AudioWorkload;
 use crate::models::architectures::maya1::{
     maya1_auto_max_new_tokens, maya1_voice_preset, Maya1GenerationParams, Maya1SamplingParams,
@@ -161,7 +166,7 @@ use asr_encoders::{
     GraniteSpeech5EncoderBatcher, GraniteSpeech5EncoderPending, GraniteSpeechEncoderBatcher,
     GraniteSpeechEncoderPending, NemotronEncoderBatcher,
     NemotronEncoderPending, ParakeetEncoderBatcher, ParakeetEncoderPending, QwenAsrEncoderBatcher,
-    QwenAsrEncoderPending, VibeVoiceEncoderBatcher, VibeVoiceEncoderPending, WhisperEncoderBatcher,
+    QwenAsrEncoderPending, RumbleEncoderBatcher, RumbleEncoderPending, VibeVoiceEncoderBatcher, VibeVoiceEncoderPending, WhisperEncoderBatcher,
     WhisperEncoderPending,
 };
 use asr_preparation::asr_encoder_retained_resources;
@@ -1023,6 +1028,7 @@ pub struct RuntimeService {
     vibevoice_encoder_batcher: Arc<VibeVoiceEncoderBatcher>,
     granite_speech_encoder_batcher: Arc<GraniteSpeechEncoderBatcher>,
     granite_speech5_encoder_batcher: Arc<GraniteSpeech5EncoderBatcher>,
+    rumble_encoder_batcher: Arc<RumbleEncoderBatcher>,
     parakeet_encoder_batcher: Arc<ParakeetEncoderBatcher>,
     nemotron_encoder_batcher: Arc<NemotronEncoderBatcher>,
     /// Long-form chunk rows in flight across every file (see
@@ -1138,6 +1144,18 @@ fn bind_request_to_residency(
     {
         return Err(Error::InvalidInput(
             "Granite Speech 5.0 normal execution shape has no matching prepared artifact".into(),
+        ));
+    }
+    if request.model_variant.is_some_and(|variant| {
+        variant.family() == ModelFamily::RumbleAsr
+            && request.prepared_asr_execution_shape().is_some()
+            && !request.uses_asr_long_form_atomic()
+    }) && request
+        .prepared_rumble_artifact_for_executor()?
+        .is_none()
+    {
+        return Err(Error::InvalidInput(
+            "Rumble normal execution shape has no matching prepared artifact".into(),
         ));
     }
     if request.model_variant.is_some_and(|variant| {

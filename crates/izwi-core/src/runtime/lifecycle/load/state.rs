@@ -291,6 +291,72 @@ impl ModelLifecycleController {
             crate::models::architectures::granite_speech5::asr::GraniteSpeech5PhysicalStateSpec,
         >,
     ) -> Result<LoadedStatePublication> {
+        self.load_retained_sequence_asr_state_publication(
+            variant,
+            model_instance_id,
+            bundle_draft,
+            RetainedSequenceAsrFamily {
+                name: "Granite Speech 5.0",
+                switch: "IZWI_GRANITE_SPEECH5_RETAINED_DECODE",
+            },
+            |graphs| {
+                let spec = physical_state_spec(graphs)?;
+                Ok(RetainedSequenceAsrState {
+                    descriptor: spec.descriptor,
+                    retained: spec.retained,
+                    retained_max_tokens: spec.retained_max_tokens,
+                    invocation: spec.invocation,
+                })
+            },
+        )
+        .await
+    }
+
+    /// Publish the state Rumble's ASR graphs need, as `physical_state_spec`
+    /// authors it for them: retained decoder pages for its retained
+    /// sequence graph (none when the route is off) beside the atomic
+    /// graph's invocation pages.
+    pub(super) async fn load_rumble_state_publication(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        bundle_draft: &LoadedModelBundleDraft,
+        physical_state_spec: impl Fn(
+            &[&[StageDescriptor]],
+        )
+            -> Result<crate::models::architectures::rumble::RumblePhysicalStateSpec>,
+    ) -> Result<LoadedStatePublication> {
+        self.load_retained_sequence_asr_state_publication(
+            variant,
+            model_instance_id,
+            bundle_draft,
+            RetainedSequenceAsrFamily {
+                name: "Rumble",
+                switch: crate::models::architectures::rumble::RUMBLE_RETAINED_DECODE_ENV,
+            },
+            |graphs| {
+                let spec = physical_state_spec(graphs)?;
+                Ok(RetainedSequenceAsrState {
+                    descriptor: spec.descriptor,
+                    retained: spec.retained,
+                    retained_max_tokens: spec.retained_max_tokens,
+                    invocation: spec.invocation,
+                })
+            },
+        )
+        .await
+    }
+
+    /// Retained decoder pages for a family's retained sequence graph beside
+    /// its atomic graph's invocation pages.
+    async fn load_retained_sequence_asr_state_publication(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        bundle_draft: &LoadedModelBundleDraft,
+        family: RetainedSequenceAsrFamily,
+        physical_state_spec: impl Fn(&[&[StageDescriptor]]) -> Result<RetainedSequenceAsrState>,
+    ) -> Result<LoadedStatePublication> {
         let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
         let stage_graphs = contracts
             .iter()
@@ -303,11 +369,11 @@ impl ModelLifecycleController {
         ) {
             (Some(retained_contract), Some(sequence_tokens)) => {
                 // Every row claims its pages from one shared pool. A row is
-                // at most one retained sequence (2,528 tokens): preparation
-                // runs a longer request atomically. So the pool holds one
-                // automatic sequence (a 30 s chunk's prompt, audio and
-                // budget) per retained row and never less than one longest
-                // retained sequence, with no floor of the 16k context, which
+                // at most one retained sequence: preparation runs a longer
+                // request atomically. So the pool holds one automatic
+                // sequence (a 30 s chunk's prompt, audio and budget) per
+                // retained row and never less than one longest retained
+                // sequence, with no floor of the model's context, which
                 // stays the atomic route's (its invocation fit publishes it).
                 let rows = self.asr_state_rows(bundle_draft)?;
                 let retained = self
@@ -326,7 +392,8 @@ impl ModelLifecycleController {
                         sequence_tokens as u64,
                     )
                     .await?;
-                granite_speech5_retained_reach_holds_a_sequence(
+                retained_reach_holds_a_sequence(
+                    family,
                     retained.logical_token_reach(),
                     sequence_tokens,
                 )?;
@@ -344,14 +411,12 @@ impl ModelLifecycleController {
                             crate::engine::ExecutionMode::Sequence => {
                                 RetainedStateUseV2::ExternalPaged
                             }
-                            crate::engine::ExecutionMode::Atomic => {
-                                RetainedStateUseV2::Inactive
-                            }
+                            crate::engine::ExecutionMode::Atomic => RetainedStateUseV2::Inactive,
                             _ => {
-                                return Err(Error::ModelLoadError(
-                                    "Granite Speech 5.0 ASR graph has an incompatible retained-state profile"
-                                        .into(),
-                                ));
+                                return Err(Error::ModelLoadError(format!(
+                                    "{} ASR graph has an incompatible retained-state profile",
+                                    family.name
+                                )));
                             }
                         };
                         Ok((graph, use_kind))
@@ -361,9 +426,10 @@ impl ModelLifecycleController {
             }
             (None, None) => (None, HashMap::new()),
             _ => {
-                return Err(Error::ModelLoadError(
-                    "Granite Speech 5.0 retained state has no context bound".into(),
-                ));
+                return Err(Error::ModelLoadError(format!(
+                    "{} retained state has no context bound",
+                    family.name
+                )));
             }
         };
         self.load_invocation_workspace_publication(
@@ -879,28 +945,23 @@ impl ModelLifecycleController {
                         .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);
                 } else if publication_route == LoadedAsrStatePublicationRoute::Rumble {
-                    // Every invocation leases decoder pages of one bounded
-                    // sequence (prompt, a 30 s window of audio tokens and the
-                    // decode budget); no state is retained between them.
+                    // Audio of up to 30 s decodes as a retained row on
+                    // managed decoder pages; longer audio runs one atomic
+                    // invocation per chunk on leased pages of one bounded
+                    // sequence. With the retained route off the capability
+                    // offers only the atomic graph and no retained state is
+                    // fitted.
                     if !managed_kv_backend_compiled(backend) {
                         return Err(Error::ModelLoadError(format!(
                             "loaded model {variant} requires physical ASR invocation state, but the {backend:?} build has no direct paged-attention runtime"
                         )));
                     }
-                    let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
-                    let stage_graphs = contracts
-                        .iter()
-                        .map(|contract| contract.stages.as_ref())
-                        .collect::<Vec<_>>();
-                    let physical_spec = loaded.rumble_physical_state_spec(&stage_graphs)?;
                     let publication = self
-                        .load_invocation_workspace_publication(
+                        .load_rumble_state_publication(
+                            variant,
                             model_instance_id,
-                            &contracts,
-                            physical_spec.descriptor,
-                            &physical_spec.invocation,
-                            None,
-                            HashMap::new(),
+                            bundle_draft,
+                            |graphs| loaded.rumble_physical_state_spec(graphs),
                         )
                         .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);

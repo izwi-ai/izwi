@@ -542,7 +542,7 @@ impl NativeExecutor {
         }
         if matches!(
             family,
-            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr
+            ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr | ModelFamily::RumbleAsr
         ) && request.uses_asr_retained_sequence()
         {
             return self.granite_speech_asr_sequence_request(

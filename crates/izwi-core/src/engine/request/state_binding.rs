@@ -372,6 +372,9 @@ impl EngineCoreRequest {
                             ModelFamily::GraniteSpeech5Asr => self
                                 .prepared_granite_speech5_artifact_for_executor()?
                                 .is_some(),
+                            ModelFamily::RumbleAsr => {
+                                self.prepared_rumble_artifact_for_executor()?.is_some()
+                            }
                             ModelFamily::ParakeetAsr => {
                                 self.prepared_parakeet_artifact_for_executor()?.is_some()
                             }

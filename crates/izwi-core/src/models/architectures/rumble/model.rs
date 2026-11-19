@@ -921,6 +921,22 @@ fn rumble_physical_state_spec(
     })
 }
 
+/// The physical state a Rumble load authors for `stage_graphs`, on the
+/// synthetic checkpoint's decoder geometry, so a bundle test can publish and
+/// seal exactly what a load would.
+#[cfg(test)]
+pub(crate) fn rumble_test_physical_state_spec(
+    stage_graphs: &[&[StageDescriptor]],
+) -> Result<RumblePhysicalStateSpec> {
+    let checkpoint = super::synthetic::SyntheticRumbleCheckpoint::write();
+    RumbleAsrModel::load(
+        checkpoint.path(),
+        crate::catalog::ModelVariant::Rumble2Flash,
+        crate::backends::DeviceProfile::cpu(),
+    )?
+    .physical_state_spec(stage_graphs)
+}
+
 /// Bytes of one invocation's paged decoder KV at `max_tokens`, in whole
 /// pages.
 pub(crate) fn paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {

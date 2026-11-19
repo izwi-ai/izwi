@@ -442,14 +442,14 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            76
+            77
         );
         assert_eq!(
             manifest
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            10
+            9
         );
 
         assert_eq!(
@@ -613,5 +613,10 @@ mod tests {
                 1
             );
         }
+        // Rumble retains decoder pages for rows of up to 30 s and leases
+        // them for longer audio's atomic invocations.
+        let rumble = manifest_case(&manifest, ModelVariant::Rumble2Flash, CapabilityKind::Asr);
+        assert_eq!(rumble.retained_state, Managed);
+        assert_eq!(rumble.workspace, InvocationStateRequired);
     }
 }

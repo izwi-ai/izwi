@@ -2470,11 +2470,20 @@ impl Engine {
                             "Granite Speech request {request_id} preparation worker failed: {error}"
                         ))
                     })??;
-                } else if variant.family() == crate::catalog::ModelFamily::GraniteSpeech5Asr
-                    && request.prepared_asr_execution_shape().is_none()
+                } else if matches!(
+                    variant.family(),
+                    crate::catalog::ModelFamily::GraniteSpeech5Asr
+                        | crate::catalog::ModelFamily::RumbleAsr
+                ) && request.prepared_asr_execution_shape().is_none()
                 {
                     // Decode and plan off the device, then dispatch the
                     // chunked stage one chunk at a time.
+                    let family_name =
+                        if variant.family() == crate::catalog::ModelFamily::RumbleAsr {
+                            "Rumble"
+                        } else {
+                            "Granite Speech 5.0"
+                        };
                     let model_for_shape = model.clone();
                     let request_id = request.id.clone();
                     let deadline = request.deadline;
@@ -2492,9 +2501,9 @@ impl Engine {
                         None => acquire_permit.await,
                     }
                     .map_err(|_| {
-                        Error::InferenceError(
-                            "Direct Granite Speech 5.0 preparation queue is unavailable".into(),
-                        )
+                        Error::InferenceError(format!(
+                            "Direct {family_name} preparation queue is unavailable"
+                        ))
                     })?;
                     let worker = tokio::task::spawn_blocking(move || {
                         let _permit = permit;
@@ -2525,7 +2534,7 @@ impl Engine {
                     }
                     .map_err(|error| {
                         Error::InferenceError(format!(
-                            "Granite Speech 5.0 request {request_id} preparation worker failed: {error}"
+                            "{family_name} request {request_id} preparation worker failed: {error}"
                         ))
                     })??;
                 }

@@ -380,6 +380,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_REQUIRE_CUDA_TEST_DEVICE` | flag | `false` | test harness | Makes CUDA-feature tests fail instead of skipping when no usable CUDA device exists. |
 | `IZWI_REQUIRE_METAL_PARITY` | flag | false (skip when no Metal device) | test harness | Makes Metal-feature tests fail instead of skipping when no Metal device exists. |
 | `IZWI_RUMBLE_AUDIO_DTYPE` | choice | `f32` | model load | Overrides the dtype of Rumble's audio tower and projector (f32, f16, bf16); a lowered dtype must pass a load-time probe or the component reloads in F32. |
+| `IZWI_RUMBLE_RETAINED_DECODE` | flag | `true` | first use | Runs Rumble ASR of up to 30 s on its retained route, where concurrent requests decode together (one batched step per token); false runs every request as one atomic invocation and fits no retained decoder state. |
 | `IZWI_RUMBLE_TEXT_DTYPE` | choice | CPU and Metal: f32; CUDA: the device's half precision (bf16 where supported) | model load | Overrides the dtype of Rumble's decoder and its KV pages (f32, f16, bf16); a lowered dtype must pass a load-time probe or the decoder reloads in F32. |
 | `IZWI_SORTFORMER_PP_FILTER_SPEECH_FIRST` | flag | true (preset value) | first use | Overrides Sortformer diarization post-processing filter_speech_first. |
 | `IZWI_SORTFORMER_PP_MIN_DURATION_OFF` | number | request min_duration_off_ms, else 0 (preset value) | first use | Overrides the Sortformer post-processing minimum non-speech gap in seconds (floored at 0). |

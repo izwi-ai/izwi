@@ -47,6 +47,7 @@ use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
 use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
 };
+use crate::models::architectures::rumble::RumblePreparedPromptArtifact;
 use crate::models::architectures::vibevoice::asr::VibeVoiceAsrPreparedArtifact;
 use crate::models::architectures::vibevoice::tts::{
     VibeVoiceTtsGenerationParams, VibeVoiceTtsPreparedArtifact,
@@ -1027,6 +1028,7 @@ enum PreparedAsrEncoderArtifactValue {
     VibeVoice(Arc<VibeVoiceAsrPreparedArtifact>),
     GraniteSpeech(Arc<GraniteSpeechPreparedPromptArtifact>),
     GraniteSpeech5(Arc<GraniteSpeech5PreparedPromptArtifact>),
+    Rumble(Arc<RumblePreparedPromptArtifact>),
     Lfm25Audio(Arc<Lfm25AudioPreparedAsrArtifact>),
     Parakeet(Arc<ParakeetPreparedEncoderArtifact>),
     Nemotron(Arc<NemotronPreparedEncoderArtifact>),
@@ -1052,6 +1054,7 @@ impl crate::backends::DeviceResident for PreparedAsrEncoderArtifactValue {
             Self::VibeVoice(value) => Some(value.device_location()),
             Self::GraniteSpeech(value) => Some(value.device_location()),
             Self::GraniteSpeech5(value) => Some(value.device_location()),
+            Self::Rumble(value) => Some(value.device_location()),
             Self::Lfm25Audio(value) => Some(value.device_location()),
             Self::Parakeet(value) => Some(value.device_location()),
             Self::Nemotron(value) => Some(value.device_location()),
@@ -1068,6 +1071,7 @@ impl PreparedAsrEncoderArtifactValue {
             Self::VibeVoice(_) => "vibevoice",
             Self::GraniteSpeech(_) => "granite_speech",
             Self::GraniteSpeech5(_) => "granite_speech5",
+            Self::Rumble(_) => "rumble",
             Self::Lfm25Audio(_) => "lfm25_audio",
             Self::Parakeet(_) => "parakeet",
             Self::Nemotron(_) => "nemotron",
@@ -1088,6 +1092,9 @@ impl PreparedAsrEncoderArtifactValue {
             Self::GraniteSpeech5(value) => {
                 Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
             }
+            Self::Rumble(value) => {
+                Ok((value.resident_host_bytes(), value.resident_tensor_bytes()?))
+            }
             Self::Lfm25Audio(value) => {
                 Ok((value.retained_host_bytes, value.retained_resident_bytes))
             }
@@ -1104,6 +1111,7 @@ impl PreparedAsrEncoderArtifactValue {
             | Self::Whisper(_)
             | Self::GraniteSpeech(_)
             | Self::GraniteSpeech5(_)
+            | Self::Rumble(_)
             | Self::Lfm25Audio(_)
             | Self::Parakeet(_)
             | Self::Nemotron(_)

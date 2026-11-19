@@ -1,6 +1,7 @@
 //! Cross-request ASR encoder batchers: Qwen3-ASR, Whisper, Granite Speech
 //! 4.1 and 5.0, VibeVoice, Parakeet and Nemotron encoder work queued by
-//! request preparation and run as one batch.
+//! request preparation and run as one batch. Rumble's encoder work queues
+//! the same way and runs one request at a time.
 
 use super::*;
 
@@ -156,6 +157,7 @@ encoder_batch_row!(
     NemotronEncoderPending,
     GraniteSpeechEncoderPending,
     GraniteSpeech5EncoderPending,
+    RumbleEncoderPending,
 );
 
 /// Forms one encoder's cross-request batches with at most one batch in
@@ -331,6 +333,37 @@ pub(super) struct GraniteSpeech5EncoderBatcher {
     pub(super) coordinator: Arc<InferenceCoordinator>,
     pub(super) formation:
         EncoderBatchFormation<GraniteSpeech5EncoderQueueKey, GraniteSpeech5EncoderPending>,
+}
+
+pub(super) type RumbleEncoderOutcome = PreparationRowOutcome<Arc<RumblePreparedPromptArtifact>>;
+
+pub(super) struct RumbleEncoderPending {
+    pub(super) job: JobLease,
+    pub(super) contract: LoadedExecutionContract,
+    pub(super) model: AsrModelLease,
+    /// The model's catalog name, for the ASR metrics.
+    pub(super) model_label: &'static str,
+    /// The host audio features, dropped once the encode has read them.
+    pub(super) features: RumbleAudioFeatures,
+    pub(super) request: RumbleRequestOptions,
+    pub(super) geometry: RumblePreparedGeometry,
+    pub(super) retained_host_bytes: u64,
+    pub(super) artifact_host_bytes: u64,
+    pub(super) cancellation: PreparationCancellation,
+    pub(super) response: Option<oneshot::Sender<RumbleEncoderOutcome>>,
+}
+
+/// Rumble's preparation stage is scalar, so its queue is keyed by the
+/// stage alone: every row runs on its own, in arrival order within a
+/// workload class.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct RumbleEncoderQueueKey {
+    pub(super) binding: AdapterBindingKey,
+}
+
+pub(super) struct RumbleEncoderBatcher {
+    pub(super) coordinator: Arc<InferenceCoordinator>,
+    pub(super) formation: EncoderBatchFormation<RumbleEncoderQueueKey, RumbleEncoderPending>,
 }
 
 pub(super) fn granite_speech_deadline_budget_bucket(deadline: Option<Instant>, now: Instant) -> Option<u64> {
@@ -1816,6 +1849,177 @@ impl GraniteSpeech5EncoderBatcher {
                 )));
             }
         }
+    }
+}
+
+impl RumbleEncoderBatcher {
+    pub(super) fn new(coordinator: Arc<InferenceCoordinator>) -> Self {
+        Self {
+            coordinator,
+            formation: EncoderBatchFormation::new(),
+        }
+    }
+
+    pub(super) async fn submit(
+        self: &Arc<Self>,
+        mut pending: RumbleEncoderPending,
+    ) -> Result<RumbleEncoderOutcome> {
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.rumble".into(),
+        };
+        let binding = pending.contract.adapter_binding()?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.name != "asr.encoder.rumble" {
+            return Err(Error::InvalidInput(
+                "Rumble loaded contract did not select asr.encoder.rumble".into(),
+            ));
+        }
+        let key = RumbleEncoderQueueKey {
+            binding: binding.key_for_stage(stage.id)?,
+        };
+        let max_width = stage.max_batch_size.max(1);
+        let cancellation = pending.cancellation.clone();
+        let (sender, receiver) = oneshot::channel();
+        pending.response = Some(sender);
+        // A row waits for the running encode and runs after it.
+        if self.formation.push(key.clone(), pending) {
+            let batcher = self.clone();
+            tokio::spawn(async move {
+                batcher
+                    .formation
+                    .run(&key, max_width, |batch| batcher.run_batch(batch))
+                    .await;
+            });
+        }
+
+        let mut guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let outcome = receiver.await.map_err(|_| {
+            Error::InferenceError("Rumble encoder worker stopped before reply".into())
+        })?;
+        guard.armed = false;
+        Ok(outcome)
+    }
+
+    pub(super) async fn run_batch(&self, batch: Vec<RumbleEncoderPending>) {
+        for row in batch {
+            self.run_row(row).await;
+        }
+    }
+
+    /// Encode one request's features into its prompt artifact.
+    async fn run_row(&self, mut row: RumbleEncoderPending) {
+        let Some(response) = row.response.take() else {
+            return;
+        };
+        if row.cancellation.is_cancelled() {
+            let _ = response.send(PreparationRowOutcome::Cancelled);
+            return;
+        }
+        if row
+            .job
+            .spec
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            let _ = response.send(PreparationRowOutcome::TimedOut);
+            return;
+        }
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "asr.encoder.rumble".into(),
+        };
+        let geometry = row.geometry;
+        // The host stage recorded the request bytes plus its features, which
+        // the encode consumes; the row's commit records only what its
+        // artifact keeps. Restore the features' claim to pending first: usage
+        // may only rise through an observation, and the reservation still
+        // covers the features until the encode ends.
+        let sealed = row
+            .job
+            .prepare_materialized_release(JobResourceObservation::host(row.retained_host_bytes))
+            .and_then(|()| geometry.work_cost())
+            .and_then(|cost| {
+                self.coordinator.seal_preparation_row(
+                    row.job.clone(),
+                    &row.contract,
+                    &work,
+                    cost,
+                    cost.tensor_elements,
+                    row.cancellation.clone(),
+                )
+            });
+        let sealed = match sealed {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                let _ = response.send(PreparationRowOutcome::Failed(error));
+                return;
+            }
+        };
+        let RumbleEncoderPending {
+            job,
+            contract,
+            model,
+            model_label,
+            features,
+            request,
+            retained_host_bytes,
+            artifact_host_bytes,
+            ..
+        } = row;
+        // The sealed row holds the admission lease from here: the handoff
+        // refuses a second holder.
+        drop(job);
+        let result = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![sealed], contract, work, move |live| {
+                // The features drop when the encode returns.
+                let features = features;
+                if live.is_empty() {
+                    return Ok(Vec::new());
+                }
+                crate::engine::metrics::record_asr_preparation_batch_rows(model_label, live.len());
+                let encode_started = Instant::now();
+                let artifact =
+                    model.prepare_rumble_prompt_artifact_from_features(&features, &request)?;
+                crate::engine::metrics::record_asr_device_phase(
+                    model_label,
+                    crate::engine::metrics::AsrPhase::Encoder,
+                    encode_started,
+                );
+                let resident_tensor_bytes = artifact.resident_tensor_bytes()?;
+                if artifact.prompt_tokens() != geometry.prompt_tokens
+                    || artifact.audio_tokens() != geometry.audio_tokens
+                    || artifact.resident_host_bytes() != artifact_host_bytes
+                    || resident_tensor_bytes != geometry.retained_device_bytes
+                {
+                    return Err(Error::InferenceError(
+                        "Rumble artifact drifted from admitted geometry".into(),
+                    ));
+                }
+                Ok(live
+                    .iter()
+                    .map(|_| {
+                        Ok(PreparationArtifact {
+                            retained: JobResourceObservation {
+                                host_bytes: retained_host_bytes,
+                                accelerator_bytes: resident_tensor_bytes,
+                            },
+                            value: artifact.clone(),
+                        })
+                    })
+                    .collect::<Vec<Result<PreparationArtifact<Arc<RumblePreparedPromptArtifact>>>>>())
+            })
+            .await;
+        let outcome = match result {
+            Ok(mut outcomes) if outcomes.len() == 1 => outcomes.remove(0),
+            Ok(_) => PreparationRowOutcome::Failed(Error::InferenceError(
+                "Rumble preparation returned the wrong row count".into(),
+            )),
+            Err(error) => PreparationRowOutcome::Failed(error),
+        };
+        let _ = response.send(outcome);
     }
 }
 

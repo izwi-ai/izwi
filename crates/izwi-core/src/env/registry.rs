@@ -2637,6 +2637,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the dtype of Rumble's audio tower and projector (f32, f16, bf16); a lowered dtype must pass a load-time probe or the component reloads in F32.",
     ),
     CoreEnvVar::new(
+        "IZWI_RUMBLE_RETAINED_DECODE",
+        Flag,
+        "true",
+        Once,
+        "Runs Rumble ASR of up to 30 s on its retained route, where concurrent requests decode together (one batched step per token); false runs every request as one atomic invocation and fits no retained decoder state.",
+    ),
+    CoreEnvVar::new(
         "IZWI_RUMBLE_TEXT_DTYPE",
         Choice,
         "CPU and Metal: f32; CUDA: the device's half precision (bf16 where supported)",
