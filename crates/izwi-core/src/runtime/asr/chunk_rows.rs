@@ -59,7 +59,10 @@ pub(crate) fn chunk_row_permit_count(row_width: usize, max_queued_requests: usiz
 /// - Qwen3-ASR and Whisper: a batched encoder, then a retained decode row;
 /// - Nemotron ASR: a batched encoder and batched RNNT rows;
 /// - Voxtral: a chunk within the realtime session ceiling encoded once, then
-///   a retained row whose frames decode batched across rows.
+///   a retained row whose frames decode batched across rows;
+/// - Rumble: a batched encoder, then a retained decode row where its retained
+///   route is on (CUDA by default); elsewhere one atomic invocation, the call
+///   its sequential chunk route makes per chunk.
 ///
 /// Not the others: Parakeet, VibeVoice and Nemotron 3.5 Transcribe cover a
 /// long file in one pass; Granite 4.1 can replay earlier text into a chunk
@@ -72,6 +75,7 @@ fn chunk_rows_family(family: ModelFamily) -> bool {
             | ModelFamily::WhisperAsr
             | ModelFamily::NemotronAsr
             | ModelFamily::Voxtral
+            | ModelFamily::RumbleAsr
     )
 }
 
