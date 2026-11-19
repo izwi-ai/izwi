@@ -184,6 +184,7 @@ pub(crate) const fn tts_decode_width(
         (
             BackendKind::Cuda,
             ModelFamily::Qwen3Tts
+            | ModelFamily::MingTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts
             | ModelFamily::ChatterboxTts

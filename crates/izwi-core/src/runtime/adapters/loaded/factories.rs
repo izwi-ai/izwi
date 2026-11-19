@@ -311,6 +311,8 @@ impl LoadedExecutionAdapterFactory for ChatterboxPhysicalTtsAdapterFactory {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Maya1PhysicalTtsAdapterFactory;
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MingPhysicalTtsAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for Maya1PhysicalTtsAdapterFactory {
     fn id(&self) -> &'static str {
@@ -329,6 +331,34 @@ impl LoadedExecutionAdapterFactory for Maya1PhysicalTtsAdapterFactory {
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
         Ok(Arc::new(
             Maya1TtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
+    }
+}
+
+impl LoadedExecutionAdapterFactory for MingPhysicalTtsAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::MingTts.factory_id()
+    }
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
+    }
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::MingTts, metadata, backend_kind)
+    }
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(
+            MingTtsExecutionAdapter::new(
                 context.execution_group_id,
                 context.model_instance_id,
                 metadata,
@@ -1026,6 +1056,7 @@ pub(in crate::runtime::adapters) fn built_in_loaded_adapter_factories() -> Vec<A
         Arc::new(VoxtralPhysicalTtsAdapterFactory),
         Arc::new(ChatterboxPhysicalTtsAdapterFactory),
         Arc::new(Maya1PhysicalTtsAdapterFactory),
+        Arc::new(MingPhysicalTtsAdapterFactory),
         Arc::new(Maya2PhysicalTtsAdapterFactory),
         Arc::new(Lfm3AudioPhysicalTtsAdapterFactory),
         Arc::new(Lfm3AudioPhysicalAsrAdapterFactory),

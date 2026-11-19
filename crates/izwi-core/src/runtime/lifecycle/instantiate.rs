@@ -139,6 +139,10 @@ pub(in crate::runtime::lifecycle) async fn load_into_registry(
             registry.load_maya1_tts(variant, model_path).await?;
             InstantiatedPayload::None
         }
+        ModelFamily::MingTts => {
+            registry.load_ming_tts(variant, model_path).await?;
+            InstantiatedPayload::None
+        }
         ModelFamily::Maya2Tts => {
             registry.load_maya2_tts(variant, model_path).await?;
             InstantiatedPayload::None

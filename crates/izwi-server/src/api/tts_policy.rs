@@ -347,7 +347,41 @@ pub(crate) fn validate_speech_controls(
             )));
         }
     }
+    // Named deliveries: only Ming 3.0 TTS performs them. Which of them a
+    // request may combine depends on its voice, so the engine checks that.
+    if variant.family() != ModelFamily::MingTts {
+        for (name, value) in [
+            ("emotion", &sampling.emotion),
+            ("dialect", &sampling.dialect),
+            ("speaking_rate", &sampling.speaking_rate),
+            ("pitch", &sampling.pitch),
+            ("volume", &sampling.volume),
+        ] {
+            if value.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+                return Err(crate::error::ApiError::bad_request(format!(
+                    "{variant} does not support `{name}`; omit it"
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+/// Ming 3.0 TTS long-form segments: whole sentences of about 12 s of speech,
+/// so a segment fits the model's 512-position context beside a reference
+/// clip and its transcript. A CJK character counts as three (it is spoken
+/// in about the time of three Latin letters).
+pub(crate) const MING_TTS_SEGMENT_MAX_CHARS: usize = 160;
+
+/// `text`'s length for [`MING_TTS_SEGMENT_MAX_CHARS`].
+pub(crate) fn ming_tts_weighted_chars(text: &str) -> usize {
+    text.trim()
+        .chars()
+        .map(|c| match c {
+            '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}' | '\u{ac00}'..='\u{d7af}' => 3,
+            _ => 1,
+        })
+        .sum()
 }
 
 /// Maya 2 Native long-form segments: whole sentences up to about 20 s of
@@ -376,6 +410,22 @@ pub(crate) fn validate_speech_language(
                 }
                 error => crate::error::core_api_error(error),
             });
+    }
+    if variant.family() == ModelFamily::MingTts {
+        let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+        if izwi_core::catalog::ming_tts_language(language).is_none() {
+            return Err(crate::error::ApiError::bad_request(format!(
+                "{variant} does not speak '{language}'; it takes {}",
+                izwi_core::catalog::MING_TTS_LANGUAGES
+                    .iter()
+                    .map(|language| language.code)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        return Ok(());
     }
     if variant.family() == ModelFamily::Maya2Tts {
         return maya2_language(language, "")
@@ -502,6 +552,27 @@ pub struct SpeechSamplingRequest {
     /// (Chatterbox; its default is 0.5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cfg_weight: Option<f32>,
+    /// The emotion to speak with: neutral, happy, sad, angry, fearful,
+    /// disgusted or surprised (Ming 3.0 TTS). A cloned voice takes any; a
+    /// built-in voice the ones it was recorded in. One of `emotion`,
+    /// `dialect`, the three levels below and a voice description per
+    /// request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emotion: Option<String>,
+    /// A Chinese dialect to speak in: cantonese or sichuanese (Ming 3.0
+    /// TTS, with a reference voice or no voice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
+    /// Speaking rate as a level: low (slow), medium or high (fast) (Ming
+    /// 3.0 TTS, with a reference voice or no voice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaking_rate: Option<String>,
+    /// Pitch as a level: low, medium or high (Ming 3.0 TTS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch: Option<String>,
+    /// Volume as a level: low, medium or high (Ming 3.0 TTS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
 }
 
 impl SpeechSamplingRequest {
@@ -528,6 +599,11 @@ impl SpeechSamplingRequest {
             min_p: self.min_p,
             exaggeration: self.exaggeration,
             cfg_weight: self.cfg_weight,
+            emotion: self.emotion.clone(),
+            dialect: self.dialect.clone(),
+            speaking_rate: self.speaking_rate.clone(),
+            pitch: self.pitch.clone(),
+            volume: self.volume.clone(),
         }
     }
 }
@@ -608,6 +684,7 @@ pub(crate) fn tts_text_exceeds_one_request(variant: ModelVariant, text: &str) ->
         // Upstream speaks long text in pieces of about 20 s; each piece's
         // budget comes from its own frame prior.
         ModelFamily::Maya2Tts => return text.trim().chars().count() > MAYA2_SEGMENT_MAX_CHARS,
+        ModelFamily::MingTts => return ming_tts_weighted_chars(text) > MING_TTS_SEGMENT_MAX_CHARS,
         ModelFamily::Lfm3Audio => ModelVariant::LFM3_AUDIO_MAX_OUTPUT_FRAMES,
         _ => return false,
     };
@@ -974,6 +1051,64 @@ mod tests {
         assert_eq!(
             resolve_tts_output_frames(ModelVariant::FishAudioS2Pro, "你好", Some(0)),
             resolve_tts_output_frames(ModelVariant::FishAudioS2Pro, "你好", None)
+        );
+    }
+
+    /// Ming 3.0 TTS takes named deliveries; every other model refuses them.
+    /// It speaks seven languages and splits long text by spoken length.
+    #[test]
+    fn ming_tts_takes_named_deliveries_languages_and_short_segments() {
+        let ming = ModelVariant::Ming30Tts05B;
+        let request = SpeechSamplingRequest {
+            emotion: Some("happy".into()),
+            ..SpeechSamplingRequest::default()
+        };
+        assert!(validate_speech_controls(ming, &request).is_ok());
+        let error = validate_speech_controls(ModelVariant::Kokoro82M, &request).unwrap_err();
+        assert!(error.message.contains("`emotion`"), "{}", error.message);
+        let blank = SpeechSamplingRequest {
+            pitch: Some("  ".into()),
+            ..SpeechSamplingRequest::default()
+        };
+        assert!(validate_speech_controls(ModelVariant::Kokoro82M, &blank).is_ok());
+        let options = request.options(None, None);
+        assert_eq!(options.emotion.as_deref(), Some("happy"));
+
+        for language in [None, Some("de"), Some("zh-CN"), Some("Japanese"), Some(" ")] {
+            assert!(validate_speech_language(ming, language).is_ok(), "{language:?}");
+        }
+        let error = validate_speech_language(ming, Some("it")).unwrap_err();
+        assert!(error.message.contains("does not speak"), "{}", error.message);
+
+        // A voice of every kind: named, cloned (transcript optional),
+        // described, or none.
+        let voice = |speaker, reference_audio, reference_text, voice_description| {
+            SpeechVoiceRequest {
+                speaker,
+                reference_audio,
+                reference_text,
+                voice_description,
+                saved_voice: false,
+            }
+        };
+        for request in [
+            voice(false, false, false, false),
+            voice(true, false, false, false),
+            voice(false, true, false, false),
+            voice(false, true, true, false),
+            voice(false, false, false, true),
+        ] {
+            assert!(validate_speech_voice(ming, request).is_ok());
+        }
+
+        assert_eq!(ming_tts_weighted_chars(" hello "), 5);
+        assert_eq!(ming_tts_weighted_chars("你好"), 6);
+        assert!(!tts_text_exceeds_one_request(ming, &"word ".repeat(30)));
+        assert!(tts_text_exceeds_one_request(ming, &"word ".repeat(40)));
+        assert!(tts_text_exceeds_one_request(ming, &"字".repeat(60)));
+        assert_eq!(
+            resolve_tts_output_frames(ming, "Hello.", None),
+            Some(ModelVariant::MING_TTS_MAX_OUTPUT_FRAMES)
         );
     }
 

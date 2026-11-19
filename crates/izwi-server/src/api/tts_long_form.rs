@@ -122,12 +122,14 @@ fn segment_max_chars(variant: ModelVariant) -> usize {
         izwi_core::ModelFamily::Qwen3Tts => QWEN_SEGMENT_MAX_CHARS,
         izwi_core::ModelFamily::Maya1Tts => MAYA1_SEGMENT_MAX_CHARS,
         izwi_core::ModelFamily::Maya2Tts => MAYA2_SEGMENT_MAX_CHARS,
+        izwi_core::ModelFamily::MingTts => crate::api::tts_policy::MING_TTS_SEGMENT_MAX_CHARS,
         _ => DEFAULT_CHUNK_MAX_CHARS,
     })
 }
 
 /// Whether text under an automatic budget splits into long-form segments:
-/// when one request cannot speak it, or (Qwen3-TTS, Maya1, Maya 2 Native)
+/// when one request cannot speak it, or (Qwen3-TTS, Maya1, Maya 2 Native,
+/// Ming 3.0 TTS)
 /// when it is longer than one segment.
 fn splits_into_segments(variant: ModelVariant, text: &str) -> bool {
     crate::api::tts_policy::tts_text_exceeds_one_request(variant, text)
@@ -136,6 +138,7 @@ fn splits_into_segments(variant: ModelVariant, text: &str) -> bool {
             izwi_core::ModelFamily::Qwen3Tts
                 | izwi_core::ModelFamily::Maya1Tts
                 | izwi_core::ModelFamily::Maya2Tts
+                | izwi_core::ModelFamily::MingTts
         ) && text.trim().chars().count() > segment_max_chars(variant))
 }
 

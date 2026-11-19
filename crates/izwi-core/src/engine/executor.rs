@@ -31,6 +31,7 @@ mod handler_chatterbox;
 mod handler_fish_drama3;
 mod handler_lfm3_audio_rows;
 mod handler_maya1;
+mod handler_ming_tts;
 mod handler_maya2;
 mod handler_nemotron_transcribe_rows;
 mod handler_sov_transcribe_rows;
@@ -121,11 +122,11 @@ use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
     ActiveAsrDecode, ActiveAudio8TtsDecode, ActiveChatDecode, ActiveChatterboxTtsDecode,
-    ActiveFishDrama3TtsDecode, ActiveFishS2TtsDecode, ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode,
-    ActiveLfm3AudioRealtime, ActiveMaya1TtsDecode, ActiveMaya2TtsDecode, ActiveNemotronAsrDecode,
-    ActiveNemotronTranscribeDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode,
-    ActiveSovTranscribeDecode, ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime,
-    ActiveVoxtralTtsDecode,
+    ActiveFishDrama3TtsDecode, ActiveFishS2TtsDecode, ActiveLfm25AsrDecode, ActiveLfm25TtsDecode,
+    ActiveLfm3AudioDecode, ActiveLfm3AudioRealtime, ActiveMaya1TtsDecode, ActiveMaya2TtsDecode,
+    ActiveMingTtsDecode, ActiveNemotronAsrDecode, ActiveNemotronTranscribeDecode,
+    ActiveParakeetAsrDecode, ActiveQwenTtsDecode, ActiveSovTranscribeDecode,
+    ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
     PendingLfm3AudioRealtimeQuantum, PendingVoxtralRealtimeQuantum,
 };
 
@@ -2837,6 +2838,7 @@ pub struct NativeExecutor {
     voxtral_tts_decode_states: ExecutorStateStore<ActiveVoxtralTtsDecode>,
     chatterbox_tts_decode_states: ExecutorStateStore<ActiveChatterboxTtsDecode>,
     maya1_tts_decode_states: ExecutorStateStore<ActiveMaya1TtsDecode>,
+    ming_tts_decode_states: ExecutorStateStore<ActiveMingTtsDecode>,
     maya2_tts_decode_states: ExecutorStateStore<ActiveMaya2TtsDecode>,
     lfm3_audio_decode_states: ExecutorStateStore<ActiveLfm3AudioDecode>,
     nemotron_transcribe_decode_states: ExecutorStateStore<ActiveNemotronTranscribeDecode>,
@@ -2954,6 +2956,7 @@ impl NativeExecutor {
             voxtral_tts_decode_states: Mutex::new(HashMap::new()),
             chatterbox_tts_decode_states: Mutex::new(HashMap::new()),
             maya1_tts_decode_states: Mutex::new(HashMap::new()),
+            ming_tts_decode_states: Mutex::new(HashMap::new()),
             maya2_tts_decode_states: Mutex::new(HashMap::new()),
             lfm3_audio_decode_states: Mutex::new(HashMap::new()),
             nemotron_transcribe_decode_states: Mutex::new(HashMap::new()),
@@ -3202,6 +3205,9 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
                     .is_ok_and(|model| model.is_some())
                 || request
                     .prepared_maya1_tts_model_lease_for_executor()
+                    .is_ok_and(|model| model.is_some())
+                || request
+                    .prepared_ming_tts_model_lease_for_executor()
                     .is_ok_and(|model| model.is_some())
                 || request
                     .prepared_maya2_tts_model_lease_for_executor()
@@ -3465,6 +3471,9 @@ impl ModelExecutor for NativeExecutor {
                         .prepared_maya1_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || request
+                        .prepared_ming_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
+                    || request
                         .prepared_maya2_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || request
@@ -3483,6 +3492,7 @@ impl ModelExecutor for NativeExecutor {
                         | crate::catalog::ModelFamily::Audio8Tts
                         | crate::catalog::ModelFamily::FishDrama3Tts
                         | crate::catalog::ModelFamily::ChatterboxTts
+                        | crate::catalog::ModelFamily::MingTts
                         | crate::catalog::ModelFamily::Maya1Tts
                         | crate::catalog::ModelFamily::Maya2Tts
                         | crate::catalog::ModelFamily::VoxtralTts
@@ -3533,6 +3543,7 @@ impl ModelExecutor for NativeExecutor {
                             | crate::catalog::ModelFamily::Audio8Tts
                             | crate::catalog::ModelFamily::FishDrama3Tts
                             | crate::catalog::ModelFamily::ChatterboxTts
+                            | crate::catalog::ModelFamily::MingTts
                             | crate::catalog::ModelFamily::Maya1Tts
                             | crate::catalog::ModelFamily::Maya2Tts
                             | crate::catalog::ModelFamily::VoxtralTts
@@ -3627,6 +3638,13 @@ impl ModelExecutor for NativeExecutor {
                 .or_else(|| {
                     request
                         .prepared_maya1_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                })
+                .or_else(|| {
+                    request
+                        .prepared_ming_tts_model_lease_for_executor()
                         .ok()
                         .flatten()
                         .map(|_| true)
@@ -4316,6 +4334,23 @@ impl ModelExecutor for NativeExecutor {
                 }
                 NativeBatchRoute::Audio {
                     task: TaskType::TTS,
+                    stage: NativeAudioStage::SequenceAudioDecode,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::MingTts
+                    })
+                }) =>
+                {
+                    self.execute_static_ming_tts_audio_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
                     stage: NativeAudioStage::SequencePrefill,
                     mode: NativeBatchMode::Static,
                     ..
@@ -4394,6 +4429,23 @@ impl ModelExecutor for NativeExecutor {
                 }) =>
                 {
                     self.execute_static_maya1_tts_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::MingTts
+                    })
+                }) =>
+                {
+                    self.execute_static_ming_tts_prefill_requests_with_rows(
                         execution.requests,
                         execution.scheduled,
                         Some(&execution.batch.rows),
@@ -4583,6 +4635,10 @@ impl ModelExecutor for NativeExecutor {
             .maya1_tts_decode_states
             .lock()
             .map_err(|_| Error::InferenceError("Maya1 decode state mutex poisoned".to_string()))?;
+        let mut ming_tts = self
+            .ming_tts_decode_states
+            .lock()
+            .map_err(|_| Error::InferenceError("Ming decode state mutex poisoned".to_string()))?;
         let mut maya2_tts = self
             .maya2_tts_decode_states
             .lock()
@@ -4638,6 +4694,7 @@ impl ModelExecutor for NativeExecutor {
         voxtral_tts.clear();
         chatterbox_tts.clear();
         maya1_tts.clear();
+        ming_tts.clear();
         maya2_tts.clear();
         lfm3_audio_rows.clear();
         nemotron_rows.clear();
@@ -4659,6 +4716,7 @@ impl ModelExecutor for NativeExecutor {
             voxtral_tts,
             chatterbox_tts,
             maya1_tts,
+            ming_tts,
             maya2_tts,
             lfm3_audio_rows,
             nemotron_rows,
@@ -4718,6 +4776,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut voxtral_tts),
             Ok(mut chatterbox_tts),
             Ok(mut maya1_tts),
+            Ok(mut ming_tts),
             Ok(mut maya2_tts),
             Ok(mut lfm3_audio_rows),
             Ok(mut nemotron_rows),
@@ -4739,6 +4798,7 @@ impl ModelExecutor for NativeExecutor {
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
             self.maya1_tts_decode_states.lock(),
+            self.ming_tts_decode_states.lock(),
             self.maya2_tts_decode_states.lock(),
             self.lfm3_audio_decode_states.lock(),
             self.nemotron_transcribe_decode_states.lock(),
@@ -4764,6 +4824,7 @@ impl ModelExecutor for NativeExecutor {
         let voxtral_tts = cleanup_request_states_locked(&mut voxtral_tts, request_id);
         let chatterbox_tts = cleanup_request_states_locked(&mut chatterbox_tts, request_id);
         let maya1_tts = cleanup_request_states_locked(&mut maya1_tts, request_id);
+        let ming_tts = cleanup_request_states_locked(&mut ming_tts, request_id);
         let maya2_tts = cleanup_request_states_locked(&mut maya2_tts, request_id);
         let lfm3_audio_rows = cleanup_request_states_locked(&mut lfm3_audio_rows, request_id);
         let nemotron_rows = cleanup_request_states_locked(&mut nemotron_rows, request_id);
@@ -4784,6 +4845,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(voxtral_tts)
                 .combine(chatterbox_tts)
                 .combine(maya1_tts)
+                .combine(ming_tts)
                 .combine(maya2_tts)
                 .combine(lfm3_audio_rows)
                 .combine(nemotron_rows)
@@ -4840,6 +4902,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut voxtral_tts),
             Ok(mut chatterbox_tts),
             Ok(mut maya1_tts),
+            Ok(mut ming_tts),
             Ok(mut maya2_tts),
             Ok(mut lfm3_audio_rows),
             Ok(mut nemotron_rows),
@@ -4861,6 +4924,7 @@ impl ModelExecutor for NativeExecutor {
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
             self.maya1_tts_decode_states.lock(),
+            self.ming_tts_decode_states.lock(),
             self.maya2_tts_decode_states.lock(),
             self.lfm3_audio_decode_states.lock(),
             self.nemotron_transcribe_decode_states.lock(),
@@ -4890,6 +4954,7 @@ impl ModelExecutor for NativeExecutor {
         let voxtral_tts = cleanup_session_state_locked(&mut voxtral_tts, session);
         let chatterbox_tts = cleanup_session_state_locked(&mut chatterbox_tts, session);
         let maya1_tts = cleanup_session_state_locked(&mut maya1_tts, session);
+        let ming_tts = cleanup_session_state_locked(&mut ming_tts, session);
         let maya2_tts = cleanup_session_state_locked(&mut maya2_tts, session);
         let lfm3_audio_rows = cleanup_session_state_locked(&mut lfm3_audio_rows, session);
         let nemotron_rows = cleanup_session_state_locked(&mut nemotron_rows, session);
@@ -4910,6 +4975,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(voxtral_tts)
                 .combine(chatterbox_tts)
                 .combine(maya1_tts)
+                .combine(ming_tts)
                 .combine(maya2_tts)
                 .combine(lfm3_audio_rows)
                 .combine(nemotron_rows)
@@ -4944,6 +5010,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut voxtral_tts),
             Ok(mut chatterbox_tts),
             Ok(mut maya1_tts),
+            Ok(mut ming_tts),
             Ok(mut maya2_tts),
             Ok(mut lfm3_audio_rows),
             Ok(mut nemotron_rows),
@@ -4955,6 +5022,7 @@ impl ModelExecutor for NativeExecutor {
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
             self.maya1_tts_decode_states.lock(),
+            self.ming_tts_decode_states.lock(),
             self.maya2_tts_decode_states.lock(),
             self.lfm3_audio_decode_states.lock(),
             self.nemotron_transcribe_decode_states.lock(),
@@ -4982,6 +5050,11 @@ impl ModelExecutor for NativeExecutor {
                 ))
                 .combine(cleanup_model_states_locked(
                     &mut maya1_tts,
+                    variant,
+                    |active| active.variant,
+                ))
+                .combine(cleanup_model_states_locked(
+                    &mut ming_tts,
                     variant,
                     |active| active.variant,
                 ))
@@ -6010,6 +6083,7 @@ mod tests {
             ModelFamily::Voxtral,
             ModelFamily::Qwen3Tts,
             ModelFamily::Maya1Tts,
+            ModelFamily::MingTts,
             ModelFamily::Maya2Tts,
             ModelFamily::ChatterboxTts,
             ModelFamily::VoxtralTts,
@@ -8127,6 +8201,24 @@ mod tests {
         });
         let mut request = EngineCoreRequest::tts("The quick brown fox jumps over the lazy dog");
         request.model_variant = Some(ModelVariant::Maya13B);
+
+        let profile = executor.execution_profile(&request).unwrap();
+
+        assert_eq!(profile.mode, ExecutionMode::Sequence);
+        assert!(profile.incremental_decode);
+        assert_eq!(profile.prefill, PrefillMode::Full);
+    }
+
+    #[test]
+    fn ming_tts_raw_profile_uses_the_sequence_execution_route() {
+        let executor = NativeExecutor::new(WorkerConfig {
+            backend: BackendKind::Cpu,
+            request_parallelism: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        let mut request = EngineCoreRequest::tts("The quick brown fox jumps over the lazy dog");
+        request.model_variant = Some(ModelVariant::Ming30Tts05B);
 
         let profile = executor.execution_profile(&request).unwrap();
 

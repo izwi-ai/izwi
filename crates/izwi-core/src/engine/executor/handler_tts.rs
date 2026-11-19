@@ -4029,6 +4029,13 @@ impl NativeExecutor {
         if ordered_requests.first().is_some_and(|request| {
             request
                 .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::MingTts)
+        }) {
+            return self.ming_tts_batch_with_managed(&ordered_requests, scheduled, managed_caches);
+        }
+        if ordered_requests.first().is_some_and(|request| {
+            request
+                .model_variant
                 .is_some_and(|variant| variant.family() == ModelFamily::Maya2Tts)
         }) {
             return self.maya2_tts_batch_with_managed(&ordered_requests, scheduled, managed_caches);

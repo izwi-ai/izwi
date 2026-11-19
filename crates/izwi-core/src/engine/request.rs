@@ -42,6 +42,8 @@ use crate::models::architectures::maya1::retained::Maya1PreparedArtifact;
 use crate::models::architectures::maya1::Maya1GenerationParams;
 use crate::models::architectures::maya2::retained::Maya2PreparedArtifact;
 use crate::models::architectures::maya2::Maya2GenerationParams;
+use crate::models::architectures::ming_tts::retained::MingPreparedArtifact;
+use crate::models::architectures::ming_tts::MingGenerationParams;
 use crate::models::architectures::nemotron::asr::NemotronPreparedEncoderArtifact;
 use crate::models::architectures::parakeet::asr::ParakeetPreparedEncoderArtifact;
 use crate::models::architectures::qwen3::asr::Qwen3AsrPreparedAudio;
@@ -59,7 +61,7 @@ use crate::models::architectures::whisper::asr::WhisperPreparedWindow;
 use crate::models::registry::{
     AsrModelLease, Audio8TtsModelLease, ChatModelLease, ChatterboxTtsModelLease,
     FishDrama3TtsModelLease, FishS2TtsModelLease, KokoroTtsModelLease, Lfm25AudioModelLease,
-    Maya1TtsModelLease, Maya2TtsModelLease, NativeAsrModel, NativeChatModel,
+    Maya1TtsModelLease, Maya2TtsModelLease, MingTtsModelLease, NativeAsrModel, NativeChatModel,
     NativeChatPreparedPrompt, QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease,
     VoxtralTtsModelLease,
 };
@@ -491,6 +493,7 @@ enum PreparedIncrementalModel {
     VoxtralTts(VoxtralTtsModelLease),
     ChatterboxTts(ChatterboxTtsModelLease),
     Maya1Tts(Maya1TtsModelLease),
+    MingTts(MingTtsModelLease),
     Maya2Tts(Maya2TtsModelLease),
     /// LFM3-Audio speech as a retained row (the audio-chat model's lease).
     Lfm3Audio(Lfm25AudioModelLease),
@@ -513,6 +516,7 @@ impl fmt::Debug for PreparedIncrementalModel {
             Self::VoxtralTts(model) => write!(formatter, "VoxtralTts({:p})", &**model),
             Self::ChatterboxTts(model) => write!(formatter, "ChatterboxTts({:p})", &**model),
             Self::Maya1Tts(model) => write!(formatter, "Maya1Tts({:p})", &**model),
+            Self::MingTts(model) => write!(formatter, "MingTts({:p})", &**model),
             Self::Maya2Tts(model) => write!(formatter, "Maya2Tts({:p})", &**model),
             Self::Lfm3Audio(model) => write!(formatter, "Lfm3Audio({:p})", &**model),
             Self::KokoroTts(model) => write!(formatter, "KokoroTts({:p})", &**model),
@@ -540,7 +544,9 @@ pub(super) struct IncrementalModelExecutionReady {
     chatterbox_tts: Option<Arc<ChatterboxPreparedArtifact>>,
     chatterbox_tts_params: Option<ChatterboxGenerationParams>,
     maya1_tts: Option<Arc<Maya1PreparedArtifact>>,
+    ming_tts: Option<Arc<MingPreparedArtifact>>,
     maya1_tts_params: Option<Maya1GenerationParams>,
+    ming_tts_params: Option<MingGenerationParams>,
     maya2_tts: Option<Arc<Maya2PreparedArtifact>>,
     maya2_tts_params: Option<Maya2GenerationParams>,
     lfm3_audio: Option<Arc<Lfm3AudioPreparedArtifact>>,

@@ -22,6 +22,7 @@
 
 pub mod config;
 pub mod flow;
+mod model;
 mod physical;
 pub mod prompt;
 pub(crate) mod retained;
@@ -48,6 +49,9 @@ pub use config::{
     MAX_NEW_LATENTS, MAX_REFERENCE_LATENTS, MIN_LATENTS, MIN_REFERENCE_SECONDS, SAMPLE_RATE,
     SPEAKER_WEIGHTS_FILE, WEIGHTS_FILE,
 };
+pub use model::{ming_lm_precision, MingTtsDiagnostics, MingTtsModel};
+pub(crate) use model::{ming_reloads_in_f32, MingAudioProgress};
+pub(crate) use physical::MING_TTS_DOMAIN;
 pub use prompt::{
     target_language_name, MingControl, MingDialect, MingEmotion, MingLevel, MingSpeaker,
     MING_INLINE_TAGS,
@@ -137,13 +141,24 @@ pub struct MingPrompt {
     pub text_tokens: usize,
 }
 
+impl MingPrompt {
+    /// Positions the prompt takes in the language model's context.
+    pub fn len(&self) -> usize {
+        self.positions
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.positions == 0
+    }
+}
+
 /// Everything one utterance's generation is parameterised by.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MingGenerationParams {
     /// Classifier-free guidance scale of the flow head.
     pub guidance: f32,
-    /// The most latents to generate (80 ms each).
-    pub max_new_latents: usize,
+    /// The most latents to generate (80 ms each): the engine's tokens.
+    pub max_new_tokens: usize,
     /// Positive; drives each latent's starting noise.
     pub seed: u64,
 }
@@ -155,7 +170,7 @@ impl MingGenerationParams {
                 "Ming guidance scale must be between 0 and 10".into(),
             ));
         }
-        if self.max_new_latents < MIN_LATENTS || self.max_new_latents > MAX_NEW_LATENTS {
+        if self.max_new_tokens < MIN_LATENTS || self.max_new_tokens > MAX_NEW_LATENTS {
             return Err(Error::InvalidInput(format!(
                 "Ming generates {MIN_LATENTS}..={MAX_NEW_LATENTS} latents per request"
             )));
@@ -608,7 +623,7 @@ impl MingRuntime {
         params.validate()?;
         let prompt = self.prompt(request)?;
         let budget = params
-            .max_new_latents
+            .max_new_tokens
             .min(Self::latent_room(prompt.positions));
         let started = Instant::now();
         let embeds = self.prompt_rows(&prompt.embeds)?;
@@ -660,18 +675,18 @@ mod tests {
     fn generation_params_validate_their_ranges() {
         let mut params = MingGenerationParams {
             guidance: DEFAULT_GUIDANCE,
-            max_new_latents: 100,
+            max_new_tokens: 100,
             seed: 3,
         };
         assert!(params.validate().is_ok());
         params.seed = 0;
         assert!(params.validate().is_err());
         params.seed = 3;
-        params.max_new_latents = MAX_NEW_LATENTS + 1;
+        params.max_new_tokens = MAX_NEW_LATENTS + 1;
         assert!(params.validate().is_err());
-        params.max_new_latents = MIN_LATENTS - 1;
+        params.max_new_tokens = MIN_LATENTS - 1;
         assert!(params.validate().is_err());
-        params.max_new_latents = MIN_LATENTS;
+        params.max_new_tokens = MIN_LATENTS;
         params.guidance = f32::NAN;
         assert!(params.validate().is_err());
     }

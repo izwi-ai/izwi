@@ -126,6 +126,7 @@ pub(crate) fn validate_managed_state_plan_eligibility(
             )
             | (ModelFamily::ChatterboxTts, CapabilityKind::Tts)
             | (ModelFamily::Maya1Tts, CapabilityKind::Tts)
+            | (ModelFamily::MingTts, CapabilityKind::Tts)
             | (ModelFamily::Maya2Tts, CapabilityKind::Tts)
             | (ModelFamily::Lfm3Audio, CapabilityKind::Tts)
             | (ModelFamily::Lfm3Audio, CapabilityKind::Asr)

@@ -311,6 +311,7 @@ impl ModelVariant {
             | ModelFamily::FishS2Tts
             | ModelFamily::Audio8Tts
             | ModelFamily::ChatterboxTts
+            | ModelFamily::MingTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts
             | ModelFamily::ParakeetAsr
@@ -395,6 +396,7 @@ impl ModelVariant {
             | ModelFamily::Audio8Tts
             | ModelFamily::FishDrama3Tts
             | ModelFamily::ChatterboxTts
+            | ModelFamily::MingTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts
             | ModelFamily::WhisperAsr
@@ -525,6 +527,10 @@ impl ModelVariant {
             ModelFamily::Maya1Tts => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
                 "Maya1 uses dense Candle CUDA tensor kernels for its Llama 3.2-3B decoder (BF16, GQA on izwi's paged KV) and SNAC's convolutional decoder (F32); sampling and the codec noise are drawn on the host; audio decodes in windows while the decoder runs, streamed or not",
+            ),
+            ModelFamily::MingTts => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Ming-3.0-tts uses dense Candle CUDA tensor kernels for its Qwen2.5 language model (BF16, GQA on izwi's paged KV), its aggregator and flow-matching head (BF16, ten Euler steps a latent, both guidance branches in one batch) and its transformer VAE (F32); each latent's starting noise is drawn on the host and the inverse STFT runs on the host; audio decodes in windows while the decoder runs, streamed or not",
             ),
             ModelFamily::Maya2Tts => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
@@ -677,6 +683,10 @@ impl ModelVariant {
             ModelFamily::Maya1Tts => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
                 "Maya1 ships dense BF16 safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
+            ),
+            ModelFamily::MingTts => CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::Dense,
+                "Ming-3.0-tts ships dense BF16 safetensors; CUDA dtype policy, not quantization, controls memory/performance tradeoffs",
             ),
             ModelFamily::Maya2Tts => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,

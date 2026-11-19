@@ -232,6 +232,10 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_METAL_PROJECTION_BACKEND` | choice | `auto` | startup | Chooses Metal block-FP8 projection residency: auto, native_fp8 (keep FP8) or expanded (F16); invalid = startup error. |
 | `IZWI_METAL_SDPA_F32_PREFILL_F16` | flag | `true` | first use | Casts F32 Metal prefill attention (q_seq > 8) to F16 for the SDPA kernel. |
 | `IZWI_METAL_SDPA_MASKED` | flag | `false` | first use | Allows Metal SDPA for masked attention when the mask shape is supported. |
+| `IZWI_MING_TTS_MODEL_DIR` | path | unset (test skipped) | test harness | Ming-3.0-tts-0.5B model directory (with campplus_cn_common.bin) for the ignored real-weight tests. |
+| `IZWI_MING_TTS_OUT_DIR` | path | unset (no audio kept) | test harness | Directory the ignored Ming-3.0-tts real-weight tests write their generated audio to as WAV files. |
+| `IZWI_MING_TTS_TEST_DEVICE` | choice | `cpu` | test harness | Device of the ignored Ming-3.0-tts real-weight tests: cpu (F32), metal (F16 language model and flow path) or metal-f32. |
+| `IZWI_MING_TTS_VAE_WINDOW_KEYS` | integer | `64` | first use | Keys a frame of Ming-3.0-tts's VAE attends to, itself included, between 2 and 4096; invalid ignored. The default is the reference's SDPA path (a frame and the 63 before it); 65 is its flash-attn path, which the published config names. Read once at load. |
 | `IZWI_MIXED_FORCE_SPLIT` | flag | `false` | first use | Runs mixed prefill+decode batches through the split prefill and decode handlers (parity oracle and kill switch). |
 | `IZWI_MIXED_STEP` | flag | certified table (currently off for all) | model load | Overrides whether a loaded chat model publishes mixed prefill+decode steps. |
 | `IZWI_MODELS_DIR` | path | `<data_local_dir>/izwi/models` | startup | Directory where model weights are stored and looked up. |

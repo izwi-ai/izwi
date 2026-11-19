@@ -285,6 +285,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -353,6 +355,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -412,6 +416,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -470,6 +476,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -522,6 +530,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -574,6 +584,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: Some(params),
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -626,6 +638,62 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: Some(artifact),
             maya1_tts_params: Some(params),
+            ming_tts: None,
+            ming_tts_params: None,
+            maya2_tts: None,
+            maya2_tts_params: None,
+            lfm3_audio: None,
+            nemotron_transcribe: None,
+            sov_transcribe: None,
+            kokoro_tts: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn install_ming_tts_execution_model(
+        &mut self,
+        model_variant: ModelVariant,
+        model: MingTtsModelLease,
+        artifact: Arc<MingPreparedArtifact>,
+        params: MingGenerationParams,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::TTS
+            || self.model_variant != Some(model_variant)
+            || model_variant.family() != ModelFamily::MingTts
+            || artifact.prompt.is_empty()
+            || artifact.prompt.len() + params.max_new_tokens > max_sequence_tokens + 1
+            || params.max_new_tokens == 0
+        {
+            return Err(Error::InvalidInput(format!(
+                "Ming request {} preparation does not match its routed model/context",
+                self.id
+            )));
+        }
+        self.prepared_stage_costs.clear();
+        self.prepared_sequence_input_tokens = Some(artifact.prompt.len());
+        self.params.max_tokens = params.max_new_tokens;
+        self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
+            model_variant,
+            model: PreparedIncrementalModel::MingTts(model),
+            qwen_tts: None,
+            lfm25_audio_tts: None,
+            vibevoice_tts: None,
+            vibevoice_tts_params: None,
+            fish_s2_tts: None,
+            fish_s2_tts_params: None,
+            audio8_tts: None,
+            audio8_tts_params: None,
+            fish_drama3_tts: None,
+            fish_drama3_tts_params: None,
+            voxtral_tts: None,
+            voxtral_tts_params: None,
+            chatterbox_tts: None,
+            chatterbox_tts_params: None,
+            maya1_tts: None,
+            maya1_tts_params: None,
+            ming_tts: Some(artifact),
+            ming_tts_params: Some(params),
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -680,6 +748,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: Some(artifact),
             maya2_tts_params: Some(params),
             lfm3_audio: None,
@@ -741,6 +811,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -911,6 +983,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: artifact,
@@ -974,6 +1048,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -1092,6 +1168,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -1369,6 +1447,19 @@ impl EngineCoreRequest {
             }))
     }
 
+    pub(crate) fn prepared_ming_tts_model_lease_for_executor(
+        &self,
+    ) -> Result<Option<MingTtsModelLease>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| match &ready.model {
+                PreparedIncrementalModel::MingTts(model) => Some(model.clone()),
+                _ => None,
+            }))
+    }
+
     pub(crate) fn prepared_maya1_tts_artifact_for_executor(
         &self,
     ) -> Result<Option<Arc<Maya1PreparedArtifact>>> {
@@ -1379,6 +1470,16 @@ impl EngineCoreRequest {
             .and_then(|ready| ready.maya1_tts.clone()))
     }
 
+    pub(crate) fn prepared_ming_tts_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<MingPreparedArtifact>>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.ming_tts.clone()))
+    }
+
     pub(crate) fn maya1_tts_generation_params_for_executor(
         &self,
     ) -> Result<Option<Maya1GenerationParams>> {
@@ -1387,6 +1488,16 @@ impl EngineCoreRequest {
             .incremental_model_execution_ready
             .as_ref()
             .and_then(|ready| ready.maya1_tts_params))
+    }
+
+    pub(crate) fn ming_tts_generation_params_for_executor(
+        &self,
+    ) -> Result<Option<MingGenerationParams>> {
+        self.validate_incremental_model_execution_preparation()?;
+        Ok(self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.ming_tts_params))
     }
 
     pub(crate) fn prepared_maya2_tts_model_lease_for_executor(
@@ -1486,6 +1597,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
+                | PreparedIncrementalModel::MingTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
@@ -1512,6 +1624,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
+                | PreparedIncrementalModel::MingTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)

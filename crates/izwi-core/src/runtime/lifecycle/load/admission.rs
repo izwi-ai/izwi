@@ -141,6 +141,7 @@ pub(super) fn fits_portable_state(variant: ModelVariant) -> bool {
                 | ModelFamily::FishS2Tts
                 | ModelFamily::Audio8Tts
                 | ModelFamily::ChatterboxTts
+                | ModelFamily::MingTts
                 | ModelFamily::Maya1Tts
                 | ModelFamily::Maya2Tts
                 | ModelFamily::FishDrama3Tts

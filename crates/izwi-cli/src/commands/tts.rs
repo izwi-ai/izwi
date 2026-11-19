@@ -43,6 +43,7 @@ pub struct TtsArgs {
     pub exaggeration: Option<f32>,
     pub cfg_weight: Option<f32>,
     pub min_p: Option<f32>,
+    pub delivery: SpeechDelivery,
     pub stream: bool,
     pub play: bool,
 }
@@ -199,6 +200,17 @@ struct SpeechControls {
     min_p: Option<f32>,
 }
 
+/// Named deliveries (Ming 3.0 TTS); each is sent only when set, and the
+/// server refuses one the model or the chosen voice does not perform.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeechDelivery {
+    pub emotion: Option<String>,
+    pub dialect: Option<String>,
+    pub speaking_rate: Option<String>,
+    pub pitch: Option<String>,
+    pub volume: Option<String>,
+}
+
 pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
     let TtsArgs {
         text,
@@ -222,6 +234,7 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
         exaggeration,
         cfg_weight,
         min_p,
+        delivery,
         stream,
         play,
     } = args;
@@ -278,6 +291,7 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
             cfg_weight,
             min_p,
         },
+        delivery,
         stream,
     })?;
 
@@ -491,6 +505,7 @@ struct BuildRequestArgs<'a> {
     language: Option<String>,
     reference_language: Option<String>,
     controls: SpeechControls,
+    delivery: SpeechDelivery,
     stream: bool,
 }
 
@@ -549,6 +564,18 @@ fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
     ] {
         if let Some(value) = value {
             request_body[name] = json!(value);
+        }
+    }
+    let delivery = args.delivery;
+    for (name, value) in [
+        ("emotion", delivery.emotion),
+        ("dialect", delivery.dialect),
+        ("speaking_rate", delivery.speaking_rate),
+        ("pitch", delivery.pitch),
+        ("volume", delivery.volume),
+    ] {
+        if let Some(value) = normalize_optional_text(value) {
+            request_body[name] = Value::String(value);
         }
     }
 
@@ -760,6 +787,7 @@ mod tests {
                 temperature: None,
                 language: None,
                 reference_language: None,
+                delivery: SpeechDelivery::default(),
                 controls: SpeechControls::default(),
                 dialogue: DialogueArgs::default(),
                 seed: None,
@@ -831,6 +859,7 @@ mod tests {
             temperature: None,
             language: None,
             reference_language: None,
+            delivery: SpeechDelivery::default(),
             controls: SpeechControls::default(),
             dialogue: DialogueArgs::default(),
             seed: None,
@@ -839,6 +868,39 @@ mod tests {
         .expect("request body");
         assert!(body.get("speed").is_none() && body.get("temperature").is_none());
         assert_eq!(body["response_format"], "pcm_i16");
+    }
+
+    #[test]
+    fn named_deliveries_are_sent_only_when_set() {
+        let body = build_request_body(BuildRequestArgs {
+            model: "Ming-3.0-tts-0.5B".to_string(),
+            text: "hello".to_string(),
+            speaker: Some("灵风信".to_string()),
+            saved_voice_id: None,
+            reference_audio: None,
+            reference_text: None,
+            reference_text_file: None,
+            instructions: None,
+            format: &AudioFormat::Wav,
+            speed: None,
+            temperature: None,
+            language: Some("zh".to_string()),
+            reference_language: None,
+            controls: SpeechControls::default(),
+            delivery: SpeechDelivery {
+                emotion: Some(" happy ".to_string()),
+                pitch: Some("  ".to_string()),
+                ..SpeechDelivery::default()
+            },
+            dialogue: DialogueArgs::default(),
+            seed: None,
+            stream: false,
+        })
+        .expect("request body");
+        assert_eq!(body["voice"], json!("灵风信"));
+        assert_eq!(body["emotion"], json!("happy"));
+        assert!(body.get("pitch").is_none());
+        assert!(body.get("dialect").is_none());
     }
 
     #[test]
@@ -857,6 +919,7 @@ mod tests {
             temperature: None,
             language: None,
             reference_language: None,
+            delivery: SpeechDelivery::default(),
             controls: SpeechControls {
                 exaggeration: Some(0.8),
                 cfg_weight: Some(0.0),
@@ -888,6 +951,7 @@ mod tests {
             temperature: None,
             language: Some("hi".to_string()),
             reference_language: Some(" en ".to_string()),
+            delivery: SpeechDelivery::default(),
             controls: SpeechControls::default(),
             dialogue: DialogueArgs::default(),
             seed: None,
@@ -914,6 +978,7 @@ mod tests {
             temperature: Some(0.7),
             language: None,
             reference_language: None,
+            delivery: SpeechDelivery::default(),
             controls: SpeechControls::default(),
             dialogue: DialogueArgs::default(),
             seed: None,
@@ -945,6 +1010,7 @@ mod tests {
             temperature: Some(0.7),
             language: None,
             reference_language: None,
+            delivery: SpeechDelivery::default(),
             controls: SpeechControls::default(),
             dialogue: DialogueArgs::default(),
             seed: None,
@@ -977,6 +1043,7 @@ mod tests {
             temperature: None,
             language: None,
             reference_language: None,
+            delivery: SpeechDelivery::default(),
             controls: SpeechControls::default(),
             dialogue: DialogueArgs::default(),
             seed: None,
@@ -1099,6 +1166,7 @@ mod tests {
             temperature: None,
             language: None,
             reference_language: None,
+            delivery: SpeechDelivery::default(),
             controls: SpeechControls::default(),
             stream: false,
         })
@@ -1140,6 +1208,7 @@ mod tests {
             temperature: None,
             language: None,
             reference_language: None,
+            delivery: SpeechDelivery::default(),
             controls: SpeechControls::default(),
             stream: false,
         })
@@ -1197,6 +1266,7 @@ mod tests {
             temperature: Some(0.7),
             language: None,
             reference_language: None,
+            delivery: SpeechDelivery::default(),
             controls: SpeechControls::default(),
             dialogue: DialogueArgs::default(),
             seed: None,

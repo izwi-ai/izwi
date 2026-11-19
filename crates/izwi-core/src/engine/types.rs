@@ -148,6 +148,20 @@ pub struct SpeechSamplingOptions {
     /// Classifier-free guidance weight; 0 turns guidance off (Chatterbox).
     #[serde(default)]
     pub cfg_weight: Option<f32>,
+    /// The emotion to speak with, by name (Ming 3.0 TTS).
+    #[serde(default)]
+    pub emotion: Option<String>,
+    /// A dialect to speak in, by name (Ming 3.0 TTS).
+    #[serde(default)]
+    pub dialect: Option<String>,
+    /// Speaking rate, pitch and volume as a level: low, medium or high
+    /// (Ming 3.0 TTS).
+    #[serde(default)]
+    pub speaking_rate: Option<String>,
+    #[serde(default)]
+    pub pitch: Option<String>,
+    #[serde(default)]
+    pub volume: Option<String>,
 }
 
 impl SpeechSamplingOptions {

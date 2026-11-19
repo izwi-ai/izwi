@@ -36,6 +36,9 @@ use crate::models::architectures::granite_speech5::asr::{
 };
 use crate::models::architectures::maya1::config::SNAC_WEIGHTS_FILE;
 use crate::models::architectures::maya1::MAYA1_GGUF_FILE;
+use crate::models::architectures::ming_tts::{
+    SPEAKER_WEIGHTS_FILE as MING_TTS_SPEAKER_WEIGHTS_FILE, WEIGHTS_FILE as MING_TTS_WEIGHTS_FILE,
+};
 use crate::models::architectures::nemotron::asr::nemotron_native_artifacts_complete;
 use crate::models::architectures::parakeet::asr::parakeet_native_artifacts_complete;
 use crate::models::shared::weights::nemo::ensure_free_disk;
@@ -249,6 +252,23 @@ const MAYA1_GGUF_FILES: &[&str] = &[
 /// The exact size of `maya1.Q8_0.gguf` at the pinned revision (LFS sha256
 /// `529b6f9a…`).
 const MAYA1_GGUF_BYTES: u64 = 3_516_496_480;
+
+/// Ming-3.0-tts-0.5B's files at the pinned revision (ffd36ab5): the config
+/// (checked against the port's layout), the tokenizer and the one BF16
+/// checkpoint; then CAM++'s PyTorch checkpoint from its own repository
+/// ([`CAMPPLUS_CHECKPOINT`]). Upstream's `campplus.onnx` holds the same
+/// weights and is not fetched.
+const MING_TTS_FILES: &[&str] = &[
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    MING_TTS_WEIGHTS_FILE,
+    MING_TTS_SPEAKER_WEIGHTS_FILE,
+];
+
+/// The exact size of Ming-3.0-tts-0.5B's `model.safetensors` at the pinned
+/// revision (LFS sha256 `45c4d78d…`).
+const MING_TTS_WEIGHTS_BYTES: u64 = 2_959_055_504;
 
 fn maya1_files(variant: ModelVariant) -> &'static [&'static str] {
     if variant.is_maya1_gguf() {
@@ -998,9 +1018,22 @@ const ECAPA_EMBEDDING_MODEL: PinnedFile = PinnedFile {
     sha256: "0575cb64845e6b9a10db9bcb74d5ac32b326b8dc90352671d345e2ee3d0126a2",
 };
 
+/// funasr/campplus at e4b6ede7 (Apache-2.0): CAM++, the speaker encoder
+/// behind Ming-3.0-tts's cloned voices, as a torch zip kept under its own
+/// name beside Ming's files.
+const CAMPPLUS_CHECKPOINT: PinnedFile = PinnedFile {
+    url: "https://huggingface.co/funasr/campplus/resolve/\
+          e4b6ede7ce16997aff4ae69fbca1f0175e2afede/campplus_cn_common.bin",
+    size: 28_036_335,
+    sha256: "3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8",
+};
+
 /// The pinned source of `variant`'s `local_file`, when it is not in the
 /// variant's own repository.
 fn pinned_file(variant: ModelVariant, local_file: &str) -> Option<PinnedFile> {
+    if variant.family() == ModelFamily::MingTts && local_file == MING_TTS_SPEAKER_WEIGHTS_FILE {
+        return Some(CAMPPLUS_CHECKPOINT);
+    }
     if variant.family() == ModelFamily::Maya1Tts && local_file == SNAC_WEIGHTS_FILE {
         return Some(SNAC_24KHZ_CHECKPOINT);
     }
@@ -2089,6 +2122,9 @@ impl ModelDownloader {
             ModelFamily::Maya1Tts => maya1_files(variant)
                 .iter()
                 .all(|file| path.join(file).exists()),
+            ModelFamily::MingTts => MING_TTS_FILES
+                .iter()
+                .all(|file| path.join(file).exists()),
             ModelFamily::Maya2Tts => MAYA2_FILES.iter().all(|file| path.join(file).exists()),
             ModelFamily::Tokenizer => {
                 path.join("tokenizer.json").exists() || path.join("vocab.json").exists()
@@ -2800,6 +2836,10 @@ impl ModelDownloader {
                 .iter()
                 .map(|file| (*file).to_string())
                 .collect(),
+            ModelFamily::MingTts => MING_TTS_FILES
+                .iter()
+                .map(|file| (*file).to_string())
+                .collect(),
             ModelFamily::Maya2Tts => MAYA2_FILES.iter().map(|file| (*file).to_string()).collect(),
             ModelFamily::Tokenizer => vec![
                 "config.json".to_string(),
@@ -3343,6 +3383,15 @@ impl ModelDownloader {
                 MAYA1_GGUF_FILE => MAYA1_GGUF_BYTES,
                 SNAC_WEIGHTS_FILE => SNAC_24KHZ_CHECKPOINT.size,
                 _ => 860,
+            }
+        } else if variant.family() == ModelFamily::MingTts {
+            // Ming-3.0-tts-0.5B at ffd36ab5.
+            match file {
+                MING_TTS_WEIGHTS_FILE => MING_TTS_WEIGHTS_BYTES,
+                MING_TTS_SPEAKER_WEIGHTS_FILE => CAMPPLUS_CHECKPOINT.size,
+                "tokenizer.json" => 11_431_389,
+                "tokenizer_config.json" => 16_260,
+                _ => 4_754,
             }
         } else if variant.family() == ModelFamily::Maya2Tts {
             // Maya 2 Native at 1403b841.
@@ -4663,6 +4712,49 @@ mod tests {
             ),
             GRANITE_SPEECH_5_MODEL_BYTES
         );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    /// Ming-3.0-tts takes its checkpoint, config and tokenizer from its own
+    /// repository at the pin and CAM++ from its pinned PyTorch checkpoint;
+    /// no ONNX file is fetched, and the sizes add up to the catalog's.
+    #[test]
+    fn ming_tts_specs_pin_the_release_and_the_speaker_checkpoint() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Ming30Tts05B;
+        let specs = downloader.get_model_file_specs(variant);
+        assert_eq!(specs.len(), MING_TTS_FILES.len());
+        let mut total = 0;
+        for spec in &specs {
+            assert!(!spec.local_file.ends_with(".onnx"));
+            total += downloader.get_single_file_size_estimate(variant, &spec.local_file);
+            if spec.local_file == MING_TTS_SPEAKER_WEIGHTS_FILE {
+                assert_eq!(
+                    pinned_file(variant, &spec.local_file),
+                    Some(CAMPPLUS_CHECKPOINT)
+                );
+                continue;
+            }
+            assert_eq!(pinned_file(variant, &spec.local_file), None);
+            assert_eq!(spec.source_repo, "inclusionAI/Ming-3.0-tts-0.5B");
+            assert_eq!(spec.source_revision, ModelVariant::MING_TTS_ARTIFACT_REVISION);
+            assert_eq!(spec.source_file, spec.local_file);
+        }
+        assert_eq!(total, variant.estimated_size());
+        assert!(CAMPPLUS_CHECKPOINT
+            .url
+            .contains(ModelVariant::MING_TTS_SPEAKER_ARTIFACT_REVISION));
+        assert!(CAMPPLUS_CHECKPOINT
+            .url
+            .contains(ModelVariant::MING_TTS_SPEAKER_REPO));
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        for file in &MING_TTS_FILES[..MING_TTS_FILES.len() - 1] {
+            std::fs::write(model_dir.join(file), [0u8]).expect("partial Ming asset");
+        }
+        assert!(!downloader.is_downloaded(variant));
+        std::fs::write(model_dir.join(MING_TTS_SPEAKER_WEIGHTS_FILE), [0u8]).expect("CAM++");
+        assert!(downloader.is_downloaded(variant));
         std::fs::remove_dir_all(temp_dir).ok();
     }
 

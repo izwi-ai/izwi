@@ -1193,7 +1193,7 @@ mod tests {
         use crate::runtime::adapters::RuntimeAdapterRegistry;
         // Families whose engine executors stream committed audio and publish
         // the final marker.
-        const ENGINE_STREAM_EMITTERS: [ModelFamily; 10] = [
+        const ENGINE_STREAM_EMITTERS: [ModelFamily; 11] = [
             ModelFamily::Qwen3Tts,
             ModelFamily::FishS2Tts,
             ModelFamily::Audio8Tts,
@@ -1203,6 +1203,7 @@ mod tests {
             ModelFamily::VibeVoiceTts,
             ModelFamily::ChatterboxTts,
             ModelFamily::Maya1Tts,
+            ModelFamily::MingTts,
             ModelFamily::Maya2Tts,
         ];
         let registry = RuntimeAdapterRegistry::built_in();

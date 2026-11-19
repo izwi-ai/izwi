@@ -105,7 +105,7 @@ impl MingRetainedState {
         params.validate()?;
         let positions = artifact.prompt.positions;
         let budget = params
-            .max_new_latents
+            .max_new_tokens
             .min(MingRuntime::latent_room(positions));
         if positions == 0
             || budget < MIN_LATENTS
@@ -133,8 +133,8 @@ impl MingRetainedState {
 
     /// Positions the sequence reaches: the prompt plus every latent but the
     /// last.
-    pub(crate) fn required_context(prompt_positions: usize, max_new_latents: usize) -> usize {
-        prompt_positions + max_new_latents.saturating_sub(1)
+    pub(crate) fn required_context(prompt_positions: usize, max_new_tokens: usize) -> usize {
+        prompt_positions + max_new_tokens.saturating_sub(1)
     }
 
     pub(crate) fn phase(&self) -> MingPhase {
@@ -412,10 +412,10 @@ mod tests {
     use crate::models::architectures::ming_tts::synthetic::{tiny_request, tiny_runtime};
     use crate::models::architectures::ming_tts::DEFAULT_GUIDANCE;
 
-    fn params(max_new_latents: usize) -> MingGenerationParams {
+    fn params(max_new_tokens: usize) -> MingGenerationParams {
         MingGenerationParams {
             guidance: DEFAULT_GUIDANCE,
-            max_new_latents,
+            max_new_tokens,
             seed: 7,
         }
     }

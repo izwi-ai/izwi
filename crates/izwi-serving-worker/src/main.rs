@@ -920,6 +920,7 @@ impl WorkerProcessConfig {
                     | izwi_core::catalog::ModelFamily::FishDrama3Tts
                     | izwi_core::catalog::ModelFamily::ChatterboxTts
                     | izwi_core::catalog::ModelFamily::Maya1Tts
+                    | izwi_core::catalog::ModelFamily::MingTts
                     | izwi_core::catalog::ModelFamily::Maya2Tts
                     | izwi_core::catalog::ModelFamily::Lfm25Audio
                     | izwi_core::catalog::ModelFamily::Lfm3Audio => variant,

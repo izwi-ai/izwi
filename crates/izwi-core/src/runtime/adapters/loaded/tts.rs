@@ -1,5 +1,5 @@
 //! TTS execution adapters: Qwen3-TTS, static Kokoro, Voxtral, Chatterbox, Maya1,
-//! Maya 2 Native, Fish S2, VibeVoice and LFM2.5-Audio.
+//! Maya 2 Native, Ming 3.0 TTS, Fish S2, VibeVoice and LFM2.5-Audio.
 
 use super::*;
 
@@ -728,7 +728,49 @@ pub(super) struct Maya1TtsExecutionAdapter {
     pub(super) decode_batch_size: usize,
 }
 
+#[derive(Debug)]
+pub(super) struct MingTtsExecutionAdapter {
+    pub(super) execution_group_id: ExecutionGroupId,
+    pub(super) model_instance_id: ModelInstanceId,
+    pub(super) adapter_instance_id: AdapterInstanceId,
+    pub(super) metadata: AdapterMetadata,
+    pub(super) backend_kind: BackendKind,
+    pub(super) max_batch_size: usize,
+    /// Rows of the continuous decode stage: `max_batch_size`, or the wider
+    /// width the family is certified for (`catalog::tts_decode_width`).
+    pub(super) decode_batch_size: usize,
+}
+
 impl Maya1TtsExecutionAdapter {
+    pub(super) fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
+        }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows).
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
+    }
+}
+
+impl MingTtsExecutionAdapter {
     pub(super) fn new(
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
@@ -896,6 +938,147 @@ impl LoadedExecutionAdapter for Maya1TtsExecutionAdapter {
         // SNAC's activations over a window of up to 22 frames (45,056
         // samples), the widest 12 MB a tensor, a window a row.
         acoustic.max_workspace_bytes = (256 * 1024 * 1024_u64).saturating_mul(rows as u64);
+        for stage in [
+            &mut preparation,
+            &mut prefill,
+            &mut decode,
+            &mut finalize,
+            &mut acoustic,
+        ] {
+            stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            stage.validate()?;
+        }
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata: self.metadata,
+            execution_profile: profile,
+            stages: Arc::from([preparation, prefill, decode, finalize, acoustic]),
+        })
+    }
+}
+
+impl LoadedExecutionAdapter for MingTtsExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        MING_TTS_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        // One graph serves both: every request's audio quanta decode VAE
+        // windows while the language model runs; a stream sends each one.
+        if streaming.model_native && self.metadata.streaming_mode == StreamingMode::None {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no native streaming TTS contract",
+                self.metadata.model_variant
+            )));
+        }
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind);
+        profile.mode = ExecutionMode::Sequence;
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some(format!(
+            "{}:tts:{}:ming_tts-state-v2",
+            self.metadata.model_variant,
+            self.backend_kind.as_str()
+        ));
+        profile.kv_dtype = "state_v2_resolved".into();
+        profile.cancellation = CancellationGranularity::SequenceStep;
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        profile.max_batch_size = self.decode_batch_size;
+        profile.resolved_from_loaded_model = true;
+
+        let mut preparation = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "tts.prepare.ming_tts",
+            &profile,
+            NativeBatchMode::None,
+        );
+        preparation.selector = StageWorkSelector::PreSequencePreparation;
+        preparation.progress = StageProgressKind::Atomic;
+        preparation.max_batch_size = 1;
+        preparation.concurrency = ConcurrencyClass::Exclusive;
+        preparation.shape_policy = StageShapePolicy::Exact;
+        preparation.max_work_units = 16_384;
+        // Normalising and tokenizing the prompt on the host.
+        preparation.max_workspace_bytes = 64 * 1024 * 1024;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "tts.prefill.ming_tts.tensor_static",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        // Prefill stays at the engine rows; only decode widens.
+        prefill.max_batch_size = self.max_batch_size;
+        prefill.progress = StageProgressKind::Iterative;
+        prefill.shape_policy = StageShapePolicy::Ragged;
+        prefill.max_padding_basis_points = 0;
+        prefill.max_work_units = 16_384_u64.saturating_mul(self.max_batch_size as u64);
+        prefill.max_workspace_bytes = 512_u64
+            .saturating_mul(1024 * 1024)
+            .saturating_mul(self.max_batch_size as u64);
+
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "tts.decode.ming_tts.tensor_continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.shape_policy = StageShapePolicy::Ragged;
+        decode.max_work_units = 64_u64.saturating_mul(self.decode_batch_size as u64);
+        decode.max_workspace_bytes = 512_u64
+            .saturating_mul(1024 * 1024)
+            .saturating_mul(self.decode_batch_size as u64);
+        // Hands over the audio (a stream's end-of-stream marker).
+        let mut finalize = StageDescriptor::from_execution_profile(
+            StageId::new(3),
+            "tts.finalize.ming_tts.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        finalize.selector = StageWorkSelector::SequenceFinalize;
+        finalize.progress = StageProgressKind::Atomic;
+        finalize.shape_policy = StageShapePolicy::Exact;
+        finalize.max_batch_size = 1;
+        finalize.concurrency = ConcurrencyClass::Exclusive;
+        finalize.max_work_units = 1;
+        finalize.max_workspace_bytes = 0;
+        // One VAE window per request and quantum, so other requests' quanta
+        // run between them: each request's decode keeps its own attention
+        // state, so windows do not share calls.
+        let mut acoustic = StageDescriptor::from_execution_profile(
+            StageId::new(4),
+            "tts.audio.ming_tts.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        acoustic.selector = StageWorkSelector::SequenceAudioDecode;
+        acoustic.progress = StageProgressKind::Iterative;
+        acoustic.shape_policy = StageShapePolicy::Exact;
+        acoustic.max_padding_basis_points = 0;
+        acoustic.max_batch_size = 1;
+        acoustic.concurrency = ConcurrencyClass::Exclusive;
+        acoustic.max_work_units = 1;
+        // The VAE stack's activations over a window of up to 8 latents (32
+        // frames at width 896) and its 3,530-wide head: a few megabytes;
+        // the last window of a short request may carry more latents.
+        acoustic.max_workspace_bytes = 256 * 1024 * 1024;
         for stage in [
             &mut preparation,
             &mut prefill,

@@ -468,6 +468,31 @@ pub enum Commands {
         #[arg(long)]
         min_p: Option<f32>,
 
+        /// Emotion to speak with: neutral, happy, sad, angry, fearful,
+        /// disgusted or surprised (Ming 3.0 TTS: any on a cloned voice, the
+        /// recorded ones on a built-in voice). One of --emotion, --dialect,
+        /// the three levels below and --instructions per request
+        #[arg(long)]
+        emotion: Option<String>,
+
+        /// Chinese dialect to speak in: cantonese or sichuanese (Ming 3.0
+        /// TTS, with a reference voice or no --speaker)
+        #[arg(long)]
+        dialect: Option<String>,
+
+        /// Speaking rate: low, medium or high (Ming 3.0 TTS, with a
+        /// reference voice or no --speaker)
+        #[arg(long, value_name = "LEVEL")]
+        speaking_rate: Option<String>,
+
+        /// Pitch: low, medium or high (Ming 3.0 TTS)
+        #[arg(long, value_name = "LEVEL")]
+        pitch: Option<String>,
+
+        /// Volume: low, medium or high (Ming 3.0 TTS)
+        #[arg(long, value_name = "LEVEL")]
+        volume: Option<String>,
+
         /// Stream the audio as it is generated and write it to a WAV file
         /// (reports the time to first audio)
         #[arg(long)]

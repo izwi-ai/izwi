@@ -210,6 +210,11 @@ pub struct AdminSpeechModelCapabilities {
     /// list is a suggestion and other tags pass through.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub inline_tags_strict: bool,
+    /// The emotions a request may name with `emotion` (Ming 3.0 TTS): a
+    /// cloned voice takes any of them, a built-in voice the ones it was
+    /// recorded in.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub emotions: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -472,6 +477,7 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             cross_lingual_reference: false,
             inline_tags: Vec::new(),
             inline_tags_strict: false,
+            emotions: Vec::new(),
         }
     }
 }
@@ -494,6 +500,9 @@ impl AdminSpeechModelCapabilities {
     fn with_inline_tags(mut self, variant: ModelVariant) -> Self {
         self.inline_tags = variant.speech_inline_tags().to_vec();
         self.inline_tags_strict = variant.refuses_unknown_inline_tags();
+        if variant.family() == izwi_core::ModelFamily::MingTts {
+            self.emotions = izwi_core::catalog::MING_TTS_EMOTIONS.to_vec();
+        }
         self
     }
 
@@ -512,6 +521,19 @@ impl AdminSpeechModelCapabilities {
             self.default_language = Some(
                 izwi_core::runtime_models::architectures::lfm3_audio::Lfm3AudioVoice::DEFAULT_LOCALE_TAG,
             );
+            return self;
+        }
+        if variant.family() == izwi_core::ModelFamily::MingTts {
+            // Chinese and English are read from the text; the other five
+            // have to be named.
+            self.languages = izwi_core::catalog::MING_TTS_LANGUAGES
+                .iter()
+                .map(|language| AdminSpeechLanguage {
+                    code: language.code,
+                    name: language.name,
+                })
+                .collect();
+            self.language_auto_detect = true;
             return self;
         }
         if variant.family() == izwi_core::ModelFamily::Maya2Tts {

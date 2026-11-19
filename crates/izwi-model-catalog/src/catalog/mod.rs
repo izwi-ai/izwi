@@ -2,6 +2,7 @@
 
 mod cuda_support;
 mod maya2;
+mod ming_tts;
 mod metadata;
 mod prefix_reuse;
 mod variant;
@@ -14,6 +15,12 @@ pub use cuda_support::{
 pub use maya2::{
     maya2_language, maya2_voice, Maya2Language, Maya2Voice, MAYA2_DEFAULT_VOICE,
     MAYA2_LANGUAGES, MAYA2_OPENAI_VOICE_ALIASES, MAYA2_SUGGESTED_TAGS, MAYA2_VOICES,
+};
+pub use ming_tts::{
+    ming_tts_language, ming_tts_model_voice_name, ming_tts_voice, MingTtsLanguage, MingTtsVoice,
+    MING_TTS_DEFAULT_CHINESE_VOICE, MING_TTS_DEFAULT_VOICE, MING_TTS_DIALECTS, MING_TTS_EMOTIONS,
+    MING_TTS_INLINE_TAGS, MING_TTS_LANGUAGES, MING_TTS_LEVELS, MING_TTS_OPENAI_VOICE_ALIASES,
+    MING_TTS_VOICES,
 };
 pub use metadata::{
     ChatModelCapabilities, ChatReasoningEffort, ModelInfo, ModelStatus, ModelVariant,

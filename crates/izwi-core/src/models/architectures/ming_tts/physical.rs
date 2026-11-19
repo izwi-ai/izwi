@@ -20,7 +20,7 @@ use crate::kv::v2::{
     CURRENT_INFERENCE_STATE_ABI,
 };
 
-pub(crate) const MING_DOMAIN: StateDomainId = StateDomainId::new(1);
+pub(crate) const MING_TTS_DOMAIN: StateDomainId = StateDomainId::new(1);
 
 #[derive(Debug, Clone)]
 pub(crate) struct MingPhysicalStateSpec {
@@ -69,7 +69,7 @@ pub(crate) fn ming_retained_contract(
         .collect::<Result<Vec<_>>>()?;
     let mut spec = PagedAttentionDomainSpec {
         header: StateDomainHeader {
-            id: MING_DOMAIN,
+            id: MING_TTS_DOMAIN,
             scope: StateScope::Retained,
             clock: StateClock::DecoderTokens,
             placement: PlacementPolicy::BackendLocalWithHostOffload,
@@ -92,8 +92,8 @@ pub(crate) fn ming_retained_contract(
         abi: CURRENT_INFERENCE_STATE_ABI,
         domains: vec![StateDomainSpec::PagedAttention(spec)],
         groups: vec![StateGroupSpec {
-            id: StateGroupId::new(MING_DOMAIN.get()),
-            domains: vec![MING_DOMAIN],
+            id: StateGroupId::new(MING_TTS_DOMAIN.get()),
+            domains: vec![MING_TTS_DOMAIN],
             prefix_shareable: false,
         }],
     };
@@ -111,7 +111,7 @@ pub(crate) fn ming_physical_state_spec(
             "Ming retained state requires stages and a non-zero context".into(),
         ));
     }
-    let max_domain_id = MING_DOMAIN.get();
+    let max_domain_id = MING_TTS_DOMAIN.get();
     let mut profiles = Vec::with_capacity(stage_graphs.len());
     for stages in stage_graphs {
         let mut ordered = stages.iter().collect::<Vec<_>>();

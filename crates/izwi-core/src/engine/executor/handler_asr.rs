@@ -284,6 +284,7 @@ fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
         | ModelFamily::Audio8Tts
         | ModelFamily::FishDrama3Tts
         | ModelFamily::ChatterboxTts
+        | ModelFamily::MingTts
         | ModelFamily::Maya1Tts
         | ModelFamily::Maya2Tts
         | ModelFamily::SortformerDiarization

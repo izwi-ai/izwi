@@ -241,6 +241,9 @@ fn certified_topology(
         // Maya1 retains its decoder pages; the SNAC window stage leases
         // scratch only.
         (Maya1Tts, Tts) => RetainedPagedAndInvocationScratch,
+        // Ming retains its decoder pages; the SNAC window stage leases
+        // scratch only.
+        (MingTts, Tts) => RetainedPagedAndInvocationScratch,
         // Maya 2 Native retains its backbone pages; the depth decoder and the
         // Mimi window stage lease scratch only.
         (Maya2Tts, Tts) => RetainedPagedAndInvocationScratch,

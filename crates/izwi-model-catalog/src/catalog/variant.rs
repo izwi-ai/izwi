@@ -22,6 +22,10 @@ pub enum ModelFamily {
     ChatterboxTts,
     /// Maya1: a Llama decoder sampling SNAC codes from a voice description.
     Maya1Tts,
+    /// Ming-3.0-tts: a Qwen2.5 language model whose hidden states drive a
+    /// flow-matching head over continuous audio latents, decoded by a
+    /// transformer VAE at 44.1 kHz.
+    MingTts,
     /// Maya 2 Native: a Qwen3 backbone and depth decoder over Mimi codes,
     /// 12 languages, built-in and cloned voices.
     Maya2Tts,
@@ -94,6 +98,7 @@ impl ModelFamily {
             | Self::FishDrama3Tts
             | Self::Audio8Tts
             | Self::ChatterboxTts
+            | Self::MingTts
             | Self::Maya1Tts
             | Self::Maya2Tts
             | Self::SortformerDiarization
@@ -442,6 +447,7 @@ impl ModelVariant {
             Audio8TtsRealisticAir => ModelFamily::Audio8Tts,
             Chatterbox500M | ChatterboxMultilingual500M => ModelFamily::ChatterboxTts,
             Maya13B | Maya13BGguf => ModelFamily::Maya1Tts,
+            Ming30Tts05B => ModelFamily::MingTts,
             Maya2Native25B => ModelFamily::Maya2Tts,
             Qwen3TtsTokenizer12Hz => ModelFamily::Tokenizer,
             ParakeetTdt06BV3 => ModelFamily::ParakeetAsr,
@@ -484,6 +490,7 @@ impl ModelVariant {
             | ModelFamily::FishDrama3Tts
             | ModelFamily::Audio8Tts
             | ModelFamily::ChatterboxTts
+            | ModelFamily::MingTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts => ModelTask::Tts,
             ModelFamily::ParakeetAsr
@@ -730,6 +737,12 @@ pub fn resolve_diarization_model_variant_strict(
 
 fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
     use ModelVariant::*;
+
+    // Before the generic `tts` rules below. Ming-3.0-tts-tiny is another
+    // (MoE) model and resolves to nothing.
+    if normalized.contains("ming30tts") || normalized.contains("ming3tts") {
+        return (!normalized.contains("tiny")).then_some(Ming30Tts05B);
+    }
 
     if normalized.contains("voxtral") {
         if normalized.contains("tts")

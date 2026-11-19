@@ -631,6 +631,29 @@ impl EngineCoreRequest {
                 )));
             }
         }
+        if matches!(&ready.model, PreparedIncrementalModel::MingTts(_)) {
+            let prepared = ready.ming_tts.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Ming request {} is missing its prepared prompt",
+                    self.id
+                ))
+            })?;
+            let params = ready.ming_tts_params.as_ref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Ming request {} is missing its sealed generation parameters",
+                    self.id
+                ))
+            })?;
+            if ready.model_variant.family() != ModelFamily::MingTts
+                || self.prepared_sequence_input_tokens != Some(prepared.prompt.len())
+                || self.params.max_tokens != params.max_new_tokens
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Ming request {} changed after preparation",
+                    self.id
+                )));
+            }
+        }
         if matches!(&ready.model, PreparedIncrementalModel::Maya2Tts(_)) {
             let prepared = ready.maya2_tts.as_ref().ok_or_else(|| {
                 Error::InvalidInput(format!(
@@ -796,6 +819,13 @@ impl EngineCoreRequest {
             {
                 Ok(())
             }
+            (PreparedIncrementalModel::MingTts(_), TaskType::TTS)
+                if ready.model_variant.family() == ModelFamily::MingTts
+                    && ready.ming_tts.is_some()
+                    && ready.ming_tts_params.is_some() =>
+            {
+                Ok(())
+            }
             (PreparedIncrementalModel::Maya2Tts(_), TaskType::TTS)
                 if ready.model_variant.family() == ModelFamily::Maya2Tts
                     && ready.maya2_tts.is_some()
@@ -888,6 +918,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
+                | PreparedIncrementalModel::MingTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)

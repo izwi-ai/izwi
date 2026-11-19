@@ -91,6 +91,15 @@ use crate::models::architectures::maya1::{
     maya1_auto_max_new_tokens, maya1_voice_preset, Maya1GenerationParams, Maya1SamplingParams,
     MAYA1_DEFAULT_VOICE, MAYA1_VOICE_PRESETS,
 };
+use crate::catalog::{
+    ming_tts_language, ming_tts_model_voice_name, MING_TTS_DEFAULT_CHINESE_VOICE,
+    MING_TTS_DEFAULT_VOICE, MING_TTS_DIALECTS, MING_TTS_EMOTIONS, MING_TTS_LANGUAGES,
+    MING_TTS_LEVELS,
+};
+use crate::models::architectures::ming_tts::{
+    MingControl, MingDialect, MingEmotion, MingGenerationParams, MingLevel, MingRequest,
+    MingVoice, DEFAULT_GUIDANCE as MING_TTS_DEFAULT_GUIDANCE, MIN_LATENTS as MING_TTS_MIN_LATENTS,
+};
 use crate::models::architectures::maya2::{
     resolve_language, Maya2GenerationParams, Maya2SamplingParams, Maya2Voice,
 };

@@ -345,6 +345,11 @@ pub(crate) fn speaker_for(speech_model: ModelVariant, voice: &str) -> Option<Str
         } else {
             pick(&["neutral_male", "casual_male"])
         }),
+        ModelFamily::MingTts => Some(if female {
+            pick(&["US_Emma", "UK_Charlotte"])
+        } else {
+            "UK_George".to_string()
+        }),
         ModelFamily::Lfm3Audio => Some(if female { "Female" } else { "Male" }.to_string()),
         ModelFamily::Lfm25Audio => Some(if female { "US Female" } else { "US Male" }.to_string()),
         // One bundled voice (Chatterbox), or none to map onto.

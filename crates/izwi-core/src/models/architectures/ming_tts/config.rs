@@ -41,6 +41,8 @@ pub const ISTFT_BINS: usize = ISTFT_SIZE / 2 + 1;
 /// Positions one request's sequence may reach: the reference decodes on a
 /// 512-position cache (`MAX_CACHE_LEN`).
 pub const CONTEXT_POSITIONS: usize = 512;
+/// The context the engine leases for one request's retained state.
+pub const STATE_CONTEXT_TOKENS: usize = CONTEXT_POSITIONS;
 /// The most latents one request generates (about 40 s); the context bounds
 /// it further by the prompt's length.
 pub const MAX_NEW_LATENTS: usize = 500;

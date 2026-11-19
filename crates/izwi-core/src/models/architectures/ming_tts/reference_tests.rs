@@ -72,7 +72,7 @@ fn write_wav(name: &str, samples: &[f32]) {
 fn params(seed: u64) -> MingGenerationParams {
     MingGenerationParams {
         guidance: DEFAULT_GUIDANCE,
-        max_new_latents: 300,
+        max_new_tokens: 300,
         seed,
     }
 }
