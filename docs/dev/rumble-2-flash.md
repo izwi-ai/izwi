@@ -145,14 +145,15 @@ lifecycle-owned paged KV lease of 1,536 tokens (the prompt's markers and
 context, at most 256 tokens; one window of audio tokens, 390; and the decode
 budget), chunked inside the dispatch. An atomic invocation holds the device
 for its whole decode. A chunked transcript reports the language most of its
-chunks named (the earliest on a tie).
+chunks named (the earliest on a tie), and a streamed one names the detected
+language in its final event.
 
 The retained route is on by default on CUDA and off on CPU and Metal;
 `IZWI_RUMBLE_RETAINED_DECODE` overrides the default on any backend
 (`rumble_retained_decode_enabled(backend)`). With it off every request runs
 atomically and the load fits no retained decoder state. The measurements
 below are why: at a width of a few rows the route costs a single request
-latency and costs the CPU throughput.
+latency and gains the CPU nothing under load.
 
 The decode width is the engine's rows on CPU and Metal and the default CUDA
 width; Rumble is not certified for the wider CUDA tier.
@@ -165,12 +166,12 @@ route switched on against the same build with it off:
 | Metal, 9 concurrent requests (3.6 s, 12.4 s and 27.3 s clips) | 6.1 to 6.9 s | 7.5 s |
 | Metal, one 3.6 s clip | 0.35 s | 0.25 s |
 | Metal, one 27.3 s clip | 1.77 s | 1.63 s |
-| CPU, 8 concurrent requests | 25.9 s | 21.5 s |
+| CPU, 8 concurrent requests | 25.9 s | 21.5 to 25.2 s over four runs |
 
 A retained row pays for its extra dispatches (the encoder job, the prefill
 and one scheduler quantum per token), about 0.1 s a request here. At width 2
-that buys little on Metal and costs throughput on the CPU, where a
-two-row step takes as long as two steps. The route is built for wider
+that buys little on Metal and nothing on the CPU, where a two-row step takes
+as long as two steps. The route is built for wider
 devices, which is why CUDA alone takes it by default; it has not been
 measured on one.
 
@@ -220,6 +221,15 @@ census (`tests/fixtures/asr_residency/rumble_2_flash.json`):
   requests, the realtime WebSocket, a diarization job with Rumble as the
   transcription stage, and the CLI. Real-time factor about 0.06 on Metal and
   0.2 on the CPU.
+- With the final defaults (retained route off on CPU and Metal), the same
+  13 requests on both backends, and again on Metal with the route forced
+  on: identical transcripts and languages each way, including a 29.7 s clip
+  in one pass and the streamed final event's language. Speech synthesised
+  by the macOS system voices in German, French, Spanish and Italian was
+  transcribed word for word with the language detected, and a 52 s German
+  clip and a 150 s English one reported their language from three and seven
+  chunks. A durable job on the German clip and the realtime WebSocket were
+  rerun on Metal.
 - With the retained route, the same 13 requests returned the same
   transcripts, languages and diagnostics on both backends as the atomic
   route had. Under 8, 9 and 16 concurrent requests every transcript equalled

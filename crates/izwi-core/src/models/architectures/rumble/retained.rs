@@ -38,8 +38,8 @@ pub(crate) const RUMBLE_RETAINED_DECODE_ENV: &str = "IZWI_RUMBLE_RETAINED_DECODE
 /// The route pays about 0.1 s a request for its extra dispatches and earns
 /// it back by decoding concurrent rows in one step, so it is on by default
 /// where rows batch wide (CUDA) and off on CPU and Metal, whose automatic
-/// width is a few rows: there a single request is slower on it, and on CPU
-/// so is a concurrent load. The switch overrides the default on every
+/// width is a few rows: there a single request is slower on it, and a
+/// concurrent load on the CPU gains nothing. The switch overrides the default on every
 /// backend. It is read once per process: the loaded adapter and the model
 /// it seals both ask with the load's backend, so their routes agree.
 pub(crate) fn rumble_retained_decode_enabled(backend: BackendKind) -> bool {
