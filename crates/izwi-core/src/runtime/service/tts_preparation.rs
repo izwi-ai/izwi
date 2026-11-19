@@ -59,6 +59,33 @@ pub(super) fn fish_s2_request_params(params: &GenerationParams, request_id: &str
         ..defaults
     }
 }
+/// Audio8 sampling for a request: unset fields keep the checkpoint's
+/// defaults, the frame budget of a request that names none is its text's
+/// automatic one, and the seed defaults to one derived from the request id.
+/// With no reference voice the seed is what picks the speaker.
+pub(super) fn audio8_request_params(params: &GenerationParams, request_id: &str) -> Audio8GenerationParams {
+    let defaults = Audio8GenerationParams::default();
+    Audio8GenerationParams {
+        max_frames: if params.max_tokens == 0 {
+            defaults.max_frames
+        } else {
+            params
+                .max_tokens
+                .clamp(1, ModelVariant::AUDIO8_MAX_OUTPUT_FRAMES)
+        },
+        temperature: params.speech.temperature.unwrap_or(defaults.temperature),
+        top_p: params.speech.top_p.unwrap_or(defaults.top_p),
+        top_k: params
+            .audio_top_k
+            .or(params.speech.top_k)
+            .unwrap_or(defaults.top_k),
+        seed: params
+            .speech
+            .seed
+            .unwrap_or_else(|| EngineCoreRequest::chat_request_seed(request_id)),
+        ..defaults
+    }
+}
 
 /// Fish Audio Drama 3 generation settings for a request (§3.6, §7.5): the
 /// request's `max_tokens` (at most 4,096 frames) or the automatic budget of
@@ -959,6 +986,224 @@ impl RuntimeService {
         let retained = artifact.retained;
         let (mut prepared, prepared_artifact) = artifact.value;
         prepared.install_fish_s2_tts_execution_model(
+            variant,
+            model,
+            prepared_artifact,
+            params,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        match self
+            .coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+        {
+            Ok(job) => Ok((prepared, job)),
+            Err(failure) => Err(release_failed_preparation(failure, prepared)),
+        }
+    }
+    pub(super) async fn prepare_audio8_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::Audio8Tts)
+            || request
+                .prepared_audio8_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request
+            .model_variant
+            .expect("validated Audio8 TTS variant");
+        let model = self
+            .model_registry
+            .get_audio8_tts_lease(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("Audio8 TTS model {variant} is not loaded"))
+            })?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Audio8 TTS preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Audio8 TTS model {variant} has no effective context"
+                ))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Audio8 TTS request is missing text".into()))?
+            .trim()
+            .to_string();
+        // A reference clip comes with its transcript. With no clip the model
+        // speaks in a voice of its own, which the request's seed selects.
+        let reference = match request.tts_reference_audio_for_execution() {
+            Some(reference_audio) => {
+                let reference_text = request
+                    .tts_reference_text_for_execution()
+                    .filter(|text| !text.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Audio8 requires reference_text with reference_audio".into(),
+                        )
+                    })?;
+                let (audio_samples, sample_rate) = decode_reference_audio_base64(reference_audio)?;
+                Some(Audio8Reference {
+                    audio_samples,
+                    sample_rate,
+                    text: reference_text.to_string(),
+                })
+            }
+            None => None,
+        };
+        let params = audio8_request_params(&request.params, &request.id);
+        params.validate()?;
+        let memory = model.preparation_memory(&text, reference.as_ref(), context_limit)?;
+        // The text clone and decoded reference were constructed under the initial
+        // input/audio-decode lease. Keep their ownership covered across the bridge;
+        // subsequent codec/tokenizer allocations begin only after admission.
+        let preparation_host_bytes = memory
+            .host_bytes()?
+            .checked_add(u64::try_from(text.capacity()).map_err(|_| {
+                Error::Overloaded("Audio8 preparation text capacity exceeds u64".into())
+            })?)
+            .ok_or_else(|| Error::Overloaded("Audio8 preparation host bytes overflow".into()))?;
+        let codec_workspace = memory.accelerator_workspace_bytes;
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("Audio8 TTS retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let preparation_spec = JobSpec {
+            request_id: request.id.clone(),
+            lane: CoordinatorLane::Atomic,
+            priority: request.priority,
+            workload_class: request.workload_class,
+            deadline: request.deadline,
+            resources: audio8_preparation_resources(
+                self.backend_router.context().backend_kind,
+                retained_request_bytes,
+                preparation_host_bytes,
+            )?,
+        };
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_job = match self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                preparation_spec,
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+        {
+            Ok(job) => job,
+            Err(failure) => {
+                return Err(release_failed_preparation(
+                    failure,
+                    (request, text, reference),
+                ));
+            }
+        };
+        let request_id = request.id.clone();
+        let codec_deadline = request.deadline;
+        let owned_inputs =
+            PreparationOwnedInputs::new((request, text, reference), preparation_job.clone());
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.audio8".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            u64::try_from(context_limit)
+                .map_err(|_| Error::Overloaded("Audio8 context exceeds u64".into()))?,
+            u64::try_from(context_limit).unwrap_or(u64::MAX),
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                codec_workspace,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            u64::try_from(context_limit).unwrap_or(u64::MAX),
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let cancellation_for_codec = cancellation.clone();
+        let codec_request_id = request_id.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Audio8 TTS preparation must remain scalar".into(),
+                    ));
+                }
+                owned_inputs.run(|(request, text, reference)| {
+                    let artifact = model_for_preparation.prepare_retained_artifact_with_cancel(
+                        &text,
+                        reference,
+                        context_limit,
+                        &|| {
+                            if cancellation_for_codec.is_cancelled() {
+                                return Err(Error::Cancelled(codec_request_id.clone()));
+                            }
+                            if codec_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                                return Err(Error::Timeout(codec_request_id.clone()));
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    let retained_host_bytes = retained_request_bytes
+                        .checked_add(artifact.retained_bytes()?)
+                        .ok_or_else(|| {
+                            Error::Overloaded("Audio8 retained bytes overflow".into())
+                        })?;
+                    Ok(vec![Ok(PreparationArtifact {
+                        retained: JobResourceObservation::host(retained_host_bytes),
+                        value: (request, artifact),
+                    })])
+                })
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes.pop().ok_or_else(|| {
+            Error::InferenceError("Audio8 TTS preparation returned no outcome".into())
+        })? {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request_id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request_id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        let (mut prepared, prepared_artifact) = artifact.value;
+        prepared.install_audio8_tts_execution_model(
             variant,
             model,
             prepared_artifact,
@@ -2440,6 +2685,9 @@ impl RuntimeService {
             .await?;
         let (request, job) = self
             .prepare_fish_s2_tts_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_audio8_tts_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
             .prepare_fish_drama3_tts_for_binding(request, job, residency_lease)

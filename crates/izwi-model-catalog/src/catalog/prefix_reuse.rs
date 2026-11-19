@@ -237,6 +237,7 @@ impl ModelFamily {
             | Self::VoxtralTts
             | Self::VibeVoiceTts
             | Self::FishS2Tts
+            | Self::Audio8Tts
             | Self::ChatterboxTts
             | Self::Maya1Tts
             | Self::Maya2Tts

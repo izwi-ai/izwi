@@ -916,6 +916,7 @@ impl WorkerProcessConfig {
                     | izwi_core::catalog::ModelFamily::VoxtralTts
                     | izwi_core::catalog::ModelFamily::VibeVoiceTts
                     | izwi_core::catalog::ModelFamily::FishS2Tts
+                    | izwi_core::catalog::ModelFamily::Audio8Tts
                     | izwi_core::catalog::ModelFamily::FishDrama3Tts
                     | izwi_core::catalog::ModelFamily::ChatterboxTts
                     | izwi_core::catalog::ModelFamily::Maya1Tts

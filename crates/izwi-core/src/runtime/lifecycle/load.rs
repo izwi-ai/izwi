@@ -28,6 +28,7 @@ use crate::kv::v2::{
 use crate::kv::InferenceStateContractProvider;
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2PhysicalStateSpec;
+use crate::models::architectures::audio8::Audio8PhysicalStateSpec;
 use crate::models::architectures::qwen3::asr::Qwen3AsrContextBound;
 use crate::models::registry::NativeAsrModel;
 use crate::models::shared::weights::gguf::TensorStorageInventory;
@@ -65,7 +66,8 @@ use admission::{
 #[cfg(test)]
 use checkpoint::{
     backend_model_memory_estimate, checkpoint_census, estimate_from_tensor_inventory,
-    fish_s2_resource_plan, qwen38_representation_memory_estimate, CheckpointCensus,
+    audio8_resource_plan, fish_s2_resource_plan, qwen38_representation_memory_estimate,
+    CheckpointCensus,
 };
 use checkpoint::{
     census_checkpoint_file, checkpoint_resource_plan, checkpoint_tensor_inventory,
@@ -667,6 +669,7 @@ fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool 
                 | crate::catalog::ModelFamily::Lfm3Chat
                 | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::FishS2Tts
+                | crate::catalog::ModelFamily::Audio8Tts
                 | crate::catalog::ModelFamily::FishDrama3Tts
         ))
         && asr_memory::weights_on_backend_device(variant, backend)
@@ -1374,6 +1377,14 @@ impl ModelLifecycleController {
                 &mut state_publications,
             )
             .await?;
+            self.allocate_audio8_tts_state(
+                variant,
+                model_instance_id,
+                backend,
+                &bundle_draft,
+                &mut state_publications,
+            )
+            .await?;
             self.allocate_fish_drama3_tts_state(
                 variant,
                 model_instance_id,
@@ -1489,6 +1500,11 @@ impl ModelLifecycleController {
             if variant.family() == crate::catalog::ModelFamily::FishS2Tts {
                 self.model_registry
                     .publish_fish_s2_tts_ready(variant)
+                    .await?;
+            }
+            if variant.family() == crate::catalog::ModelFamily::Audio8Tts {
+                self.model_registry
+                    .publish_audio8_tts_ready(variant)
                     .await?;
             }
             if variant.family() == crate::catalog::ModelFamily::FishDrama3Tts {

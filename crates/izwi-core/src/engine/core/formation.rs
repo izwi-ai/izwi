@@ -367,7 +367,7 @@ impl EngineCore {
                         "Fish S2 codec requires its exact bound execution stage".into(),
                     )
                 })?;
-            // Each Fish family's sealed frame budget and codec workspace.
+            // Each family's sealed frame budget and codec workspace.
             let (max_frames, streaming_decode_workspace_bytes): (usize, fn(usize) -> Result<u64>) =
                 if request.model_variant.is_some_and(|variant| {
                     variant.family() == crate::catalog::ModelFamily::FishDrama3Tts
@@ -385,6 +385,26 @@ impl EngineCore {
                     (
                         params.max_frames,
                         crate::models::architectures::fish_drama3::codec::streaming_decode_workspace_bytes,
+                    )
+                } else if request.model_variant.is_some_and(|variant| {
+                    variant.family() == crate::catalog::ModelFamily::Audio8Tts
+                }) {
+                    let params = request
+                        .audio8_tts_generation_params_for_executor()?
+                        .ok_or_else(|| {
+                            Error::InvalidInput(
+                                "Audio8 finalization requires sealed generation parameters".into(),
+                            )
+                        })?;
+                    params.validate()?;
+                    if params.max_frames > ModelVariant::AUDIO8_MAX_OUTPUT_FRAMES {
+                        return Err(Error::InvalidInput(
+                            "Audio8 output exceeds the model's frame limit".into(),
+                        ));
+                    }
+                    (
+                        params.max_frames,
+                        crate::models::architectures::audio8::codec::streaming_decode_workspace_bytes,
                     )
                 } else {
                     let params = request

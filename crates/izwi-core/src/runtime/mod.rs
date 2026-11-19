@@ -7,6 +7,7 @@
 mod adapters;
 mod asr;
 mod asr_no_speech;
+pub(crate) mod audio8_capacity;
 pub(crate) mod audio_io;
 mod broker;
 mod capabilities;

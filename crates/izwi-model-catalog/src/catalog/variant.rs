@@ -15,6 +15,10 @@ pub enum ModelFamily {
     /// codebook-MTP tower and the Fish S2 DAC codec; reference-bracket
     /// prompts with speaker tags. Its own family, not a Fish S2 checkpoint.
     FishDrama3Tts,
+    /// Audio8 TTS: a DualAR model (a slow transformer for one semantic token
+    /// per frame, a fast one for the frame's codebooks) with a 44.1 kHz
+    /// codec. Speaks in a reference voice or, with none, in a voice it picks.
+    Audio8Tts,
     ChatterboxTts,
     /// Maya1: a Llama decoder sampling SNAC codes from a voice description.
     Maya1Tts,
@@ -83,6 +87,7 @@ impl ModelFamily {
             | Self::VibeVoiceTts
             | Self::FishS2Tts
             | Self::FishDrama3Tts
+            | Self::Audio8Tts
             | Self::ChatterboxTts
             | Self::Maya1Tts
             | Self::Maya2Tts
@@ -424,6 +429,7 @@ impl ModelVariant {
             VibeVoice15BTts => ModelFamily::VibeVoiceTts,
             FishAudioS2Pro => ModelFamily::FishS2Tts,
             FishAudioDrama3 => ModelFamily::FishDrama3Tts,
+            Audio8TtsRealisticAir => ModelFamily::Audio8Tts,
             Chatterbox500M | ChatterboxMultilingual500M => ModelFamily::ChatterboxTts,
             Maya13B | Maya13BGguf => ModelFamily::Maya1Tts,
             Maya2Native25B => ModelFamily::Maya2Tts,
@@ -465,6 +471,7 @@ impl ModelVariant {
             | ModelFamily::VibeVoiceTts
             | ModelFamily::FishS2Tts
             | ModelFamily::FishDrama3Tts
+            | ModelFamily::Audio8Tts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts => ModelTask::Tts,
@@ -738,6 +745,15 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
             return Some(ChatterboxMultilingual500M);
         }
         return Some(Chatterbox500M);
+    }
+
+    // Audio8 Realistic Air. The earlier Preview checkpoints are other
+    // artifacts the catalog does not carry.
+    if normalized.contains("audio8") {
+        if normalized.contains("preview") {
+            return None;
+        }
+        return Some(Audio8TtsRealisticAir);
     }
 
     // Drama 3 before the rule below, which takes any "fishaudio" id for S2
@@ -1408,6 +1424,22 @@ mod tests {
             assert_eq!(parsed, ModelVariant::FishAudioDrama3, "{alias}");
             assert_eq!(parsed.family(), ModelFamily::FishDrama3Tts);
         }
+    }
+
+    #[test]
+    fn parse_tts_accepts_audio8_aliases() {
+        for alias in [
+            "Audio8-TTS-Realistic-Air",
+            "Edge0/Audio8-TTS-Realistic-Air",
+            "audio8-tts-realistic-air",
+            "Audio8 TTS Realistic Air",
+            "audio8",
+        ] {
+            let parsed = parse_tts_model_variant(alias).expect("Audio8 should parse for tts");
+            assert_eq!(parsed, ModelVariant::Audio8TtsRealisticAir, "{alias}");
+            assert_eq!(parsed.family(), ModelFamily::Audio8Tts);
+        }
+        assert!(parse_model_variant("Edge0/Audio8-TTS-Preview-0.6b").is_err());
     }
 
     /// The Fish heuristic sends any "fishaudio" id to S2 Pro; a Drama 3 id

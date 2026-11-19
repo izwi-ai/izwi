@@ -27,6 +27,7 @@ use crate::model::ModelVariant;
 use crate::models::architectures::chatterbox::ChatterboxTtsModel;
 use crate::models::architectures::fish_drama3::FishDrama3Model;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
+use crate::models::architectures::audio8::Audio8TtsModel;
 use crate::models::architectures::gemma3::chat::{
     ChatDecodeCheckpoint as Gemma3ChatDecodeCheckpoint, ChatDecodeState as Gemma3ChatDecodeState,
     Gemma3ChatModel,
@@ -187,6 +188,7 @@ type Maya1TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Maya1Tt
 type Maya2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Maya2TtsModel>;
 type VibeVoiceTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VibeVoiceTtsModel>;
 type FishS2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishS2TtsModel>;
+type Audio8TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Audio8TtsModel>;
 type FishDrama3TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishDrama3Model>;
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
 type KokoroLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<KokoroTtsModel>;
@@ -260,6 +262,11 @@ struct FishS2TtsLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: FishS2TtsLoaderFn,
+}
+struct Audio8TtsLoaderRegistration {
+    name: &'static str,
+    family: ModelFamily,
+    loader: Audio8TtsLoaderFn,
 }
 
 struct FishDrama3TtsLoaderRegistration {
@@ -596,6 +603,13 @@ fn load_fish_s2_tts_model(
 ) -> Result<FishS2TtsModel> {
     FishS2TtsModel::load(model_dir, variant, device)
 }
+fn load_audio8_tts_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<Audio8TtsModel> {
+    Audio8TtsModel::load(model_dir, variant, device)
+}
 
 /// What a Fish Audio Drama 3 load checks before it reads a weight: the
 /// backend's forms run on the device (a CUDA load needs compute capability
@@ -854,6 +868,12 @@ const FISH_S2_TTS_LOADER_REGISTRY: &[FishS2TtsLoaderRegistration] =
         family: ModelFamily::FishS2Tts,
         loader: load_fish_s2_tts_model,
     }];
+const AUDIO8_TTS_LOADER_REGISTRY: &[Audio8TtsLoaderRegistration] =
+    &[Audio8TtsLoaderRegistration {
+        name: "audio8_tts",
+        family: ModelFamily::Audio8Tts,
+        loader: load_audio8_tts_model,
+    }];
 
 /// A synthetic Fish Audio Drama 3 checkpoint
 /// (`fish_drama3::test_support::write_lifecycle_synthetic_model`), loaded as
@@ -1018,6 +1038,14 @@ fn resolve_fish_s2_tts_loader_registration(
 ) -> Option<&'static FishS2TtsLoaderRegistration> {
     let family = variant.family();
     FISH_S2_TTS_LOADER_REGISTRY
+        .iter()
+        .find(|registration| registration.family == family)
+}
+fn resolve_audio8_tts_loader_registration(
+    variant: ModelVariant,
+) -> Option<&'static Audio8TtsLoaderRegistration> {
+    let family = variant.family();
+    AUDIO8_TTS_LOADER_REGISTRY
         .iter()
         .find(|registration| registration.family == family)
 }
@@ -5868,6 +5896,12 @@ pub struct VibeVoiceTtsModelLease {
 pub struct FishS2TtsModelLease {
     inner: TrackedModelLease<FishS2TtsModel>,
 }
+/// A loaded Audio8 TTS handle that fences unload for the exact model
+/// instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct Audio8TtsModelLease {
+    inner: TrackedModelLease<Audio8TtsModel>,
+}
 
 /// A loaded Fish Audio Drama 3 handle that fences unload for the exact
 /// model instance retained by an admitted incremental request.
@@ -5990,9 +6024,32 @@ impl FishS2TtsModelLease {
         self.inner.model.clone()
     }
 }
+impl Audio8TtsModelLease {
+    #[cfg(test)]
+    pub(crate) fn for_test(model: Audio8TtsModel) -> Self {
+        let uses = Arc::new(ModelUseState::default());
+        Self {
+            inner: TrackedModelLease {
+                model: Arc::new(model),
+                _guard: uses.acquire().expect("fresh Audio8 test model lease"),
+            },
+        }
+    }
+
+    pub(crate) fn model_arc(&self) -> Arc<Audio8TtsModel> {
+        self.inner.model.clone()
+    }
+}
 
 impl Deref for FishS2TtsModelLease {
     type Target = FishS2TtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl Deref for Audio8TtsModelLease {
+    type Target = Audio8TtsModel;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -7799,6 +7856,7 @@ pub struct ModelRegistry {
     vibevoice_tts_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VibeVoiceTtsModel>>>>>,
     fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<FishS2TtsModel>>>>>,
+    audio8_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Audio8TtsModel>>>>>,
     fish_drama3_tts_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<FishDrama3Model>>>>>,
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
@@ -7908,7 +7966,7 @@ fn normalize_observed_runtime_value(value: &str) -> Option<String> {
 /// each one counts a path that replaced a slower one, so a live server
 /// shows whether it ran.
 fn tts_fast_path_counters(family: ModelFamily) -> Option<Value> {
-    use crate::models::architectures::{fish_s2, kokoro, qwen3, voxtral};
+    use crate::models::architectures::{audio8, fish_s2, kokoro, qwen3, voxtral};
     match family {
         ModelFamily::Qwen3Tts => Some(serde_json::json!({
             "codec_stream_frames_total": qwen3::tts::qwen3_tts_codec_stream_frames(),
@@ -7923,6 +7981,9 @@ fn tts_fast_path_counters(family: ModelFamily) -> Option<Value> {
         })),
         ModelFamily::FishS2Tts => Some(serde_json::json!({
             "resident_fast_frames_total": fish_s2::fast::fish_s2_resident_fast_frames(),
+        })),
+        ModelFamily::Audio8Tts => Some(serde_json::json!({
+            "resident_fast_frames_total": audio8::fast::audio8_resident_fast_frames(),
         })),
         ModelFamily::FishDrama3Tts => {
             use crate::models::architectures::fish_drama3::device::{self, sampling as resident};
@@ -8002,6 +8063,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::Maya2Tts => "maya2_tts",
         ModelFamily::VibeVoiceTts => "vibevoice_tts",
         ModelFamily::FishS2Tts => "fish_s2_tts",
+        ModelFamily::Audio8Tts => "audio8_tts",
         ModelFamily::FishDrama3Tts => "fish_drama3_tts",
         ModelFamily::ParakeetAsr => "parakeet_asr",
         ModelFamily::WhisperAsr => "whisper_asr",
@@ -8137,6 +8199,7 @@ impl ModelRegistry {
             maya2_tts_models: Arc::new(RwLock::new(HashMap::new())),
             vibevoice_tts_models: Arc::new(RwLock::new(HashMap::new())),
             fish_s2_tts_models: Arc::new(RwLock::new(HashMap::new())),
+            audio8_tts_models: Arc::new(RwLock::new(HashMap::new())),
             fish_drama3_tts_models: Arc::new(RwLock::new(HashMap::new())),
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
@@ -8546,6 +8609,27 @@ impl ModelRegistry {
                     *variant,
                     "fish_s2_tts",
                     "fish_s2_tts",
+                    LoadedModelActualRuntime::default(),
+                    None,
+                    None,
+                    with_tts_fast_path_counters(
+                        *variant,
+                        serde_json::to_value(model.diagnostics()).ok(),
+                    ),
+                ));
+            }
+        }
+        {
+            let guard = self.audio8_tts_models.read().await;
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.model.get() else {
+                    continue;
+                };
+                diagnostics.push(loaded_model_diagnostics_entry(
+                    &self.device,
+                    *variant,
+                    "audio8_tts",
+                    "audio8_tts",
                     LoadedModelActualRuntime::default(),
                     None,
                     None,
@@ -9386,6 +9470,62 @@ impl ModelRegistry {
             ))
         })
     }
+    pub async fn load_audio8_tts(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+    ) -> Result<Arc<Audio8TtsModel>> {
+        let registration = resolve_audio8_tts_loader_registration(variant).ok_or_else(|| {
+            Error::InvalidInput(format!("Unsupported Audio8 TTS model variant: {variant}"))
+        })?;
+
+        let (entry, loading_guard) = {
+            let mut guard = self.audio8_tts_models.write().await;
+            let entry = guard
+                .entry(variant)
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Audio8 TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
+        };
+
+        info!(
+            "Loading Audio8 TTS model metadata {variant} ({}) from {model_dir:?}",
+            registration.name
+        );
+
+        entry
+            .model
+            .get_or_try_init({
+                let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
+                let loader = registration.loader;
+                move || async move {
+                    DeviceThread::for_device(&device.device)?.submit(move || loader(&model_dir, variant, device))
+                        .await
+                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                        .map(Arc::new)
+                }
+            })
+            .await?;
+        let model = {
+            let guard = self.audio8_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Audio8 TTS model {variant} load was superseded before publication"
+            ))
+        })
+    }
 
     pub async fn load_fish_drama3_tts(
         &self,
@@ -9958,9 +10098,17 @@ impl ModelRegistry {
         let guard = self.fish_s2_tts_models.read().await;
         guard.get(&variant).and_then(|entry| entry.ready_model())
     }
+    pub async fn get_audio8_tts(&self, variant: ModelVariant) -> Option<Arc<Audio8TtsModel>> {
+        let guard = self.audio8_tts_models.read().await;
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
 
     pub fn try_get_fish_s2_tts(&self, variant: ModelVariant) -> Option<Arc<FishS2TtsModel>> {
         let guard = self.fish_s2_tts_models.try_read().ok()?;
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+    pub fn try_get_audio8_tts(&self, variant: ModelVariant) -> Option<Arc<Audio8TtsModel>> {
+        let guard = self.audio8_tts_models.try_read().ok()?;
         guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
@@ -9974,6 +10122,16 @@ impl ModelRegistry {
             .and_then(|entry| entry.acquire_ready())
             .map(|inner| FishS2TtsModelLease { inner })
     }
+    pub async fn get_audio8_tts_lease(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Audio8TtsModelLease> {
+        let guard = self.audio8_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| Audio8TtsModelLease { inner })
+    }
 
     pub fn try_get_fish_s2_tts_lease(&self, variant: ModelVariant) -> Option<FishS2TtsModelLease> {
         let guard = self.fish_s2_tts_models.try_read().ok()?;
@@ -9981,6 +10139,13 @@ impl ModelRegistry {
             .get(&variant)
             .and_then(|entry| entry.acquire_ready())
             .map(|inner| FishS2TtsModelLease { inner })
+    }
+    pub fn try_get_audio8_tts_lease(&self, variant: ModelVariant) -> Option<Audio8TtsModelLease> {
+        let guard = self.audio8_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| Audio8TtsModelLease { inner })
     }
 
     pub(crate) async fn get_loading_fish_s2_tts(
@@ -9992,12 +10157,30 @@ impl ModelRegistry {
             .get(&variant)
             .and_then(|entry| entry.model.get().cloned())
     }
+    pub(crate) async fn get_loading_audio8_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<Audio8TtsModel>> {
+        let guard = self.audio8_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
 
     pub(crate) async fn publish_fish_s2_tts_ready(&self, variant: ModelVariant) -> Result<()> {
         let guard = self.fish_s2_tts_models.read().await;
         let entry = guard.get(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(
                 "cannot publish missing Fish S2 TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
+    }
+    pub(crate) async fn publish_audio8_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.audio8_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Audio8 TTS model {variant} as ready"
             ))
         })?;
         entry.publish_ready()
@@ -10297,6 +10480,20 @@ impl ModelRegistry {
             self.drop_on_device(entry).await;
         }
     }
+    pub async fn unload_audio8_tts(&self, variant: ModelVariant) {
+        let entry = {
+            let mut guard = self.audio8_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
+        }
+    }
 
     pub async fn unload_fish_drama3_tts(&self, variant: ModelVariant) {
         let entry = {
@@ -10407,6 +10604,10 @@ mod tests {
         );
         assert_eq!(
             counters(ModelVariant::FishAudioS2Pro, Some(serde_json::json!({}))),
+            ["resident_fast_frames_total"]
+        );
+        assert_eq!(
+            counters(ModelVariant::Audio8TtsRealisticAir, Some(serde_json::json!({}))),
             ["resident_fast_frames_total"]
         );
         assert_eq!(
@@ -10698,6 +10899,14 @@ mod tests {
 
         assert_eq!(registration.name, "fish_s2_tts");
         assert_eq!(registration.family, ModelFamily::FishS2Tts);
+    }
+    #[test]
+    fn resolves_audio8_tts_loader_registration() {
+        let registration = resolve_audio8_tts_loader_registration(ModelVariant::Audio8TtsRealisticAir)
+            .expect("Audio8 TTS loader should be registered");
+
+        assert_eq!(registration.name, "audio8_tts");
+        assert_eq!(registration.family, ModelFamily::Audio8Tts);
     }
 
     #[test]

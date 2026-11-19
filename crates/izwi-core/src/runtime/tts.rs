@@ -128,6 +128,20 @@ fn direct_tts_generation_shape(
             2_048,
             true,
         ),
+        // The text's automatic budget, or the explicit one up to the cap.
+        ModelFamily::Audio8Tts => (
+            if explicit == 0 {
+                crate::models::architectures::audio8::auto_frame_budget(&request.text)
+            } else {
+                explicit.min(tts_explicit_output_limit(
+                    backend,
+                    variant,
+                    max_sequence_length,
+                ))
+            },
+            2_048,
+            true,
+        ),
         // The family's budget: the automatic one of the text, or the
         // explicit one up to the codec stream's 4,096 frames.
         ModelFamily::FishDrama3Tts => (
@@ -1179,9 +1193,10 @@ mod tests {
         use crate::runtime::adapters::RuntimeAdapterRegistry;
         // Families whose engine executors stream committed audio and publish
         // the final marker.
-        const ENGINE_STREAM_EMITTERS: [ModelFamily; 9] = [
+        const ENGINE_STREAM_EMITTERS: [ModelFamily; 10] = [
             ModelFamily::Qwen3Tts,
             ModelFamily::FishS2Tts,
+            ModelFamily::Audio8Tts,
             ModelFamily::FishDrama3Tts,
             ModelFamily::VoxtralTts,
             ModelFamily::Lfm25Audio,

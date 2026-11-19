@@ -1,0 +1,404 @@
+//! Immutable Audio8 load-time limits, sealed into its adapters through the
+//! serving-capacity interface the DualAR families share
+//! ([`ResolvedFishServingCapacity`]). Live resource admission remains
+//! authoritative.
+use crate::config::EngineConfig;
+use crate::error::{Error, Result};
+use crate::models::architectures::audio8::config::Audio8Config;
+use crate::runtime::fish_capacity::ResolvedFishServingCapacity;
+
+/// Tokens one Audio8 request holds in the slow stack's retained state: a
+/// full reference (the 30 s reference limit at 21.5 frames per second), a
+/// rendered text segment, and the explicit output-frame cap. That is more
+/// than the model's 2,048 positions, so rows are priced at the context.
+fn audio8_request_tokens() -> usize {
+    let reference_frames = (crate::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS
+        as f32
+        * crate::model::ModelVariant::AUDIO8_FRAME_RATE_HZ)
+        .ceil() as usize;
+    const TEXT_SEGMENT_TOKENS: usize = 1_024;
+    reference_frames + TEXT_SEGMENT_TOKENS + crate::model::ModelVariant::AUDIO8_MAX_OUTPUT_FRAMES
+}
+
+/// Resolves the serving capacity of a loaded Audio8 model.
+pub(crate) struct Audio8ServingCapacity;
+
+impl Audio8ServingCapacity {
+    pub(crate) fn scalar() -> Result<ResolvedFishServingCapacity> {
+        Ok(ResolvedFishServingCapacity {
+            ar_rows: 1,
+            prefill_tokens: 1,
+            prefill_workspace_per_token: 512 * 1024 * 1024,
+            codec_rows: 1,
+            active_rows: 1,
+            staged_rows: 1,
+            ar_workspace_per_row: 512 * 1024 * 1024,
+            codec_workspace_per_row:
+                crate::models::architectures::audio8::codec::streaming_decode_workspace_bytes(
+                    crate::models::architectures::audio8::AUDIO8_AUDIO_CHUNK_FRAMES,
+                )?,
+            planning_headroom_bytes: None,
+            native_batching: false,
+        })
+    }
+
+    /// `kv_element_bytes`: one retained KV element at the loaded precision
+    /// (2 for F16/BF16, 4 for F32, including a load-time F32 fallback).
+    pub(crate) fn resolve(
+        model: &Audio8Config,
+        config: &EngineConfig,
+        headroom: Option<u64>,
+        native_batching: bool,
+        kv_element_bytes: usize,
+    ) -> Result<ResolvedFishServingCapacity> {
+        let mut profile = Self::scalar()?;
+        profile.planning_headroom_bytes = headroom;
+        let checked_product = |values: &[usize]| -> Result<u64> {
+            values.iter().try_fold(1u64, |value, next| {
+                value.checked_mul(*next as u64).ok_or_else(|| {
+                    Error::ModelLoadError("Audio8 serving capacity geometry overflow".into())
+                })
+            })
+        };
+        let effective_context = config
+            .max_sequence_length
+            .explicit_tokens()
+            .unwrap_or(model.max_seq_len)
+            .min(model.max_seq_len);
+        let slow = &model.text_config;
+        let fast = &model.audio_decoder_config;
+        // F32 is a conservative bound for F32/F16/BF16 KV. Price the requested
+        // context (native when automatic); do not reduce requested output/context to advertise more rows.
+        let slow_head = slow
+            .head_dim
+            .unwrap_or(slow.hidden_size / slow.num_attention_heads.max(1));
+        let fast_head = fast
+            .head_dim
+            .unwrap_or(fast.hidden_size / fast.num_attention_heads.max(1));
+        // Price packed dense buffers, the logits row and the paged-prefill
+        // attention working set. The slow stack prefills through the paged
+        // kernels (`paged_prefill` on every backend), which keep online-softmax
+        // state per query and head, never a query-by-context score matrix, so
+        // a token costs its query, output and partial vectors whatever the
+        // context (FSH-6: pricing full-context scores per token resolved the
+        // prefill chunk to 29 tokens). Bound aggregate prefill tokens, not just
+        // rows.
+        let hidden_buffers = slow
+            .hidden_size
+            .checked_mul(16)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    slow.intermediate_size
+                        .unwrap_or(slow.hidden_size.saturating_mul(4))
+                        .checked_mul(6)?,
+                )
+            })
+            .ok_or_else(|| Error::ModelLoadError("Audio8 prefill geometry overflow".into()))?;
+        let attention = checked_product(&[4, slow.num_attention_heads, slow_head + 2, 4])?;
+        let dense = checked_product(&[4, hidden_buffers])?;
+        profile.prefill_workspace_per_token = attention
+            .checked_add(dense)
+            .and_then(|bytes| bytes.checked_add((slow.vocab_size as u64).checked_mul(8)?))
+            .ok_or_else(|| Error::ModelLoadError("Audio8 prefill workspace overflow".into()))?
+            .max(1);
+        profile.ar_workspace_per_row = profile
+            .ar_workspace_per_row
+            .max(profile.prefill_workspace_per_token);
+        // Metal splits long contexts across partitions only for tiny query
+        // batches (at most 64 query-head workgroups); their partials are a
+        // fixed charge per prefill pass.
+        let split_partials =
+            checked_product(&[64, effective_context.div_ceil(512), slow_head + 2, 4])?;
+        let chunk_budget = profile.ar_workspace_per_row.saturating_sub(split_partials);
+        profile.prefill_tokens = (chunk_budget / profile.prefill_workspace_per_token)
+            .clamp(1, 512)
+            .min(effective_context as u64);
+        // Scalar tensor execution can still interleave multiple independently
+        // retained requests. Unknown memory leaves final fitting to the existing
+        // state authority, without promoting native tensor width.
+        if headroom.is_none() {
+            profile.active_rows = config.max_retained_sequences.max(1);
+            profile.staged_rows = config
+                .max_staged_transactions
+                .max(1)
+                .min(profile.active_rows);
+            return Ok(profile);
+        }
+        // Native codec packing retains one additional history copy beyond the
+        // ordinary request-owned rollback pair.
+        profile.codec_workspace_per_row = profile
+            .codec_workspace_per_row
+            .checked_add(
+                crate::models::architectures::audio8::dac::Audio8DacConfig::current()
+                    .streaming_history_bound_bytes()?,
+            )
+            .ok_or_else(|| {
+                Error::ModelLoadError("Audio8 codec packing workspace overflow".into())
+            })?;
+        // One request's retained slow KV at the loaded precision (FSH-2).
+        let slow_bytes = checked_product(&[
+            2,
+            kv_element_bytes.max(1),
+            slow.num_hidden_layers,
+            slow.num_key_value_heads,
+            slow_head,
+            effective_context.min(audio8_request_tokens()),
+        ])?;
+        let fast_bytes = checked_product(&[
+            2,
+            kv_element_bytes.max(1),
+            fast.num_hidden_layers,
+            fast.num_key_value_heads,
+            fast_head,
+            model.num_codebooks,
+        ])?;
+        // The slow state is retained once and shared by both public
+        // capabilities; each has its own invocation bank, so price its
+        // prefill+decode scratch and fast state twice, plus codec candidates.
+        let row_bytes = slow_bytes
+            .checked_add(fast_bytes.checked_mul(2).ok_or_else(|| {
+                Error::ModelLoadError("Audio8 serving row budget overflow".into())
+            })?)
+            .and_then(|bytes| bytes.checked_add(profile.ar_workspace_per_row.checked_mul(4)?))
+            .and_then(|bytes| bytes.checked_add(profile.codec_workspace_per_row.checked_mul(4)?))
+            .ok_or_else(|| Error::ModelLoadError("Audio8 serving row budget overflow".into()))?;
+        // Reference preparation for the longest reference a request may
+        // carry (the 30 s reference limit, at the highest accepted rate), not
+        // the codec's 4,096-frame ceiling (FSH-2: 2 x 39 GB).
+        let reference_rate =
+            crate::models::architectures::audio8::Audio8DacConfig::MAX_REFERENCE_SAMPLE_RATE;
+        let reference_samples =
+            usize::try_from(crate::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS)
+                .ok()
+                .and_then(|secs| secs.checked_mul(reference_rate as usize))
+                .ok_or_else(|| {
+                    Error::ModelLoadError("Audio8 preparation budget overflow".into())
+                })?;
+        let fixed_preparation =
+            crate::models::architectures::audio8::codec::preparation_workspace_bytes(
+                reference_samples,
+                reference_rate,
+            )?
+            .min(
+                crate::models::architectures::audio8::codec::maximum_preparation_workspace_bytes()?,
+            )
+            .checked_mul(2)
+            .ok_or_else(|| Error::ModelLoadError("Audio8 preparation budget overflow".into()))?;
+        let available = headroom.unwrap_or(0);
+        // Keep 20% untouched for allocator/transient uncertainty. The resource
+        // authority still performs exact retained/invocation allocation and admission.
+        let fitting = usize::try_from(
+            available
+                .saturating_sub(available / 5)
+                .saturating_sub(fixed_preparation)
+                / row_bytes.max(1),
+        )
+        .unwrap_or(usize::MAX)
+        .max(1);
+        let ceiling = |value: usize| {
+            if value == 0 {
+                fitting
+            } else {
+                value.min(fitting)
+            }
+        };
+        profile.active_rows = ceiling(config.max_retained_sequences);
+        profile.staged_rows = ceiling(config.max_staged_transactions).min(profile.active_rows);
+        if native_batching {
+            profile.ar_rows = ceiling(config.max_scheduler_batch_size)
+                .min(profile.staged_rows)
+                .min(config.max_batch_size.fixed_rows().unwrap_or(fitting));
+        }
+        profile.codec_rows = profile.ar_rows;
+        profile.native_batching = profile.ar_rows > 1;
+        Ok(profile)
+    }
+}
+
+/// Whether Audio8 decodes concurrent requests as rows of one batch when
+/// `IZWI_AUDIO8_NATIVE_BATCHING` is unset. On by default on CUDA, where one
+/// row at a time queues every request behind the others and the batched
+/// path keeps each request's output identical to its solo output. Portable
+/// backends stay scalar.
+pub(crate) fn audio8_native_batching_default(backend: crate::backends::BackendKind) -> bool {
+    backend == crate::backends::BackendKind::Cuda
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::architectures::audio8::Audio8TtsModel;
+
+    #[test]
+    fn native_batching_defaults_on_for_cuda_only() {
+        use crate::backends::BackendKind;
+        assert!(audio8_native_batching_default(BackendKind::Cuda));
+        assert!(!audio8_native_batching_default(BackendKind::Metal));
+        assert!(!audio8_native_batching_default(BackendKind::Cpu));
+    }
+
+    #[test]
+    fn unknown_or_unqualified_capacity_stays_scalar() {
+        let model = Audio8TtsModel::for_test();
+        let config = EngineConfig::default();
+        for (memory, enabled) in [(None, true), (Some(u64::MAX / 2), false)] {
+            let profile =
+                Audio8ServingCapacity::resolve(model.config(), &config, memory, enabled, 4)
+                    .unwrap();
+            assert_eq!(profile.ar_rows, 1);
+            assert!(!profile.native_batching);
+        }
+    }
+
+    #[test]
+    fn explicit_context_prices_the_same_limit_as_loaded_state() {
+        let model = Audio8TtsModel::for_test();
+        let mut config = EngineConfig::default();
+        let native =
+            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
+                .unwrap();
+        config.max_sequence_length = crate::config::ContextLengthPreference::explicit(32).unwrap();
+        let shorter =
+            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
+                .unwrap();
+        // Paged prefill works per query, so a token costs the same at any
+        // context; the shorter context still frees KV for more rows.
+        assert_eq!(
+            shorter.prefill_workspace_per_token,
+            native.prefill_workspace_per_token
+        );
+        assert!(shorter.ar_rows >= native.ar_rows);
+        assert!(shorter.prefill_tokens <= 32);
+    }
+
+    #[test]
+    fn scalar_execution_preserves_multiple_retained_requests() {
+        let model = Audio8TtsModel::for_test();
+        let config = EngineConfig {
+            max_retained_sequences: 12,
+            max_staged_transactions: 4,
+            ..Default::default()
+        };
+        for memory in [None, Some(256 << 30)] {
+            let profile =
+                Audio8ServingCapacity::resolve(model.config(), &config, memory, false, 4).unwrap();
+            assert_eq!(profile.ar_rows, 1);
+            assert!(profile.active_rows > 1);
+            assert!(profile.active_rows <= 12);
+            assert!(profile.staged_rows <= 4);
+        }
+    }
+
+    #[test]
+    fn prefill_quantum_is_bounded_by_geometry_even_in_scalar_mode() {
+        let model = Audio8TtsModel::for_test();
+        let capacity = Audio8ServingCapacity::resolve(
+            model.config(),
+            &EngineConfig::default(),
+            None,
+            false,
+            4,
+        )
+        .unwrap();
+        assert!(capacity.prefill_tokens > 0);
+        assert!(capacity.prefill_tokens <= 512);
+        assert!(
+            capacity.prefill_tokens * capacity.prefill_workspace_per_token
+                <= capacity.ar_workspace_per_row
+        );
+        assert!(capacity.prefill_tokens < model.config().max_seq_len as u64);
+    }
+
+    /// FSH-6: pricing a full-context score matrix per prompt token resolved
+    /// the slow-stack prefill chunk to 29 tokens, so a prompt took about 25
+    /// full passes. Priced as the paged kernels run, a typical prompt
+    /// prefills in a pass or two, and the chunk still fits the row's
+    /// workspace.
+    #[test]
+    fn prefill_chunk_follows_the_paged_kernel_working_set() {
+        let model = Audio8TtsModel::for_test();
+        let capacity = Audio8ServingCapacity::resolve(
+            model.config(),
+            &EngineConfig::default(),
+            Some(64 << 30),
+            false,
+            4,
+        )
+        .unwrap();
+        assert!(
+            capacity.prefill_tokens >= 256,
+            "{}",
+            capacity.prefill_tokens
+        );
+        assert!(
+            capacity.prefill_tokens * capacity.prefill_workspace_per_token
+                <= capacity.ar_workspace_per_row
+        );
+    }
+
+    /// FSH-2: rows were priced at F32 over the native 32,768-token context,
+    /// twice (19.3 GB of slow KV a row), beside 78 GB of preparation for a
+    /// 4,096-frame reference, so even an H100 sealed one Fish row. Priced at
+    /// the loaded BF16 over one request's tokens (counted once) and the
+    /// 30 s reference limit, an H100's headroom seals several rows. The
+    /// per-row codec and AR workspaces (four of each) now dominate a row.
+    #[test]
+    fn rows_are_priced_from_one_request_at_the_loaded_precision() {
+        let model = Audio8TtsModel::for_test();
+        let config = EngineConfig {
+            max_scheduler_batch_size: 0,
+            max_retained_sequences: 0,
+            max_staged_transactions: 0,
+            ..Default::default()
+        };
+        let rows = |headroom_gib: u64, kv_bytes: usize| {
+            Audio8ServingCapacity::resolve(
+                model.config(),
+                &config,
+                Some(headroom_gib << 30),
+                true,
+                kv_bytes,
+            )
+            .unwrap()
+            .active_rows
+        };
+        // H100 headroom after about 10 GB of BF16 weights.
+        let h100 = rows(68, 2);
+        assert!(h100 >= 4, "H100: {h100} rows");
+        // An F32 fallback prices twice the KV, never more rows.
+        assert!(rows(68, 4) <= h100);
+        // A full reference, a text segment and the output cap are more than
+        // the model attends over: rows are priced at the context.
+        assert!(audio8_request_tokens() >= crate::model::ModelVariant::AUDIO8_CONTEXT_POSITIONS);
+    }
+
+    #[test]
+    fn capacity_scales_with_memory_and_preserves_operator_ceilings() {
+        let model = Audio8TtsModel::for_test();
+        let mut config = EngineConfig {
+            max_scheduler_batch_size: 0,
+            max_retained_sequences: 0,
+            max_staged_transactions: 0,
+            ..Default::default()
+        };
+        let small = Audio8ServingCapacity::resolve(model.config(), &config, Some(8 << 30), true, 4)
+            .unwrap();
+        let large =
+            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
+                .unwrap();
+        assert!(large.ar_rows > small.ar_rows);
+        assert!(large.ar_rows > 5);
+        config.max_batch_size = crate::config::BatchSizePreference::fixed(3).unwrap();
+        let capped =
+            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
+                .unwrap();
+        assert_eq!(capped.ar_rows, 3);
+        config.max_staged_transactions = 2;
+        assert_eq!(
+            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
+                .unwrap()
+                .ar_rows,
+            2
+        );
+    }
+}

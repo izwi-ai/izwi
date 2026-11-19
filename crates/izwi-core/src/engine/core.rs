@@ -1351,5 +1351,8 @@ mod decode_timing_tests {
 }
 
 #[cfg(test)]
+#[path = "audio8_finalization_tests.rs"]
+mod audio8_finalization_tests;
+#[cfg(test)]
 #[path = "fish_s2_finalization_tests.rs"]
 mod fish_s2_finalization_tests;

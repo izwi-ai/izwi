@@ -346,6 +346,18 @@ pub enum ModelVariant {
         alias = "drama3"
     )]
     FishAudioDrama3,
+    /// Edge0's Audio8 TTS Realistic Air: a 0.6B-parameter DualAR model with a
+    /// 44.1 kHz codec, 23 languages, zero-shot cloning from a reference clip
+    /// and its transcript, or speech in a voice of its own with no reference
+    #[serde(
+        rename = "Audio8-TTS-Realistic-Air",
+        alias = "Edge0/Audio8-TTS-Realistic-Air",
+        alias = "audio8-tts-realistic-air",
+        alias = "Audio8 TTS Realistic Air",
+        alias = "audio8-realistic-air",
+        alias = "audio8"
+    )]
+    Audio8TtsRealisticAir,
     /// Resemble AI's Chatterbox (English, 0.5B Llama T3 + S3Gen)
     #[serde(
         rename = "Chatterbox-500M",
@@ -444,6 +456,19 @@ impl ModelVariant {
     pub const FISH_DRAMA3_MAX_OUTPUT_FRAMES: usize = 4096;
     /// One frame is 2,048 samples of the 44.1 kHz Fish DAC codec.
     pub const FISH_DRAMA3_FRAME_RATE_HZ: f32 = 44_100.0 / 2_048.0;
+    /// Edge0/Audio8-TTS-Realistic-Air as of 2026-11-16. The family loads the
+    /// root checkpoint (`model.safetensors` and `codec.pth`); the repository's
+    /// `llama-cpp/` export is not downloaded.
+    pub const AUDIO8_ARTIFACT_REVISION: &'static str = "6bf7a980759d8022a66922ee975dab99229a2dd9";
+    /// Frames one Audio8 request may ask for (`max_tokens`), about 47 s of
+    /// audio. The prompt, the reference frames and the output share the
+    /// model's 2,048 positions, so a request must also fit beside its prompt.
+    pub const AUDIO8_MAX_OUTPUT_FRAMES: usize = 1024;
+    /// Positions the slow transformer attends over: prompt text, reference
+    /// frames and generated frames together.
+    pub const AUDIO8_CONTEXT_POSITIONS: usize = 2048;
+    /// One frame is 2,048 samples of the model's 44.1 kHz codec.
+    pub const AUDIO8_FRAME_RATE_HZ: f32 = 44_100.0 / 2_048.0;
     /// Chatterbox's English checkpoint as published 2026-06-10; its five
     /// English files are unchanged since 2025-05-30.
     pub const CHATTERBOX_ARTIFACT_REVISION: &'static str =
@@ -561,6 +586,7 @@ impl ModelVariant {
             Self::Qwen36Moe35BA3BFp8 => Some(Self::QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION),
             Self::FishAudioS2Pro => Some(Self::FISH_S2_PRO_ARTIFACT_REVISION),
             Self::FishAudioDrama3 => Some(Self::FISH_DRAMA3_ARTIFACT_REVISION),
+            Self::Audio8TtsRealisticAir => Some(Self::AUDIO8_ARTIFACT_REVISION),
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => {
                 Some(Self::CHATTERBOX_ARTIFACT_REVISION)
             }
@@ -653,6 +679,7 @@ impl ModelVariant {
             Self::VibeVoice15BTts => "microsoft/VibeVoice-1.5B",
             Self::FishAudioS2Pro => "fishaudio/s2-pro",
             Self::FishAudioDrama3 => "fishaudio/drama-3",
+            Self::Audio8TtsRealisticAir => "Edge0/Audio8-TTS-Realistic-Air",
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => "ResembleAI/chatterbox",
             Self::Maya13B => "maya-research/maya1",
             Self::Maya13BGguf => "mradermacher/maya1-GGUF",
@@ -716,6 +743,7 @@ impl ModelVariant {
             Self::VibeVoice15BTts => "VibeVoice 1.5B TTS",
             Self::FishAudioS2Pro => "Fish Audio S2 Pro",
             Self::FishAudioDrama3 => "Fish Audio Drama 3",
+            Self::Audio8TtsRealisticAir => "Audio8 TTS Realistic Air",
             Self::Chatterbox500M => "Chatterbox",
             Self::ChatterboxMultilingual500M => "Chatterbox Multilingual",
             Self::Maya13B => "Maya1",
@@ -780,6 +808,7 @@ impl ModelVariant {
             Self::VibeVoice15BTts => "VibeVoice-1.5B",
             Self::FishAudioS2Pro => "FishAudio-S2-Pro",
             Self::FishAudioDrama3 => "FishAudio-Drama-3",
+            Self::Audio8TtsRealisticAir => "Audio8-TTS-Realistic-Air",
             Self::Chatterbox500M => "Chatterbox-500M",
             Self::ChatterboxMultilingual500M => "Chatterbox-Multilingual-500M",
             Self::Maya13B => "Maya1-3B",
@@ -855,6 +884,10 @@ impl ModelVariant {
             // configs, tokenizer, chat template, README and LICENSE at the
             // pin: the 24 files of `fish_drama3::artifacts`.
             Self::FishAudioDrama3 => 41_502_569_692,
+            // model.safetensors (1.20 GB, BF16), codec.pth (1.35 GB), the
+            // tokenizer and the card; the llama-cpp/ export is not part of
+            // the download.
+            Self::Audio8TtsRealisticAir => 2_565_411_929,
             Self::Chatterbox500M => 3_229_396_676, // five pinned HF files (3,191,966,992 B) + PerTh checkpoint (37,429,684 B)
             // Its T3 and tokenizer (2,144,059,741 B), the English S3Gen,
             // voice encoder and default voice (1,062,287,778 B), PerTh, and
@@ -965,6 +998,8 @@ impl ModelVariant {
             // weights on Metal and CUDA (37.2 GiB as CPU Q8_0), the F32 codec
             // included, before rows (0.1-0.6 GiB each).
             Self::FishAudioDrama3 => 40.0,
+            // The CPU figure; `memory_required_gb_by_backend` has each one.
+            Self::Audio8TtsRealisticAir => 5.5,
             // 3.2 GB of F32 weights, two guided KV branches (~0.6 GB per
             // 1,000-token request at F32) and the flow's attention workspace.
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => 6.0,
@@ -1025,6 +1060,7 @@ impl ModelVariant {
             Self::VoxtralMini4BRealtime2602 => [18.5, 10.0, 9.0],
             Self::Lfm25Audio15BGguf => [2.5, 2.5, 1.5],
             Self::VibeVoice15BTts => [11.5, 6.5, 5.5],
+            Self::Audio8TtsRealisticAir => [5.5, 4.0, 4.0],
             _ => return None,
         })
     }
@@ -1205,6 +1241,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::VibeVoiceTts
                 | crate::catalog::ModelFamily::FishS2Tts
                 | crate::catalog::ModelFamily::FishDrama3Tts
+                | crate::catalog::ModelFamily::Audio8Tts
                 | crate::catalog::ModelFamily::ChatterboxTts
                 | crate::catalog::ModelFamily::Maya1Tts
                 | crate::catalog::ModelFamily::Maya2Tts
@@ -1234,7 +1271,8 @@ impl ModelVariant {
             | Self::Qwen36Moe35BA3BFp8
             | Self::Maya13B
             | Self::Maya13BGguf
-            | Self::Maya2Native25B => Some("Apache-2.0"),
+            | Self::Maya2Native25B
+            | Self::Audio8TtsRealisticAir => Some("Apache-2.0"),
             Self::Lfm2512BInstructGguf
             | Self::Lfm2512BThinkingGguf
             | Self::Lfm25Audio15BGguf
@@ -1284,7 +1322,9 @@ impl ModelVariant {
     pub fn uses_fish_dac_codec(&self) -> bool {
         matches!(
             self.family(),
-            crate::catalog::ModelFamily::FishS2Tts | crate::catalog::ModelFamily::FishDrama3Tts
+            crate::catalog::ModelFamily::FishS2Tts
+                | crate::catalog::ModelFamily::FishDrama3Tts
+                | crate::catalog::ModelFamily::Audio8Tts
         )
     }
 
@@ -1298,7 +1338,9 @@ impl ModelVariant {
     pub fn plans_own_speech_segments(&self) -> bool {
         matches!(
             self.family(),
-            crate::catalog::ModelFamily::FishS2Tts | crate::catalog::ModelFamily::FishDrama3Tts
+            crate::catalog::ModelFamily::FishS2Tts
+                | crate::catalog::ModelFamily::FishDrama3Tts
+                | crate::catalog::ModelFamily::Audio8Tts
         )
     }
 
@@ -1319,7 +1361,9 @@ impl ModelVariant {
     pub fn streams_audio_only(&self) -> bool {
         matches!(
             self.family(),
-            crate::catalog::ModelFamily::FishS2Tts | crate::catalog::ModelFamily::FishDrama3Tts
+            crate::catalog::ModelFamily::FishS2Tts
+                | crate::catalog::ModelFamily::FishDrama3Tts
+                | crate::catalog::ModelFamily::Audio8Tts
         )
     }
 
@@ -1329,7 +1373,9 @@ impl ModelVariant {
     pub fn has_fish_artifact_fingerprint(&self) -> bool {
         matches!(
             self.family(),
-            crate::catalog::ModelFamily::FishS2Tts | crate::catalog::ModelFamily::FishDrama3Tts
+            crate::catalog::ModelFamily::FishS2Tts
+                | crate::catalog::ModelFamily::FishDrama3Tts
+                | crate::catalog::ModelFamily::Audio8Tts
         )
     }
 
@@ -1500,6 +1546,23 @@ impl ModelVariant {
                 max_speakers: 16,
                 max_references: 8,
             },
+            // Clones from one reference clip with its transcript, or speaks
+            // in a voice its seed sets when given none; streams; long text
+            // runs as a segment plan.
+            Self::Audio8TtsRealisticAir => SpeechModelCapabilities {
+                supports_builtin_voices: false,
+                built_in_voice_count: None,
+                supports_reference_voice: true,
+                reference_transcript_required: true,
+                supports_voice_description: false,
+                supports_streaming: true,
+                supports_speed_control: false,
+                supports_auto_long_form: true,
+                supports_seeded_voice: true,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
+            },
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => SpeechModelCapabilities {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::CHATTERBOX_BUILT_IN_VOICE_COUNT),
@@ -1608,6 +1671,7 @@ impl ModelVariant {
             }
             crate::catalog::ModelFamily::FishS2Tts => Some(Self::FISH_S2_PRO_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::FishDrama3Tts => Some(Self::FISH_DRAMA3_MAX_OUTPUT_FRAMES),
+            crate::catalog::ModelFamily::Audio8Tts => Some(Self::AUDIO8_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::ChatterboxTts => Some(Self::CHATTERBOX_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::Maya1Tts => Some(Self::MAYA1_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::Maya2Tts => Some(Self::MAYA2_MAX_OUTPUT_FRAMES),
@@ -1624,6 +1688,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::VibeVoiceTts => Some(Self::VIBEVOICE_TTS_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::FishS2Tts => Some(Self::FISH_S2_PRO_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::FishDrama3Tts => Some(Self::FISH_DRAMA3_FRAME_RATE_HZ),
+            crate::catalog::ModelFamily::Audio8Tts => Some(Self::AUDIO8_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::ChatterboxTts => Some(Self::CHATTERBOX_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::Maya1Tts => Some(Self::MAYA1_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::Maya2Tts => Some(Self::MAYA2_FRAME_RATE_HZ),
@@ -1636,9 +1701,9 @@ impl ModelVariant {
     /// that announce it before the first chunk (realtime sessions).
     pub fn tts_output_sample_rate_hint(&self) -> Option<u32> {
         match self.family() {
-            crate::catalog::ModelFamily::FishS2Tts | crate::catalog::ModelFamily::FishDrama3Tts => {
-                Some(44_100)
-            }
+            crate::catalog::ModelFamily::FishS2Tts
+            | crate::catalog::ModelFamily::FishDrama3Tts
+            | crate::catalog::ModelFamily::Audio8Tts => Some(44_100),
             crate::catalog::ModelFamily::Qwen3Tts
             | crate::catalog::ModelFamily::KokoroTts
             | crate::catalog::ModelFamily::VoxtralTts
@@ -1932,6 +1997,7 @@ impl ModelVariant {
             Self::VibeVoice15BTts,
             Self::FishAudioS2Pro,
             Self::FishAudioDrama3,
+            Self::Audio8TtsRealisticAir,
             Self::Chatterbox500M,
             Self::ChatterboxMultilingual500M,
             Self::Maya13B,
@@ -2609,6 +2675,47 @@ mod tests {
     }
 
     #[test]
+    fn audio8_is_an_enabled_tts_of_its_own_family() {
+        let variant = ModelVariant::Audio8TtsRealisticAir;
+        assert!(variant.is_tts());
+        assert!(variant.is_enabled());
+        assert!(!variant.is_quantized());
+        assert!(!variant.is_gguf());
+        assert_eq!(variant.family(), crate::catalog::ModelFamily::Audio8Tts);
+        assert_ne!(variant.family(), ModelVariant::FishAudioS2Pro.family());
+        assert_eq!(variant.primary_task(), ModelTask::Tts);
+        assert_eq!(variant.repo_id(), "Edge0/Audio8-TTS-Realistic-Air");
+        assert_eq!(variant.dir_name(), "Audio8-TTS-Realistic-Air");
+        assert_eq!(variant.display_name(), "Audio8 TTS Realistic Air");
+        assert_eq!(
+            variant.artifact_revision(),
+            Some("6bf7a980759d8022a66922ee975dab99229a2dd9")
+        );
+        assert_eq!(variant.license_label(), Some("Apache-2.0"));
+        assert_eq!(variant.license_notice(), None);
+        assert!(ModelVariant::all().contains(&variant));
+        assert_eq!(variant.tts_output_sample_rate_hint(), Some(44_100));
+        assert_eq!(variant.tts_max_output_frames_hint(), Some(1024));
+        let capabilities = variant.speech_capabilities().expect("speech capabilities");
+        assert!(capabilities.supports_reference_voice);
+        assert!(capabilities.reference_transcript_required);
+        assert!(capabilities.supports_seeded_voice);
+        assert!(!capabilities.supports_builtin_voices);
+        assert_eq!(capabilities.max_references, 1);
+        for backend in [
+            crate::BackendKind::Cpu,
+            crate::BackendKind::Metal,
+            crate::BackendKind::Cuda,
+        ] {
+            assert!(variant.memory_required_gb_on(backend) <= variant.memory_required_gb());
+        }
+        assert_eq!(
+            serde_json::to_string(&variant).expect("serialize variant"),
+            "\"Audio8-TTS-Realistic-Air\""
+        );
+    }
+
+    #[test]
     fn fish_drama3_is_an_enabled_reference_voice_tts_of_its_own_family() {
         let variant = ModelVariant::FishAudioDrama3;
         assert!(variant.is_tts());
@@ -2675,9 +2782,9 @@ mod tests {
                 max_references: 8,
             })
         );
-        // Only Drama 3 speaks without a voice input or voices a dialogue;
-        // every other model speaks one voice from at most one reference,
-        // and only a model that clones takes one.
+        // Only Drama 3 voices a dialogue, and only it and Audio8 speak
+        // without a voice input; every other model speaks one voice from at
+        // most one reference, and only a model that clones takes one.
         for other in ModelVariant::all()
             .iter()
             .filter(|other| **other != variant)
@@ -2685,7 +2792,11 @@ mod tests {
             let Some(capabilities) = other.speech_capabilities() else {
                 continue;
             };
-            assert!(!capabilities.supports_seeded_voice, "{other}");
+            assert_eq!(
+                capabilities.supports_seeded_voice,
+                *other == ModelVariant::Audio8TtsRealisticAir,
+                "{other}"
+            );
             assert!(!capabilities.supports_speaker_dialogue, "{other}");
             assert_eq!(capabilities.max_speakers, 1, "{other}");
             assert_eq!(
@@ -2753,7 +2864,12 @@ mod tests {
             assert!(!variant.has_fish_artifact_fingerprint(), "{variant}");
         }
         for variant in ModelVariant::all() {
-            let is_fish = *variant == fish || *variant == drama3;
+            // Audio8 has its own family and takes the same product path:
+            // 2,048-sample codec frames, a segment plan, chunk-only streams
+            // and a content fingerprint.
+            let is_fish = *variant == fish
+                || *variant == drama3
+                || *variant == ModelVariant::Audio8TtsRealisticAir;
             assert_eq!(variant.uses_fish_dac_codec(), is_fish, "{variant}");
             assert_eq!(variant.plans_own_speech_segments(), is_fish, "{variant}");
             assert_eq!(

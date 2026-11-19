@@ -85,6 +85,16 @@ pub(super) fn checkpoint_resource_plan(
             crate::models::architectures::fish_s2::fish_s2_fast_graph_device_bytes(backend);
         return fish_s2_resource_plan(backend, memory, graphs).map(Some);
     }
+    if variant == ModelVariant::Audio8TtsRealisticAir {
+        let memory = crate::models::architectures::audio8::weights::audio8_model_memory(
+            model_path, device,
+        )?;
+        let backend = BackendKind::from(device.kind);
+        // The fast AR's CUDA graphs allocate at the load's self-check.
+        let graphs =
+            crate::models::architectures::audio8::audio8_fast_graph_device_bytes(backend);
+        return audio8_resource_plan(backend, memory, graphs).map(Some);
+    }
     if variant.family() == crate::catalog::ModelFamily::FishDrama3Tts {
         // Priced from the pinned census, before a weight is read.
         return fish_drama3_memory::resource_plan(model_path, BackendKind::from(device.kind))
@@ -528,6 +538,64 @@ pub(super) fn fish_s2_resource_plan(
     let reference_cache = ResourceVector {
         host_bytes: ResourceAmount::Known(
             crate::models::architectures::fish_s2::FISH_S2_REFERENCE_CACHE_BYTES,
+        ),
+        ..ResourceVector::zero()
+    };
+    plan.load_authorization = plan.load_authorization.checked_add(reference_cache)?;
+    plan.resident_authorization = plan.resident_authorization.checked_add(reference_cache)?;
+    // Cache entries are populated lazily. Keep their promise unmaterialized so
+    // state fitting cannot consume this headroom before the first reference is
+    // encoded. As with lazy graph caches, this remains conservative once filled.
+    plan.deferred_resident_authorization = reference_cache;
+    if graph_device_bytes > 0 {
+        let graphs = ResourceVector {
+            device_bytes: ResourceAmount::Known(graph_device_bytes),
+            ..ResourceVector::zero()
+        };
+        plan.load_authorization = plan.load_authorization.checked_add(graphs)?;
+        plan.resident_authorization = plan.resident_authorization.checked_add(graphs)?;
+        plan.deferred_resident_authorization =
+            plan.deferred_resident_authorization.checked_add(graphs)?;
+    }
+    Ok(plan)
+}
+/// `graph_device_bytes`: the fast AR's CUDA graphs, priced resident but kept
+/// pending until they allocate.
+pub(super) fn audio8_resource_plan(
+    backend: BackendKind,
+    memory: crate::models::architectures::audio8::weights::Audio8ModelMemory,
+    graph_device_bytes: u64,
+) -> Result<ModelResourcePlan> {
+    // On Metal the GPU allocates only the final tensors (staged transformer
+    // uploads, codec uploaded from the host); the rest of the load peak is
+    // host staging, which the GPU working set does not hold.
+    let device_load_peak_bytes = if backend == BackendKind::Metal {
+        memory.metal_device_load_peak_bytes
+    } else {
+        memory.load_peak_bytes
+    };
+    let mut plan = model_resource_plan(
+        backend,
+        ModelMemoryEstimate {
+            load_peak_bytes: device_load_peak_bytes,
+            resident_bytes: memory.resident_bytes,
+        },
+    );
+    if backend == BackendKind::Metal {
+        plan.host_staging_bytes = memory
+            .load_peak_bytes
+            .saturating_sub(device_load_peak_bytes);
+    }
+    if backend == BackendKind::Cuda {
+        plan.load_authorization.host_bytes =
+            ResourceAmount::Known(memory.cuda_host_load_peak_bytes);
+    }
+    // Reference VQ codes are immutable CPU data owned by this model instance,
+    // even when weights reside on CUDA or Metal. Reserve their complete bounded
+    // allocation before load and keep it charged until model unload.
+    let reference_cache = ResourceVector {
+        host_bytes: ResourceAmount::Known(
+            crate::models::architectures::audio8::AUDIO8_REFERENCE_CACHE_BYTES,
         ),
         ..ResourceVector::zero()
     };

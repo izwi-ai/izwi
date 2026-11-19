@@ -400,6 +400,92 @@ impl ModelLifecycleController {
         }
         Ok(publications)
     }
+    /// Seal each advertised Fish route against its own adapter identity. Slow
+    /// retained state is model-scoped and reused; invocation backing is per adapter.
+    pub(super) async fn load_audio8_state_publications(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        bundle_draft: &LoadedModelBundleDraft,
+        max_sequence_tokens: usize,
+        capacity: &crate::runtime::fish_capacity::ResolvedFishServingCapacity,
+        physical_state_spec: impl Fn(&[&[StageDescriptor]]) -> Result<Audio8PhysicalStateSpec>,
+    ) -> Result<HashMap<CapabilityKind, LoadedStatePublication>> {
+        let mut publications = HashMap::new();
+        let mut retained_runtime: Option<Arc<crate::engine::ManagedKvModelRuntime>> = None;
+        for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
+            let contracts = bundle_draft.execution_contracts(capability)?;
+            let stage_graphs = contracts
+                .iter()
+                .map(|contract| contract.stages.as_ref())
+                .collect::<Vec<_>>();
+            let physical_spec = physical_state_spec(&stage_graphs)?;
+            let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
+                Error::ModelLoadError(
+                    "Audio8 TTS normal graph did not publish retained state".into(),
+                )
+            })?;
+            // Fit and allocate slow state once. Refitting after its allocation
+            // would incorrectly price another copy against remaining headroom.
+            let retained = match &retained_runtime {
+                Some(retained) => {
+                    if retained.state_plan_v2().contract_fingerprint
+                        != retained_contract.fingerprint()?
+                    {
+                        return Err(Error::ModelLoadError(
+                            "Fish capabilities disagree on retained state".into(),
+                        ));
+                    }
+                    retained.clone()
+                }
+                None => {
+                    let retained = self
+                        .core_engine
+                        .load_managed_model_state_with_row_limits(
+                            model_instance_id,
+                            retained_contract,
+                            Some(max_sequence_tokens),
+                            capacity.active_rows,
+                            capacity.staged_rows,
+                        )
+                        .await?;
+                    retained_runtime = Some(retained.clone());
+                    retained
+                }
+            };
+            self.model_registry
+                .publish_effective_context(variant, retained.maximum_sequence_tokens())?;
+            self.model_registry.publish_kv_storage(variant, &retained);
+            crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                variant,
+                capability,
+                retained.state_plan_v2(),
+            )?;
+            let retained_uses = contracts
+                .iter()
+                .map(|contract| {
+                    let graph = stage_graph_fingerprint(&contract.stages)?;
+                    let retained_use = match contract.execution_profile.cache_mode {
+                        CacheMode::ExternalPaged => RetainedStateUseV2::ExternalPaged,
+                        CacheMode::None => RetainedStateUseV2::Inactive,
+                    };
+                    Ok((graph, retained_use))
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+            let publication = self
+                .load_invocation_workspace_publication(
+                    model_instance_id,
+                    &contracts,
+                    physical_spec.descriptor,
+                    &physical_spec.invocation,
+                    Some(retained.into()),
+                    retained_uses,
+                )
+                .await?;
+            publications.insert(capability, publication);
+        }
+        Ok(publications)
+    }
 
     pub(super) fn load_scratch_only_workspace_publication(
         &self,
