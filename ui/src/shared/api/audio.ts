@@ -235,6 +235,8 @@ export interface SpeechHistoryRecordCreateRequest {
   max_output_tokens?: number;
   top_k?: number;
   exaggeration?: number;
+  /** The emotion to speak with, for a model that lists `emotions`. */
+  emotion?: string;
   cfg_weight?: number;
   min_p?: number;
 }
@@ -1746,6 +1748,7 @@ export class AudioApiClient {
       max_output_tokens: request.max_output_tokens,
       top_k: request.top_k,
       exaggeration: request.exaggeration,
+      emotion: request.emotion,
       cfg_weight: request.cfg_weight,
       min_p: request.min_p,
       stream,

@@ -105,6 +105,98 @@ describe("viewport-safe creation dialogs", () => {
     );
   });
 
+  it("offers Ming 3.0 TTS's voices, emotions and a voice of your own", async () => {
+    vi.spyOn(api, "listSavedVoices").mockResolvedValue([]);
+    const ming = {
+      variant: "Ming-3.0-tts-0.5B",
+      status: "ready",
+      speech_capabilities: {
+        supports_builtin_voices: true,
+        built_in_voice_count: 85,
+        supports_reference_voice: true,
+        reference_transcript_required: false,
+        supports_voice_description: true,
+        supports_streaming: true,
+        supports_speed_control: false,
+        supports_auto_long_form: true,
+        emotions: [
+          "neutral",
+          "happy",
+          "sad",
+          "angry",
+          "fearful",
+          "disgusted",
+          "surprised",
+        ],
+      },
+    } as ModelInfo;
+    render(
+      <NewTextToSpeechModal
+        isOpen
+        onClose={vi.fn()}
+        selectedModel={ming.variant}
+        selectedModelInfo={ming}
+        selectedModelReady
+        initialSpeaker="US_Emma"
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onCreated={vi.fn()}
+        onCreateStream={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("combobox", { name: "Built-in voice" })).toHaveTextContent(
+      "US_Emma",
+    );
+    expect(await screen.findByText("Saved voice (optional)")).toBeInTheDocument();
+    expect(screen.getByText("Your own voice (optional)")).toBeInTheDocument();
+    // US_Emma has one delivery: no emotion to pick.
+    expect(screen.queryByRole("combobox", { name: "Emotion" })).toBeNull();
+  });
+
+  it("offers a Ming 3.0 TTS voice only the emotions it was recorded in", async () => {
+    vi.spyOn(api, "listSavedVoices").mockResolvedValue([]);
+    const ming = {
+      variant: "Ming-3.0-tts-0.5B",
+      status: "ready",
+      speech_capabilities: {
+        supports_builtin_voices: true,
+        supports_reference_voice: true,
+        reference_transcript_required: false,
+        supports_voice_description: true,
+        supports_streaming: true,
+        supports_speed_control: false,
+        supports_auto_long_form: true,
+        emotions: ["neutral", "happy", "sad", "angry"],
+      },
+    } as ModelInfo;
+    render(
+      <NewTextToSpeechModal
+        isOpen
+        onClose={vi.fn()}
+        selectedModel={ming.variant}
+        selectedModelInfo={ming}
+        selectedModelReady
+        initialSpeaker="灵风信"
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onCreated={vi.fn()}
+        onCreateStream={vi.fn()}
+      />,
+    );
+
+    expect(
+      await screen.findByRole("combobox", { name: "Emotion" }),
+    ).toHaveTextContent("Voice default");
+    // A described voice replaces the built-in one, and its emotions with it.
+    fireEvent.change(screen.getByLabelText("Your own voice (optional)"), {
+      target: { value: "A calm, low narrator." },
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("combobox", { name: "Emotion" })).toBeNull(),
+    );
+  });
+
   it("asks a multilingual model which language to speak", async () => {
     vi.spyOn(api, "listSavedVoices").mockResolvedValue([]);
     HTMLElement.prototype.scrollIntoView = vi.fn();

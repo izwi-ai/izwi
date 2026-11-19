@@ -356,3 +356,30 @@ describe("Fish Audio Drama 3", () => {
     );
   });
 });
+
+describe("Ming 3.0 TTS", () => {
+  const variant = "Ming-3.0-tts-0.5B";
+
+  it("is offered for speech, cloning and voice design, and nothing else", () => {
+    expect(VIEW_CONFIGS["custom-voice"].modelFilter(variant)).toBe(true);
+    expect(VIEW_CONFIGS["voice-clone"].modelFilter(variant)).toBe(true);
+    expect(VIEW_CONFIGS["voice-design"].modelFilter(variant)).toBe(true);
+    expect(VIEW_CONFIGS.chat.modelFilter(variant)).toBe(false);
+    expect(VIEW_CONFIGS.transcription.modelFilter(variant)).toBe(false);
+  });
+
+  it("lists its built-in voices with the emotions each was recorded in", () => {
+    const voices = getSpeakerProfilesForVariant(variant);
+    expect(voices).toHaveLength(85);
+    expect(voices.slice(0, 3).map((voice) => voice.id)).toEqual([
+      "US_Emma",
+      "UK_George",
+      "UK_Charlotte",
+    ]);
+    expect(voices[0].emotions).toBeUndefined();
+    const withEmotions = voices.find((voice) => voice.id === "灵风信");
+    expect(withEmotions?.emotions?.[0]).toBe("neutral");
+    expect(withEmotions?.emotions).toContain("angry");
+    expect(new Set(voices.map((voice) => voice.id)).size).toBe(voices.length);
+  });
+});

@@ -53,6 +53,7 @@ import {
   getSpeakerProfilesForVariant,
   isFishDrama3Variant,
   isMaya1Variant,
+  isMingTtsVariant,
 } from "@/types";
 
 interface NewTextToSpeechModalProps {
@@ -112,6 +113,9 @@ const AUTO_DETECT_LANGUAGE = "auto";
 /** The saved-voice picker's "no saved voice" choice, for a model that also
  * has built-in voices or a seeded voice (Radix Select takes no empty value). */
 const BUILT_IN_VOICE = "__built_in__";
+
+/** The emotion picker's "as the voice speaks by default" choice. */
+const DEFAULT_EMOTION = "__default__";
 
 type SpeechMode = "single" | "dialogue";
 
@@ -185,6 +189,7 @@ export function NewTextToSpeechModal({
     () => initialTake?.dialogue ?? newDialogueScene(null),
   );
   const [seed, setSeed] = useState("");
+  const [emotion, setEmotion] = useState(DEFAULT_EMOTION);
   // The latest line preview, replayed while its request is unchanged.
   const [linePreview, setLinePreview] = useState<{
     lineId: string;
@@ -287,7 +292,7 @@ export function NewTextToSpeechModal({
   // Maya1's built-in voices are themselves descriptions: one of the user's
   // own replaces the voice rather than styling it.
   const descriptionReplacesVoice = selectedModel
-    ? isMaya1Variant(selectedModel)
+    ? isMaya1Variant(selectedModel) || isMingTtsVariant(selectedModel)
     : false;
   // Inline tags the script may carry (Maya1's <laugh>, Maya 2's [laughs], ...).
   const inlineTags = useMemo(
@@ -320,6 +325,7 @@ export function NewTextToSpeechModal({
         ? getSpeakerProfilesForVariant(selectedModel).map((profile) => ({
             id: profile.id,
             label: profile.name,
+            emotions: profile.emotions,
           }))
         : [],
     [selectedModel, usesBuiltInVoiceSelection],
@@ -333,6 +339,32 @@ export function NewTextToSpeechModal({
     }
     return speakerOptions[0]?.id ?? "";
   }, [speaker, speakerOptions, usesBuiltInVoiceSelection]);
+
+  // The emotions the chosen voice can speak with (a model that lists
+  // `emotions`): any of them on a saved voice, a built-in voice's own
+  // recorded ones, none on a described voice.
+  const emotionOptions = useMemo(() => {
+    const all = capabilities?.emotions ?? [];
+    if (all.length === 0 || voiceDescription.trim()) {
+      return [];
+    }
+    if (useSavedVoice) {
+      return all;
+    }
+    return (
+      speakerOptions.find((option) => option.id === resolvedBuiltInSpeaker)
+        ?.emotions ?? []
+    );
+  }, [
+    capabilities,
+    resolvedBuiltInSpeaker,
+    speakerOptions,
+    useSavedVoice,
+    voiceDescription,
+  ]);
+  const resolvedEmotion = emotionOptions.includes(emotion)
+    ? emotion
+    : undefined;
 
   const resetModalState = useCallback(() => {
     setText(initialTake?.text ?? "");
@@ -353,6 +385,7 @@ export function NewTextToSpeechModal({
     setMode(initialTake?.dialogue ? "dialogue" : "single");
     setScene(initialTake?.dialogue ?? newDialogueScene(limits));
     setSeed(initialTake?.seed ?? String(randomSeed()));
+    setEmotion(DEFAULT_EMOTION);
     previewRunRef.current += 1;
     setPreviewingLineId(null);
     setLinePreview(null);
@@ -623,11 +656,13 @@ export function NewTextToSpeechModal({
         showsVoiceDescription && trimmedVoiceDescription
           ? trimmedVoiceDescription
           : undefined,
+      emotion: resolvedEmotion,
       ...shared.fields,
     });
   }, [
     onModelRequired,
     dialogueMode,
+    resolvedEmotion,
     effectiveVoiceWorkflow,
     limits,
     resolvedBuiltInSpeaker,
@@ -1000,6 +1035,33 @@ export function NewTextToSpeechModal({
                       {usableSavedVoices.map((voice) => (
                         <SelectItem key={voice.id} value={voice.id}>
                           {savedVoiceLabel(voice)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </CreationField>
+              ) : null}
+
+              {emotionOptions.length > 0 && !dialogueMode ? (
+                <CreationField label="Emotion">
+                  <Select
+                    value={resolvedEmotion ?? DEFAULT_EMOTION}
+                    onValueChange={setEmotion}
+                    disabled={isSubmitting}
+                  >
+                    <SelectTrigger
+                      aria-label="Emotion"
+                      className="h-9 w-full rounded-[10px] border-(--border-default) bg-(--surface-panel) text-[13.5px]"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={DEFAULT_EMOTION}>
+                        Voice default
+                      </SelectItem>
+                      {emotionOptions.map((option) => (
+                        <SelectItem key={option} value={option}>
+                          {option.charAt(0).toUpperCase() + option.slice(1)}
                         </SelectItem>
                       ))}
                     </SelectContent>
