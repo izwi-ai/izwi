@@ -1490,11 +1490,44 @@ impl NativeExecutor {
         plan: &PlannedAsrChunks,
         chunked: ChunkedAsrTranscription,
     ) -> (String, Option<serde_json::Value>) {
+        let language = Self::chunked_asr_language(&chunked.chunk_diagnostics);
         let mut diagnostics = plan.diagnostics_with_chunk_transcriptions(chunked.chunk_diagnostics);
-        if let (Some(words), Some(root)) = (chunked.timestamp_words, diagnostics.as_object_mut()) {
-            root.insert("timestamp_words".to_string(), timestamp_words_json(&words));
+        if let Some(root) = diagnostics.as_object_mut() {
+            if let Some(words) = chunked.timestamp_words {
+                root.insert("timestamp_words".to_string(), timestamp_words_json(&words));
+            }
+            if let Some(language) = language {
+                root.insert("language".to_string(), serde_json::json!(language));
+            }
         }
         (chunked.text, Some(diagnostics))
+    }
+
+    /// The language of a chunked transcript: the one most of its chunks
+    /// reported as `language` in their model diagnostics, the earliest of
+    /// them on a tie. `None` when no chunk named one.
+    fn chunked_asr_language(chunk_diagnostics: &[serde_json::Value]) -> Option<String> {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for language in chunk_diagnostics
+            .iter()
+            .filter_map(|chunk| {
+                chunk
+                    .get("model_diagnostics")
+                    .and_then(|model| model.get("language"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .filter(|language| !language.trim().is_empty())
+        {
+            match counts.iter_mut().find(|(seen, _)| *seen == language) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((language, 1)),
+            }
+        }
+        let most = counts.iter().map(|(_, count)| *count).max()?;
+        counts
+            .into_iter()
+            .find(|(_, count)| *count == most)
+            .map(|(language, _)| language.to_string())
     }
 
     fn with_audio_decode_timing(
