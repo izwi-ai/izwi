@@ -24,6 +24,9 @@ mod precision;
 mod prompt;
 #[cfg(test)]
 mod reference_tests;
+mod retained;
+#[cfg(test)]
+mod retained_tests;
 #[cfg(test)]
 mod synthetic;
 #[cfg(test)]
@@ -47,6 +50,10 @@ pub(crate) use precision::rumble_weight_dtypes;
 pub use prompt::{
     resolve_rumble_language, RumblePrompt, RumblePromptOptions, RumbleTranscriptStyle,
     RUMBLE_DETECTED_LANGUAGES, RUMBLE_FORCED_LANGUAGES, RUMBLE_MAX_CONTEXT_TOKENS,
+};
+pub(crate) use retained::{
+    RumbleDecodeCheckpoint, RumbleDecodeState, RumbleDecodeStep, RumblePreparedGeometry,
+    RumblePreparedPromptArtifact,
 };
 pub use tokenizer::{RumbleSpecialTokens, RumbleTokenizer};
 pub use transcript::{split_rumble_output, RumbleOutput};

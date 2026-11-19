@@ -113,10 +113,15 @@ pub struct RumbleTranscription {
     pub diagnostics: Option<serde_json::Value>,
 }
 
-/// The state a load publishes for its ASR graphs.
+/// The state a load publishes for its ASR graphs: retained decoder pages for
+/// the retained sequence graph (when it is offered), and invocation pages
+/// for the atomic graph.
 #[derive(Debug, Clone)]
 pub(crate) struct RumblePhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) retained: Option<InferenceStateContract>,
+    /// The longest retained sequence.
+    pub(crate) retained_max_tokens: Option<usize>,
     pub(crate) invocation: InferenceStateContract,
     /// Decoder tokens one invocation may occupy.
     pub(crate) sequence_tokens: usize,
@@ -141,6 +146,7 @@ pub struct RumbleAsrModel {
     text_model: Qwen3Model,
     audio_precision: PrecisionLoad,
     text_precision: PrecisionLoad,
+    retained_decode: bool,
 }
 
 impl RumbleAsrModel {
@@ -235,7 +241,13 @@ impl RumbleAsrModel {
             text_model,
             audio_precision,
             text_precision,
+            retained_decode: super::retained::rumble_retained_decode_enabled(),
         })
+    }
+
+    /// Whether this load offers the retained sequence route.
+    pub(crate) fn retained_decode(&self) -> bool {
+        self.retained_decode
     }
 
     pub fn config(&self) -> &RumbleConfig {
@@ -320,17 +332,16 @@ impl RumbleAsrModel {
         Ok(contract)
     }
 
-    /// The state for the loaded ASR capability's stage graphs: one paged
-    /// decoder cache of [`Self::sequence_tokens`] per atomic invocation.
+    /// The state for the loaded ASR capability's stage graphs: retained
+    /// decoder pages for a retained sequence graph, and for the atomic graph
+    /// one paged decoder cache of [`Self::sequence_tokens`] per invocation.
     pub(crate) fn physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
     ) -> Result<RumblePhysicalStateSpec> {
-        rumble_physical_state_spec(
-            stage_graphs,
-            self.invocation_contract()?,
-            self.sequence_tokens(),
-        )
+        let invocation = self.invocation_contract()?;
+        let retained = rumble_retained_contract(invocation.clone())?;
+        rumble_physical_state_spec(stage_graphs, retained, invocation, self.sequence_tokens())
     }
 
     /// Host features for one invocation of audio.
@@ -708,8 +719,62 @@ fn rumble_atomic_graph(stages: &[StageDescriptor]) -> bool {
         )
 }
 
+/// The retained route's decoder pages: the invocation contract's layout,
+/// retained across scheduler quanta with transactional checkpoints.
+fn rumble_retained_contract(
+    mut contract: InferenceStateContract,
+) -> Result<InferenceStateContract> {
+    for domain in &mut contract.domains {
+        let StateDomainSpec::PagedAttention(domain) = domain else {
+            return Err(Error::ModelLoadError(
+                "Rumble retained state must be paged attention".into(),
+            ));
+        };
+        domain.header.scope = StateScope::Retained;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = CheckpointPolicy::Transactional;
+    }
+    contract.validate()?;
+    Ok(contract)
+}
+
+/// The retained sequence graph a load may seal: scalar exact encoder
+/// preparation, scalar exact prefill, and continuous ragged decode priced
+/// per row.
+fn rumble_retained_graph(stages: &[StageDescriptor]) -> bool {
+    use crate::engine::{ConcurrencyClass, NativeBatchMode, StageShapePolicy, StageWorkSelector};
+    let scalar = |stage: &StageDescriptor| {
+        stage.batch_mode == NativeBatchMode::None
+            && stage.shape_policy == StageShapePolicy::Exact
+            && stage.concurrency == ConcurrencyClass::Exclusive
+            && stage.max_batch_size == 1
+    };
+    let preparation = stages
+        .iter()
+        .any(|stage| stage.selector == StageWorkSelector::PreSequencePreparation && scalar(stage));
+    let prefill = stages
+        .iter()
+        .any(|stage| stage.selector == StageWorkSelector::SequencePrefill && scalar(stage));
+    let decode = stages.iter().any(|stage| {
+        let batch_workspace = u64::try_from(stage.max_batch_size)
+            .ok()
+            .and_then(|width| stage.workspace_per_row_bytes.checked_mul(width));
+        stage.selector == StageWorkSelector::SequenceDecode
+            && stage.batch_mode == NativeBatchMode::Continuous
+            && stage.shape_policy == StageShapePolicy::Ragged
+            && stage.concurrency == ConcurrencyClass::Batchable
+            && stage.max_batch_size > 0
+            && stage.workspace_base_bytes == 0
+            && stage.workspace_per_row_bytes > 0
+            && stage.workspace_per_work_unit_bytes == 0
+            && batch_workspace.is_some_and(|bytes| stage.max_workspace_bytes >= bytes)
+    });
+    stages.len() == 3 && preparation && prefill && decode
+}
+
 fn rumble_physical_state_spec(
     stage_graphs: &[&[StageDescriptor]],
+    retained: InferenceStateContract,
     invocation: InferenceStateContract,
     sequence_tokens: usize,
 ) -> Result<RumblePhysicalStateSpec> {
@@ -718,14 +783,41 @@ fn rumble_physical_state_spec(
             "Rumble state requires stages and a non-zero decoder context".into(),
         ));
     }
-    if !stage_graphs
+    let atomic_graphs = stage_graphs
         .iter()
-        .all(|stages| rumble_atomic_graph(stages))
-    {
+        .filter(|stages| rumble_atomic_graph(stages))
+        .count();
+    let retained_graphs = stage_graphs
+        .iter()
+        .filter(|stages| {
+            stages.iter().any(|stage| {
+                matches!(
+                    stage.selector,
+                    crate::engine::StageWorkSelector::SequencePrefill
+                        | crate::engine::StageWorkSelector::SequenceDecode
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    // A retained graph needs the atomic graph beside it (long audio); with
+    // the retained route off, every graph is atomic and no retained state
+    // is authored.
+    let valid = if retained_graphs.is_empty() {
+        atomic_graphs == stage_graphs.len()
+    } else {
+        retained_graphs
+            .iter()
+            .all(|stages| rumble_retained_graph(stages))
+            && atomic_graphs > 0
+            && retained_graphs.len() + atomic_graphs == stage_graphs.len()
+    };
+    if !valid {
         return Err(Error::ModelLoadError(
-            "Rumble ASR runs one atomic invocation stage per graph".into(),
+            "Rumble ASR runs its atomic graph, beside at most a retained graph of scalar preparation, scalar exact prefill and continuous ragged decode"
+                .into(),
         ));
     }
+    let uses_retained = !retained_graphs.is_empty();
     let max_tokens = u64::try_from(sequence_tokens)
         .map_err(|_| Error::ModelLoadError("Rumble context exceeds u64".into()))?;
     let max_domain_id = invocation
@@ -736,27 +828,34 @@ fn rumble_physical_state_spec(
         .ok_or_else(|| Error::ModelLoadError("Rumble invocation contract is empty".into()))?;
     let mut profiles = Vec::with_capacity(stage_graphs.len());
     for stages in stage_graphs {
+        let atomic = rumble_atomic_graph(stages);
         let mut ordered = stages.iter().collect::<Vec<_>>();
         ordered.sort_unstable_by_key(|stage| stage.id);
         let mut invocation_stages = Vec::with_capacity(ordered.len());
         for (index, stage) in ordered.into_iter().enumerate() {
-            let mut domains = invocation
-                .domains
-                .iter()
-                .cloned()
-                .map(|state| {
-                    Ok(InvocationWorkspaceDomain::State {
-                        placement: state.header().placement,
-                        formula: WorkspaceFormula {
-                            fixed_bytes: paged_invocation_bytes(&state, max_tokens)?,
-                            dimensions: vec![],
-                            terms: vec![],
-                        },
-                        state,
-                        capacity: InvocationStateCapacity::decoder_context(max_tokens)?,
+            // Only the atomic graph leases invocation pages; the retained
+            // graph's stages lease scratch beside the retained pages.
+            let mut domains = if atomic {
+                invocation
+                    .domains
+                    .iter()
+                    .cloned()
+                    .map(|state| {
+                        Ok(InvocationWorkspaceDomain::State {
+                            placement: state.header().placement,
+                            formula: WorkspaceFormula {
+                                fixed_bytes: paged_invocation_bytes(&state, max_tokens)?,
+                                dimensions: vec![],
+                                terms: vec![],
+                            },
+                            state,
+                            capacity: InvocationStateCapacity::decoder_context(max_tokens)?,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>>>()?;
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
             if stage.max_workspace_bytes > 0 {
                 let scratch_bytes = if stage.workspace_per_row_bytes > 0 {
                     stage.workspace_per_row_bytes
@@ -784,7 +883,11 @@ fn rumble_physical_state_spec(
             invocation_stages.push(InvocationStageWorkspace {
                 stage: stage.id,
                 lease_scope: InvocationLeaseScope::PerRow,
-                groups: invocation.groups.clone(),
+                groups: if atomic {
+                    invocation.groups.clone()
+                } else {
+                    Vec::new()
+                },
                 domains,
             });
         }
@@ -797,7 +900,13 @@ fn rumble_physical_state_spec(
     profiles.dedup();
     let descriptor = CapabilityStateDescriptorV2 {
         abi: CURRENT_INFERENCE_STATE_ABI,
-        retained: RetainedStateCapability::Stateless,
+        retained: if uses_retained {
+            RetainedStateCapability::Managed {
+                contract: retained.clone(),
+            }
+        } else {
+            RetainedStateCapability::Stateless
+        },
         invocation: InvocationWorkspaceSet::Bounded { profiles },
     };
     for stages in stage_graphs {
@@ -805,6 +914,8 @@ fn rumble_physical_state_spec(
     }
     Ok(RumblePhysicalStateSpec {
         descriptor,
+        retained: uses_retained.then_some(retained),
+        retained_max_tokens: uses_retained.then_some(sequence_tokens),
         invocation,
         sequence_tokens,
     })

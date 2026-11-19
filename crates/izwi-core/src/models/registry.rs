@@ -49,8 +49,10 @@ use crate::models::architectures::granite_speech5::asr::{
 };
 use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::rumble::{
-    RumbleAsrModel, RumbleGenerationOptions, RumblePhysicalStateSpec, RumbleRequestOptions,
-    RumbleTranscription, RUMBLE_MAX_AUDIO_SECONDS,
+    RumbleAsrModel, RumbleAudioFeatures, RumbleDecodeCheckpoint, RumbleDecodeState,
+    RumbleDecodeStep, RumbleGenerationOptions, RumblePhysicalStateSpec, RumblePreparedGeometry,
+    RumblePreparedPromptArtifact, RumbleRequestOptions, RumbleTranscription,
+    RUMBLE_MAX_AUDIO_SECONDS,
 };
 use crate::models::architectures::lfm2::chat::{
     ChatDecodeState as Lfm2ChatDecodeState, ChatDecodeStep as Lfm2ChatDecodeStep,
@@ -1110,6 +1112,7 @@ pub enum NativeAsrDecodeState {
     VibeVoice(VibeVoiceAsrDecodeState),
     GraniteSpeech(GraniteSpeechDecodeState),
     GraniteSpeech5(GraniteSpeech5DecodeState),
+    Rumble(RumbleDecodeState),
     Nemotron(NemotronStreamingState),
 }
 
@@ -1119,6 +1122,7 @@ pub(crate) enum NativeAsrDecodeCheckpoint {
     VibeVoice(VibeVoiceAsrDecodeCheckpoint),
     GraniteSpeech(GraniteSpeechDecodeCheckpoint),
     GraniteSpeech5(GraniteSpeech5DecodeCheckpoint),
+    Rumble(RumbleDecodeCheckpoint),
 }
 
 impl NativeAsrDecodeState {
@@ -1128,6 +1132,7 @@ impl NativeAsrDecodeState {
         match self {
             Self::Qwen3(state) => Some(state.retained_terminal_diagnostics()),
             Self::VibeVoice(state) => Some(state.retained_terminal_diagnostics()),
+            Self::Rumble(state) => Some(state.retained_terminal_diagnostics()),
             _ => None,
         }
     }
@@ -1146,6 +1151,7 @@ impl NativeAsrDecodeState {
             Self::VibeVoice(_) => true,
             Self::GraniteSpeech(state) => state.uses_managed_kv(),
             Self::GraniteSpeech5(state) => state.uses_managed_kv(),
+            Self::Rumble(state) => state.uses_managed_kv(),
             Self::Nemotron(_) => false,
         }
     }
@@ -1159,6 +1165,7 @@ impl NativeAsrDecodeState {
             Self::VibeVoice(state) => state.take_managed_write_completions(),
             Self::GraniteSpeech(state) => state.take_managed_write_completions(),
             Self::GraniteSpeech5(state) => state.take_managed_write_completions(),
+            Self::Rumble(state) => state.take_managed_write_completions(),
             Self::Nemotron(_) => Vec::new(),
         }
     }
@@ -1170,6 +1177,7 @@ impl NativeAsrDecodeState {
             Self::VibeVoice(state) => Some(state.sequence_position()),
             Self::GraniteSpeech(state) => Some(state.sequence_position()),
             Self::GraniteSpeech5(state) => Some(state.sequence_position()),
+            Self::Rumble(state) => Some(state.sequence_position()),
             Self::Nemotron(_) => None,
         }
     }
@@ -1194,6 +1202,9 @@ impl NativeAsrDecodeState {
             Self::GraniteSpeech5(state) => state
                 .begin_managed_quantum(cache)
                 .map(NativeAsrDecodeCheckpoint::GraniteSpeech5),
+            Self::Rumble(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeAsrDecodeCheckpoint::Rumble),
             Self::Nemotron(_) => Err(Error::InvalidInput(
                 "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
             )),
@@ -1219,6 +1230,7 @@ impl NativeAsrDecodeState {
             | Self::VibeVoice(_)
             | Self::GraniteSpeech(_)
             | Self::GraniteSpeech5(_)
+            | Self::Rumble(_)
             | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Whisper managed generation was supplied to another ASR state".into(),
             )),
@@ -1248,6 +1260,9 @@ impl NativeAsrDecodeState {
                 Self::GraniteSpeech5(state),
                 NativeAsrDecodeCheckpoint::GraniteSpeech5(mut checkpoint),
             ) => state.rollback_managed_quantum(&mut checkpoint),
+            (Self::Rumble(state), NativeAsrDecodeCheckpoint::Rumble(mut checkpoint)) => {
+                state.rollback_managed_quantum(&mut checkpoint)
+            }
             _ => Err(Error::InvalidInput(
                 "ASR managed checkpoint was supplied to a different decoder state".to_string(),
             )),
@@ -1273,6 +1288,9 @@ impl NativeAsrDecodeState {
                 Self::GraniteSpeech5(state),
                 NativeAsrDecodeCheckpoint::GraniteSpeech5(mut checkpoint),
             ) => state.commit_managed_quantum(&mut checkpoint),
+            (Self::Rumble(state), NativeAsrDecodeCheckpoint::Rumble(mut checkpoint)) => {
+                state.commit_managed_quantum(&mut checkpoint)
+            }
             (Self::Qwen3(_), NativeAsrDecodeCheckpoint::Qwen3(_)) => Ok(()),
             _ => Err(Error::InvalidInput(
                 "ASR managed checkpoint does not match its decoder state".into(),
@@ -1287,6 +1305,7 @@ impl NativeAsrDecodeState {
             | Self::VibeVoice(_)
             | Self::GraniteSpeech(_)
             | Self::GraniteSpeech5(_)
+            | Self::Rumble(_)
             | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Qwen3 ASR tensor-state reservation was supplied to a non-Qwen3 state".to_string(),
             )),
@@ -1303,6 +1322,7 @@ impl NativeAsrDecodeState {
             | Self::VibeVoice(_)
             | Self::GraniteSpeech(_)
             | Self::GraniteSpeech5(_)
+            | Self::Rumble(_)
             | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
             )),
@@ -1320,6 +1340,7 @@ impl NativeAsrDecodeState {
             | Self::VibeVoice(_)
             | Self::GraniteSpeech(_)
             | Self::GraniteSpeech5(_)
+            | Self::Rumble(_)
             | Self::Nemotron(_) => Err(Error::InvalidInput(
                 "Qwen3 ASR tensor-state arena was supplied to a non-Qwen3 state".to_string(),
             )),
@@ -1333,6 +1354,7 @@ impl NativeAsrDecodeState {
             Self::VibeVoice(state) => Some(state.prefill_progress()),
             Self::GraniteSpeech(state) => Some(state.prefill_progress()),
             Self::GraniteSpeech5(state) => Some(state.prefill_progress()),
+            Self::Rumble(state) => Some(state.prefill_progress()),
             Self::Nemotron(_) => None,
         }
     }
@@ -1344,6 +1366,7 @@ impl NativeAsrDecodeState {
             Self::VibeVoice(state) => Some(state.prefill_token_count()),
             Self::GraniteSpeech(state) => Some(state.prefill_token_count()),
             Self::GraniteSpeech5(state) => Some(state.prefill_token_count()),
+            Self::Rumble(state) => Some(state.prefill_token_count()),
             Self::Nemotron(_) => None,
         }
     }
@@ -1364,6 +1387,7 @@ impl NativeAsrDecodeState {
             | Self::Whisper(_)
             | Self::GraniteSpeech(_)
             | Self::GraniteSpeech5(_)
+            | Self::Rumble(_)
             | Self::Nemotron(_) => None,
         }
     }
@@ -3303,6 +3327,7 @@ impl NativeAsrModel {
             Self::NemotronTranscribe(_) => true,
             Self::GraniteSpeech(model) => model.supports_incremental_decode(),
             Self::GraniteSpeech5(model) => model.supports_incremental_decode(),
+            Self::Rumble(model) => model.supports_incremental_decode(),
             _ => false,
         }
     }
@@ -3313,6 +3338,7 @@ impl NativeAsrModel {
             Self::VibeVoice(_) => true,
             Self::GraniteSpeech(model) => model.supports_resumable_prefill(),
             Self::GraniteSpeech5(model) => model.supports_resumable_prefill(),
+            Self::Rumble(model) => model.supports_resumable_prefill(),
             Self::NemotronTranscribe(_) => true,
             _ => false,
         }
@@ -3325,7 +3351,7 @@ impl NativeAsrModel {
             Self::VibeVoice(model) => model.supports_continuous_decode_batch(),
             Self::GraniteSpeech(model) => model.supports_continuous_decode_batch(),
             Self::GraniteSpeech5(model) => model.supports_continuous_decode_batch(),
-            Self::Rumble(_) => false,
+            Self::Rumble(model) => model.supports_continuous_decode_batch(),
             Self::NemotronTranscribe(_) => true,
             Self::WhisperTurbo(model) => model.supports_continuous_decode_batch(),
         }
@@ -3348,6 +3374,7 @@ impl NativeAsrModel {
                 Self::VibeVoice(_)
                     | Self::GraniteSpeech(_)
                     | Self::GraniteSpeech5(_)
+                    | Self::Rumble(_)
                     | Self::NemotronTranscribe(_)
                     | Self::WhisperTurbo(_)
             )
@@ -3362,9 +3389,7 @@ impl NativeAsrModel {
             Self::VibeVoice(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::GraniteSpeech(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::GraniteSpeech5(model) => model.continuous_decode_workspace_per_row_bytes(),
-            Self::Rumble(_) => Err(Error::InvalidInput(
-                "Rumble ASR has no continuous decode batch".to_string(),
-            )),
+            Self::Rumble(model) => model.continuous_decode_workspace_per_row_bytes(),
             Self::NemotronTranscribe(model) => Ok(model.decode_workspace_per_row_bytes()),
             Self::WhisperTurbo(model) => model.continuous_decode_workspace_per_row_bytes(),
             _ => Err(Error::InvalidInput(
@@ -3888,6 +3913,61 @@ impl NativeAsrModel {
         }
     }
 
+    pub(crate) fn start_rumble_resumable_prefill_managed(
+        &self,
+        prepared: Arc<RumblePreparedPromptArtifact>,
+        options: NativeAsrGenerationOptions,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::Rumble(model) => Ok(NativeAsrDecodeState::Rumble(
+                model.begin_resumable_prefill_managed(
+                    prepared,
+                    RumbleGenerationOptions {
+                        max_new_tokens: options.max_new_tokens,
+                        stop_token_ids: options.stop_token_ids,
+                        stop_sequences: options.stop_sequences,
+                    },
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "prepared Rumble input was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
+    /// One Rumble request's audio features, computed on the host, and the
+    /// retained geometry they give.
+    pub(crate) fn rumble_retained_preparation_features(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        request: &RumbleRequestOptions,
+    ) -> Result<(RumbleAudioFeatures, RumblePreparedGeometry)> {
+        match self {
+            Self::Rumble(model) => model.retained_preparation_features(audio, sample_rate, request),
+            _ => Err(Error::InvalidInput(
+                "Rumble features were requested from another ASR model".into(),
+            )),
+        }
+    }
+
+    /// Encodes one Rumble request whose audio features a host worker
+    /// computed.
+    pub(crate) fn prepare_rumble_prompt_artifact_from_features(
+        &self,
+        features: &RumbleAudioFeatures,
+        request: &RumbleRequestOptions,
+    ) -> Result<Arc<RumblePreparedPromptArtifact>> {
+        match self {
+            Self::Rumble(model) => model.prepare_prompt_artifact_from_features(features, request),
+            _ => Err(Error::InvalidInput(
+                "Rumble preparation was supplied to another ASR model".into(),
+            )),
+        }
+    }
+
     pub(crate) fn continue_resumable_prefill(
         &self,
         state: &mut NativeAsrDecodeState,
@@ -3895,6 +3975,9 @@ impl NativeAsrModel {
         span_end: usize,
     ) -> Result<bool> {
         match (self, state) {
+            (Self::Rumble(model), NativeAsrDecodeState::Rumble(state)) => {
+                model.continue_resumable_prefill(state, span_start, span_end)
+            }
             (Self::Qwen3(model), NativeAsrDecodeState::Qwen3(state)) => {
                 model.continue_resumable_prefill(state, span_start, span_end)
             }
@@ -4016,6 +4099,15 @@ impl NativeAsrModel {
                     finished: step.finished,
                 })
             }
+            (Self::Rumble(model), NativeAsrDecodeState::Rumble(state)) => {
+                let step: RumbleDecodeStep = model.decode_step(state)?;
+                Ok(NativeAsrDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+            }
             _ => Err(Error::InvalidInput(
                 "ASR decode state does not match loaded ASR model".to_string(),
             )),
@@ -4079,6 +4171,28 @@ impl NativeAsrModel {
                         _ => Err(Error::InvalidInput(
                             "continuous Granite Speech ASR batch contains a foreign state"
                                 .to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeAsrDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            Self::Rumble(model) => {
+                let mut typed = states
+                    .iter_mut()
+                    .map(|state| match &mut **state {
+                        NativeAsrDecodeState::Rumble(state) => Ok(state),
+                        _ => Err(Error::InvalidInput(
+                            "continuous Rumble ASR batch contains a foreign state".to_string(),
                         )),
                     })
                     .collect::<Result<Vec<_>>>()?;
