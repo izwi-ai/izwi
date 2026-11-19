@@ -2639,9 +2639,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_RUMBLE_RETAINED_DECODE",
         Flag,
-        "true",
+        "true on CUDA, false on CPU and Metal",
         Once,
-        "Runs Rumble ASR of up to 30 s on its retained route, where concurrent requests decode together (one batched step per token); false runs every request as one atomic invocation and fits no retained decoder state.",
+        "Runs Rumble ASR that fits one pass on its retained route, where concurrent requests decode together (one batched step per token); false runs every request as one atomic invocation and fits no retained decoder state.",
     ),
     CoreEnvVar::new(
         "IZWI_RUMBLE_TEXT_DTYPE",

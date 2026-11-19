@@ -120,8 +120,14 @@ name; other values pass through title-cased.
 The ASR capability offers two graphs
 (`row(F::RumbleAsr, C::Asr, Loaded::RumbleAsr, RetainedAndInvocation).sequence().resumable().chunked()`).
 
-**Retained rows** take audio the chunk planner leaves whole (up to 28.5 s).
-Request preparation computes the log-mel on a host worker, then
+One pass covers audio up to the model's whole 30 s window
+(`asr_single_pass_fills_invocation_window`): the window is a fixed feature
+window the front end checks itself, so the planner's 5% margin applies only
+to the chunks of longer audio (28.5 s each) and to a context too small for a
+full window.
+
+**Retained rows** take audio that fits one pass, on a load that offers the
+route. Request preparation computes the log-mel on a host worker, then
 `RumbleEncoderBatcher` encodes the audio and splices it into the prompt on
 the device, one request at a time (`asr.encoder.rumble`, a scalar stage).
 The prompt prefills onto retained decoder pages in resumable spans
@@ -133,20 +139,26 @@ budget is 512 tokens by default; any budget is narrowed to the room the
 sequence leaves after the prompt. A row decodes the same tokens alone and in
 a batch, and the same tokens as an atomic invocation.
 
-**Atomic invocations** take longer audio: each chunk is one invocation on a
+**Atomic invocations** take longer audio, and every request on a load
+without the retained route: each chunk is one invocation on a
 lifecycle-owned paged KV lease of 1,536 tokens (the prompt's markers and
 context, at most 256 tokens; one window of audio tokens, 390; and the decode
 budget), chunked inside the dispatch. An atomic invocation holds the device
-for its whole decode.
+for its whole decode. A chunked transcript reports the language most of its
+chunks named (the earliest on a tie).
 
-`IZWI_RUMBLE_RETAINED_DECODE=false` turns the retained route off: every
-request then runs atomically and the load fits no retained decoder state.
+The retained route is on by default on CUDA and off on CPU and Metal;
+`IZWI_RUMBLE_RETAINED_DECODE` overrides the default on any backend
+(`rumble_retained_decode_enabled(backend)`). With it off every request runs
+atomically and the load fits no retained decoder state. The measurements
+below are why: at a width of a few rows the route costs a single request
+latency and costs the CPU throughput.
 
 The decode width is the engine's rows on CPU and Metal and the default CUDA
 width; Rumble is not certified for the wider CUDA tier.
 
-Measured on an M1 Pro, where the engine's automatic width is 2, against the
-same build with the route off:
+Measured on an M1 Pro, where the engine's automatic width is 2, with the
+route switched on against the same build with it off:
 
 | | Retained route | Atomic only |
 |---|---|---|
@@ -159,7 +171,8 @@ A retained row pays for its extra dispatches (the encoder job, the prefill
 and one scheduler quantum per token), about 0.1 s a request here. At width 2
 that buys little on Metal and costs throughput on the CPU, where a
 two-row step takes as long as two steps. The route is built for wider
-devices; it has not been measured on one.
+devices, which is why CUDA alone takes it by default; it has not been
+measured on one.
 
 Live transcription and dictation use the generic rolling-window route, the
 diarization pipeline uses the model as its transcription stage, and word

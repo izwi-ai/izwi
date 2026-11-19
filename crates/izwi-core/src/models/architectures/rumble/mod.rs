@@ -11,12 +11,14 @@
 //! also load; the audio tower, projector, front end, tokenizer, prompt and
 //! transcript handling are Rumble's own.
 //!
-//! Audio of up to 30 s runs as a retained row (`retained.rs`): its audio is
-//! encoded into a prompt artifact, the prompt prefills onto retained decoder
-//! pages, and it decodes beside other rows, one batched step per token.
-//! Longer audio is cut into chunks by the generic ASR route, each an atomic
-//! invocation on a lifecycle-owned paged KV lease; with
-//! `IZWI_RUMBLE_RETAINED_DECODE` off every request runs that way.
+//! On a load that offers the retained route, audio of up to 30 s runs as a
+//! retained row (`retained.rs`): its audio is encoded into a prompt
+//! artifact, the prompt prefills onto retained decoder pages, and it decodes
+//! beside other rows, one batched step per token. Longer audio is cut into
+//! chunks by the generic ASR route, each an atomic invocation on a
+//! lifecycle-owned paged KV lease; a load without the route runs every
+//! request that way. `IZWI_RUMBLE_RETAINED_DECODE` sets the route; unset,
+//! it is on for CUDA only.
 
 mod audio_tower;
 mod checkpoint;

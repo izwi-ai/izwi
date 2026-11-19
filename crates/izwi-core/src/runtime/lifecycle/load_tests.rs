@@ -433,19 +433,22 @@ async fn granite_speech5_load_publishes_retained_asr_state() {
 /// beside the atomic graph's invocation pages, and the bundle seals them:
 /// an ordinary or streaming requirement binds the retained sequence graph
 /// on the managed pages, a long-form one the atomic graph and its
-/// invocation state. With the retained route switched off
-/// (`IZWI_RUMBLE_RETAINED_DECODE`) it publishes invocation state only and
-/// every requirement binds the atomic graph.
+/// invocation state. With the retained route off
+/// (`IZWI_RUMBLE_RETAINED_DECODE`, the default on CPU and Metal) it
+/// publishes invocation state only and every requirement binds the atomic
+/// graph.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn rumble_load_publishes_retained_asr_state() {
+    // The runtime below is a CPU runtime.
+    let backend = BackendKind::Cpu;
     use crate::models::architectures::rumble::{
         rumble_retained_decode_enabled, rumble_test_physical_state_spec,
     };
     use crate::runtime::adapters::{
         LoadedModelBundleDraft, LoadedStatePublication, StreamingRequirements,
     };
-    let retained_route = rumble_retained_decode_enabled();
+    let retained_route = rumble_retained_decode_enabled(backend);
     // Serialize against OOM-ladder poison windows and load-transaction
     // reservations on the process-global resource authority.
     let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
@@ -482,11 +485,11 @@ async fn rumble_load_publishes_retained_asr_state() {
         ExecutionGroupId::new(994),
         instance,
         variant,
-        BackendKind::Cpu,
+        backend,
     )
     .unwrap();
     draft
-        .install_test_preparation_seals(BackendKind::Cpu, 2)
+        .install_test_preparation_seals(backend, 2)
         .unwrap();
     let publication = runtime
         .model_lifecycle
@@ -541,7 +544,7 @@ async fn rumble_load_publishes_retained_asr_state() {
         assert_eq!(binding.execution, contract.adapter_binding().unwrap());
         binding
             .state
-            .validate_against(BackendKind::Cpu, &binding.execution)
+            .validate_against(backend, &binding.execution)
             .unwrap();
         assert_eq!(binding.state.managed_kv_runtime().is_some(), sequence);
     }

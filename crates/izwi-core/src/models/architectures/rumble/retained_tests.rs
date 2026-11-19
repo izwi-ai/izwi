@@ -19,6 +19,8 @@ fn load(checkpoint: &SyntheticRumbleCheckpoint) -> RumbleAsrModel {
         DeviceProfile::cpu(),
     )
     .expect("synthetic Rumble loads")
+    // The route is off by default on CPU.
+    .with_retained_decode(true)
 }
 
 fn caches(model: &RumbleAsrModel, rows: usize) -> Vec<PhysicalPagedKvCache> {

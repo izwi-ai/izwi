@@ -103,6 +103,8 @@ fn model_dir() -> PathBuf {
 fn load(profile: DeviceProfile) -> RumbleAsrModel {
     RumbleAsrModel::load(&model_dir(), ModelVariant::Rumble2Flash, profile)
         .expect("the published Rumble-2-Flash checkpoint loads")
+        // The retained route is off by default on CPU and Metal.
+        .with_retained_decode(true)
 }
 
 fn cache(model: &RumbleAsrModel) -> PhysicalPagedKvCache {

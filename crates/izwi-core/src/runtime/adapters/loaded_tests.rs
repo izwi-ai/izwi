@@ -742,6 +742,10 @@ fn every_supported_model_capability_authors_an_exact_width_one_contract() {
                 assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
             } else if factory.id() == LoadedAdapterKind::FishS2Tts.factory_id()
                 || factory.id() == LoadedAdapterKind::FishDrama3Tts.factory_id()
+                || (factory.id() == LoadedAdapterKind::RumbleAsr.factory_id()
+                    && !crate::models::architectures::rumble::rumble_retained_decode_enabled(
+                        BackendKind::Cpu,
+                    ))
             {
                 // The factory implements native batching, but an unqualified
                 // scalar load must publish the scalar graph truthfully.
@@ -3081,19 +3085,20 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
 /// retained sequence graph: scalar encoder preparation at any engine width,
 /// scalar exact prefill, and continuous decode priced per row. A long-form
 /// requirement binds the atomic stage, which chunks long audio inside its
-/// dispatch; with the retained route switched off it is the only graph. The
-/// model authors state for both graphs.
+/// dispatch; with the retained route off (the default on CPU and Metal) it
+/// is the only graph. The model authors state for both graphs.
 #[test]
 fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
     use crate::models::architectures::rumble::{
         rumble_retained_decode_enabled, rumble_test_physical_state_spec,
     };
-    let retained_route = rumble_retained_decode_enabled();
     for (backend, rows) in [
         (BackendKind::Cpu, 1),
         (BackendKind::Metal, 1),
         (BackendKind::Cuda, 4),
     ] {
+        // On by default on CUDA only.
+        let retained_route = rumble_retained_decode_enabled(backend);
         let draft = LoadedModelBundleDraft::build(
             &RuntimeAdapterRegistry::built_in_with_execution_limits(rows, 1).unwrap(),
             ExecutionGroupId::new(7),
@@ -3120,6 +3125,12 @@ fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
         ] {
             let normal = adapter.contract(streaming).unwrap();
             if !retained_route {
+                // The atomic graph, as the same transport's long-form
+                // requirement binds it.
+                let long = adapter
+                    .contract(streaming.with_asr_long_form(true))
+                    .unwrap();
+                assert_eq!(normal.execution_profile.mode, ExecutionMode::Atomic);
                 assert_eq!(
                     crate::kv::v2::stage_graph_fingerprint(&normal.stages).unwrap(),
                     crate::kv::v2::stage_graph_fingerprint(&long.stages).unwrap(),

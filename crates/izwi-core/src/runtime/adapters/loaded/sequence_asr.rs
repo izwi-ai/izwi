@@ -690,8 +690,8 @@ pub(super) struct RumbleAsrExecutionSeal {
 /// Rumble's ASR graphs: a retained sequence graph (scalar encoder
 /// preparation, scalar exact prefill, continuous decode) for audio of up to
 /// 30 s, and the chunked atomic graph for longer audio. With the retained
-/// route off (`IZWI_RUMBLE_RETAINED_DECODE`) the atomic graph is the only
-/// graph and the load fits no retained state.
+/// route off (`IZWI_RUMBLE_RETAINED_DECODE`, the default on CPU and Metal)
+/// the atomic graph is the only graph and the load fits no retained state.
 #[derive(Debug)]
 pub(super) struct RumbleAsrExecutionAdapter {
     pub(super) execution_group_id: ExecutionGroupId,
@@ -725,8 +725,9 @@ impl RumbleAsrExecutionAdapter {
             backend_kind,
             max_batch_size: max_batch_size.max(1),
             decode_batch_size: max_batch_size.max(1),
-            retained_route:
-                crate::models::architectures::rumble::rumble_retained_decode_enabled(),
+            retained_route: crate::models::architectures::rumble::rumble_retained_decode_enabled(
+                backend_kind,
+            ),
             seal: OnceLock::new(),
         }
     }

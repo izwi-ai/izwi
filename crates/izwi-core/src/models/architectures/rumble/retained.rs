@@ -28,17 +28,26 @@ use super::transcript::split_rumble_output;
 
 static NEXT_DECODE_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The retained route's switch for Rumble (on by default).
+/// The retained route's switch for Rumble (on by default on CUDA only).
 pub(crate) const RUMBLE_RETAINED_DECODE_ENV: &str = "IZWI_RUMBLE_RETAINED_DECODE";
 
-/// Whether a Rumble load offers the retained sequence route. Off, every
-/// request runs as atomic invocations and the load fits no retained decoder
-/// state. Read once per process: the loaded adapter and the model it seals
-/// both take it, so their routes agree.
-pub(crate) fn rumble_retained_decode_enabled() -> bool {
-    static ENABLED: crate::env::ReadOnce<bool> =
-        crate::env::ReadOnce::new(|| crate::env::flag_or(RUMBLE_RETAINED_DECODE_ENV, true));
-    ENABLED.get()
+/// Whether a Rumble load on `backend` offers the retained sequence route.
+/// Off, every request runs as atomic invocations and the load fits no
+/// retained decoder state.
+///
+/// The route pays about 0.1 s a request for its extra dispatches and earns
+/// it back by decoding concurrent rows in one step, so it is on by default
+/// where rows batch wide (CUDA) and off on CPU and Metal, whose automatic
+/// width is a few rows: there a single request is slower on it, and on CPU
+/// so is a concurrent load. The switch overrides the default on every
+/// backend. It is read once per process: the loaded adapter and the model
+/// it seals both ask with the load's backend, so their routes agree.
+pub(crate) fn rumble_retained_decode_enabled(backend: BackendKind) -> bool {
+    static CONFIGURED: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag(RUMBLE_RETAINED_DECODE_ENV));
+    CONFIGURED
+        .get()
+        .unwrap_or(matches!(backend, BackendKind::Cuda))
 }
 
 /// A request's prompt with its audio spliced in, ready to prefill.
@@ -433,7 +442,7 @@ fn to_u64(value: usize, what: &str) -> Result<u64> {
 
 impl RumbleAsrModel {
     /// Whether a request of up to 30 s resumes prefill on the retained route
-    /// ([`rumble_retained_decode_enabled`], read at load).
+    /// ([`rumble_retained_decode_enabled`] for the load's backend).
     pub(crate) fn supports_resumable_prefill(&self) -> bool {
         self.retained_decode()
     }

@@ -823,13 +823,10 @@ impl LoadedExecutionAdapterFactory for RumblePhysicalAsrAdapterFactory {
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
-        // Continuous decode batching lives on the retained sequence graph,
-        // which the adapter offers only with its retained route.
-        if crate::models::architectures::rumble::rumble_retained_decode_enabled() {
-            NativeBatchMode::Continuous
-        } else {
-            NativeBatchMode::None
-        }
+        // Continuous decode batching lives on the retained sequence graph.
+        // A load whose backend leaves the retained route off publishes the
+        // atomic graph alone.
+        NativeBatchMode::Continuous
     }
 
     fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {

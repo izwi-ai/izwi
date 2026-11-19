@@ -230,6 +230,7 @@ impl RumbleAsrModel {
             text_precision.loaded,
             text_precision.reason
         );
+        let retained_decode = super::retained::rumble_retained_decode_enabled(device.kind.into());
         Ok(Self {
             model_identity: NEXT_MODEL_IDENTITY.fetch_add(1, Ordering::Relaxed),
             model_dir: model_dir.to_path_buf(),
@@ -241,13 +242,21 @@ impl RumbleAsrModel {
             text_model,
             audio_precision,
             text_precision,
-            retained_decode: super::retained::rumble_retained_decode_enabled(),
+            retained_decode,
         })
     }
 
     /// Whether this load offers the retained sequence route.
     pub(crate) fn retained_decode(&self) -> bool {
         self.retained_decode
+    }
+
+    /// This load with the retained route forced on or off, whatever its
+    /// backend's default.
+    #[cfg(test)]
+    pub(crate) fn with_retained_decode(mut self, retained_decode: bool) -> Self {
+        self.retained_decode = retained_decode;
+        self
     }
 
     pub fn config(&self) -> &RumbleConfig {
