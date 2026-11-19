@@ -1286,8 +1286,8 @@ impl Audio8FastMlp {
 
 static AUDIO8_RESIDENT_FAST_FRAMES: AtomicU64 = AtomicU64::new(0);
 
-/// Process-wide count of Fish fast-codebook frames sampled on the device
-/// with a single code readback (FSH-4).
+/// Process-wide count of fast-codebook frames sampled on the device
+/// with a single code readback.
 pub fn audio8_resident_fast_frames() -> u64 {
     AUDIO8_RESIDENT_FAST_FRAMES.load(Ordering::Relaxed)
 }
@@ -1486,7 +1486,7 @@ mod tests {
         Audio8FastDecoder::load(cfg, vb).unwrap()
     }
 
-    /// FSH-4: a device-resident frame reads its fast codes back once (the
+    /// A device-resident frame reads its fast codes back once (the
     /// host sampler reads every code: num_codebooks - 1 per frame) and, when
     /// greedy, picks exactly the host's codes. Batched resident rows match
     /// scalar resident rows, and a non-finite logit fails the frame.

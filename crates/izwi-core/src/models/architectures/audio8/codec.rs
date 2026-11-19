@@ -1,7 +1,7 @@
 //! Audio8 codec artifact boundary.
 //!
-//! The public S2 Pro checkpoint ships `codec.pth` as a PyTorch state dict. This
-//! module owns the Fish-specific state-dict normalization before the actual DAC
+//! The published checkpoint ships `codec.pth` as a PyTorch state dict. This
+//! module owns the state-dict normalization before the actual DAC
 //! encoder/decoder modules consume ordinary Candle tensors.
 
 use std::collections::{BTreeMap, HashMap};

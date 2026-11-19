@@ -80,8 +80,8 @@ impl Audio8ServingCapacity {
         // kernels (`paged_prefill` on every backend), which keep online-softmax
         // state per query and head, never a query-by-context score matrix, so
         // a token costs its query, output and partial vectors whatever the
-        // context (FSH-6: pricing full-context scores per token resolved the
-        // prefill chunk to 29 tokens). Bound aggregate prefill tokens, not just
+        // context (pricing full-context scores per token would resolve the
+        // prefill chunk to a few dozen tokens). Bound aggregate prefill tokens, not just
         // rows.
         let hidden_buffers = slow
             .hidden_size
@@ -135,7 +135,7 @@ impl Audio8ServingCapacity {
             .ok_or_else(|| {
                 Error::ModelLoadError("Audio8 codec packing workspace overflow".into())
             })?;
-        // One request's retained slow KV at the loaded precision (FSH-2).
+        // One request's retained slow KV at the loaded precision.
         let slow_bytes = checked_product(&[
             2,
             kv_element_bytes.max(1),
@@ -164,7 +164,7 @@ impl Audio8ServingCapacity {
             .ok_or_else(|| Error::ModelLoadError("Audio8 serving row budget overflow".into()))?;
         // Reference preparation for the longest reference a request may
         // carry (the 30 s reference limit, at the highest accepted rate), not
-        // the codec's 4,096-frame ceiling (FSH-2: 2 x 39 GB).
+        // the codec's 4,096-frame ceiling.
         let reference_rate =
             crate::models::architectures::audio8::Audio8DacConfig::MAX_REFERENCE_SAMPLE_RATE;
         let reference_samples =
@@ -309,10 +309,9 @@ mod tests {
         assert!(capacity.prefill_tokens < model.config().max_seq_len as u64);
     }
 
-    /// FSH-6: pricing a full-context score matrix per prompt token resolved
-    /// the slow-stack prefill chunk to 29 tokens, so a prompt took about 25
-    /// full passes. Priced as the paged kernels run, a typical prompt
-    /// prefills in a pass or two, and the chunk still fits the row's
+    /// The prefill chunk is priced as the paged kernels run (per-query
+    /// partial state, never a query-by-context score matrix), so a typical
+    /// prompt prefills in a pass or two and the chunk still fits the row's
     /// workspace.
     #[test]
     fn prefill_chunk_follows_the_paged_kernel_working_set() {
@@ -336,12 +335,10 @@ mod tests {
         );
     }
 
-    /// FSH-2: rows were priced at F32 over the native 32,768-token context,
-    /// twice (19.3 GB of slow KV a row), beside 78 GB of preparation for a
-    /// 4,096-frame reference, so even an H100 sealed one Fish row. Priced at
-    /// the loaded BF16 over one request's tokens (counted once) and the
-    /// 30 s reference limit, an H100's headroom seals several rows. The
-    /// per-row codec and AR workspaces (four of each) now dominate a row.
+    /// A row is priced at the loaded precision over one request's tokens
+    /// (the model's 2,048 positions, counted once) and the 30 s reference
+    /// limit, so an H100's headroom seals several rows. The per-row codec
+    /// and AR workspaces (four of each) dominate a row.
     #[test]
     fn rows_are_priced_from_one_request_at_the_loaded_precision() {
         let model = Audio8TtsModel::for_test();
@@ -362,7 +359,7 @@ mod tests {
             .unwrap()
             .active_rows
         };
-        // H100 headroom after about 10 GB of BF16 weights.
+        // H100 headroom after the weights.
         let h100 = rows(68, 2);
         assert!(h100 >= 4, "H100: {h100} rows");
         // An F32 fallback prices twice the KV, never more rows.

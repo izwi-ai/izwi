@@ -1,5 +1,5 @@
-//! Fish Speech sampling policy. Keep this separate from chat-model sampling:
-//! upstream filters cumulative probabilities before temperature, and excludes
+//! Audio8 sampling policy. Keep this separate from chat-model sampling:
+//! the reference filters cumulative probabilities before temperature, and excludes
 //! the token that crosses top-p (except that rank zero always survives).
 
 use candle_core::{DType, IndexOp, Tensor};
@@ -107,7 +107,7 @@ impl Audio8Sampler {
     }
 }
 
-/// Audio8's policy on the logits' device (upstream `logits_to_probs`): top-p
+/// Audio8's policy on the logits' device (the reference's `ArkttsLegacyTopKTopPLogitsProcessor`): top-p
 /// over the raw softmax of the whole row, dropping candidates whose
 /// cumulative probability exceeds `top_p` except rank 0, then top-k, then
 /// temperature. Returns the tempered logits of the `top_k` highest
@@ -146,7 +146,7 @@ pub(crate) fn resident_filtered_candidates(
     Ok(Some((masked, indices)))
 }
 
-/// One device-resident Fish draw for `row`: the token as a `[1]` U32 tensor
+/// One device-resident draw for `row`: the token as a `[1]` U32 tensor
 /// and the row's count of non-finite logits as a `[1]` U32 tensor, both left
 /// on the device for the caller to read back once per frame. `noise_row` is
 /// this token's Gumbel noise (`None` when greedy).
@@ -702,7 +702,7 @@ mod tests {
         .is_none());
     }
 
-    /// FSH-4: the device filter keeps exactly the host policy's support
+    /// The device filter keeps exactly the host policy's support
     /// (top-p over the whole row's raw softmax, rank 0 always, then top-k)
     /// with the same tempered probabilities.
     #[test]
@@ -750,7 +750,7 @@ mod tests {
         }
     }
 
-    /// FSH-4: the production device path (Metal) keeps the CPU filter's
+    /// The production device path (Metal) keeps the CPU filter's
     /// support and probabilities, and greedy draws agree.
     #[cfg(feature = "metal")]
     #[test]
@@ -793,7 +793,7 @@ mod tests {
         }
     }
 
-    /// FSH-4: Gumbel-max over the filtered candidates draws tokens at the
+    /// Gumbel-max over the filtered candidates draws tokens at the
     /// host policy's probabilities, and greedy picks the top logit.
     #[test]
     fn resident_draws_follow_the_host_distribution() {
@@ -909,14 +909,14 @@ mod tests {
     }
 
     #[test]
-    fn upstream_nucleus_excludes_crossing_token_before_temperature() {
+    fn nucleus_excludes_crossing_token_before_temperature() {
         let values = distribution(&[0.45, 0.30, 0.15, 0.10]);
         let probabilities = values.probabilities(0.5, 0.8, 30).unwrap();
         assert_eq!(
             probabilities.iter().map(|item| item.0).collect::<Vec<_>>(),
             [0, 1]
         );
-        // Frozen probability ratio from upstream logits_to_probs: .45^2/.30^2.
+        // Frozen probability ratio of the reference filter: .45^2/.30^2.
         assert!((probabilities[0].1 - 0.6923077).abs() < 1e-6);
         assert!((probabilities[1].1 - 0.3076923).abs() < 1e-6);
         let sharp = distribution(&[0.7, 0.2, 0.1]);
@@ -924,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_keeps_exact_boundary_and_top_one_intersects_top_k() {
+    fn nucleus_keeps_exact_boundary_and_top_one_intersects_top_k() {
         let values = Audio8SamplingDistribution::from_values(&[0.0; 4], None).unwrap();
         assert_eq!(
             values.probabilities(0.8, 0.5, 30).unwrap(),

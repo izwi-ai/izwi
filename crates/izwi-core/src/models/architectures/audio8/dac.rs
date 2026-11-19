@@ -14,7 +14,6 @@ use crate::models::architectures::audio8::config::Audio8CodecPostConfig;
 use crate::models::architectures::audio8::contracts::Audio8DacContract;
 use crate::models::architectures::audio8::rotary::Audio8RotaryCache;
 use crate::models::architectures::audio8::tokenizer::Audio8VqCodes;
-use crate::models::architectures::qwen3::core::repeat_kv;
 
 #[path = "dac_streaming.rs"]
 mod streaming;
@@ -1323,7 +1322,7 @@ impl Audio8DacAttention {
         let q = self.rotary.apply(&q, 0)?.transpose(1, 2)?;
         let k = self.rotary.apply(&k, 0)?.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        // The shared GQA helper consumes [B,T,H,D], unlike codec attention.
+        // `repeat_kv` consumes [B,T,H,D], unlike codec attention.
         let k =
             repeat_kv(&k.transpose(1, 2)?, self.num_heads, self.num_kv_heads)?.transpose(1, 2)?;
         let v =
@@ -1567,6 +1566,28 @@ fn load_conv_transpose1d_weight(
     Ok(ConvTranspose1d::new(weight, bias, cfg))
 }
 
+/// Repeats each of the `num_kv_heads` heads of `x` (`[B, T, kv, D]`)
+/// `num_heads / num_kv_heads` times in place, so query head `h` reads KV head
+/// `h / (num_heads / num_kv_heads)`, as `repeat_interleave` does in the
+/// published codec. Its post module shares 8 KV heads among 16 heads; the
+/// encoder's and the pre module's transformers have as many KV heads as
+/// heads, where this is the identity.
+fn repeat_kv(x: &Tensor, num_heads: usize, num_kv_heads: usize) -> Result<Tensor> {
+    if num_heads == num_kv_heads {
+        return Ok(x.clone());
+    }
+    if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
+        return Err(Error::InvalidInput(format!(
+            "Audio8 codec attention cannot share {num_kv_heads} KV heads among {num_heads} heads"
+        )));
+    }
+    let (batch, seq_len, kv_heads, head_dim) = x.dims4()?;
+    x.unsqueeze(3)?
+        .expand((batch, seq_len, kv_heads, num_heads / num_kv_heads, head_dim))?
+        .reshape((batch, seq_len, num_heads, head_dim))
+        .map_err(Error::from)
+}
+
 fn windowed_attention(
     q: &Tensor,
     k: &Tensor,
@@ -1627,6 +1648,25 @@ pub(super) fn tiny_for_batch_tests() -> Audio8DacDecoder {
 
 #[cfg(test)]
 mod tests {
+    /// Query head `h` reads KV head `h / repeats`: the published codec's
+    /// `repeat_interleave`, which its post module (16 heads over 8) needs.
+    #[test]
+    fn repeat_kv_interleaves_each_kv_head() {
+        let device = candle_core::Device::Cpu;
+        // [B=1, T=2, kv=2, D=1]: head k at time t holds 10 * t + k.
+        let x = Tensor::from_vec(vec![0f32, 1.0, 10.0, 11.0], (1, 2, 2, 1), &device).unwrap();
+        let repeated = super::repeat_kv(&x, 6, 2).unwrap();
+        assert_eq!(repeated.dims(), [1, 2, 6, 1]);
+        assert_eq!(
+            repeated.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0, 11.0, 11.0, 11.0]
+        );
+        let same = super::repeat_kv(&x, 2, 2).unwrap();
+        assert_eq!(same.dims(), x.dims());
+        assert!(super::repeat_kv(&x, 5, 2).is_err());
+        assert!(super::repeat_kv(&x, 4, 0).is_err());
+    }
+
     use super::*;
     use candle_core::{Device, Shape};
     use std::collections::HashMap;

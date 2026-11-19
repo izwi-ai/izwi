@@ -48,7 +48,7 @@ pub struct Audio8VqCodes {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Audio8ConditioningPrompt {
-    /// Upstream prompt tensor values shaped `[num_codebooks + 1][seq_len]`.
+    /// The reference's prompt tensor values, shaped `[num_codebooks + 1][seq_len]`.
     pub values: Vec<Vec<u32>>,
     pub vq_mask: Vec<bool>,
     pub prompt_length: usize,

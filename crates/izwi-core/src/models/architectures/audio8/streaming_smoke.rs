@@ -190,5 +190,5 @@ async fn audio8_real_runtime_streaming_emits_pcm_before_completion() -> Result<(
 
 fn required(name: &str) -> Result<String> {
     env::var(name)
-        .map_err(|_| Error::InvalidInput(format!("Set {name} for Fish streaming qualification")))
+        .map_err(|_| Error::InvalidInput(format!("Set {name} for Audio8 streaming qualification")))
 }

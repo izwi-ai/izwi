@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn synthetic_accelerator_profile_is_rejected_before_reading_artifacts() {
-        let directory = std::env::temp_dir().join("fish-s2-artifacts-must-not-be-read");
+        let directory = std::env::temp_dir().join("audio8-artifacts-must-not-be-read");
         let error =
             match Audio8Weights::load(&directory, synthetic_cuda_profile(Some((8, 0))), None) {
                 Ok(_) => panic!("CPU storage must not pass CUDA preflight"),

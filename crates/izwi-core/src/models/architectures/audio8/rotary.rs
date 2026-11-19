@@ -133,8 +133,9 @@ mod tests {
     use super::*;
 
     // Frozen with the published PyTorch precompute_freqs_cis/apply_rotary_emb,
-    // fishaudio/fish-speech befe4001745417f8c42131739d862b8a6fdbd15a,
-    // fish_speech/models/text2semantic/llama.py:1004-1038. Input [1,2,3,4],
+    // The same adjacent-pair rotation as `_apply_rope` in modeling_arktts.py.
+    // Oracle values frozen from fish-speech befe4001 (llama.py:1004-1038),
+    // whose rotation the reference reuses. Input [1,2,3,4],
     // base 1e6, BF16 frequency table, F32 rotation. These fixtures distinguish
     // adjacent pairs from split halves and table rounding from full precision.
     #[allow(clippy::excessive_precision)]

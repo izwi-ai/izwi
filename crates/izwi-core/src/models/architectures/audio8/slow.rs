@@ -154,7 +154,7 @@ impl Audio8SlowTransformer {
         })
     }
 
-    /// Gather the only output rows Fish samples: EOS followed by the semantic
+    /// Gather the only output rows sampling reads: EOS followed by the semantic
     /// vocabulary. Input embeddings remain the complete checkpoint matrix.
     pub(crate) fn configure_semantic_head(&mut self, eos: u32) -> Result<()> {
         if eos as usize >= self.cfg.vocab_size

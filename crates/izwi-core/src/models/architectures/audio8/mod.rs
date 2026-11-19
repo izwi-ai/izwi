@@ -1,4 +1,19 @@
-//! Audio8 TTS Realistic Air TTS architecture boundary.
+//! Audio8 TTS (`Edge0/Audio8-TTS-Realistic-Air`): a DualAR model with a
+//! 44.1 kHz codec.
+//!
+//! A slow transformer emits one semantic token per codec frame and a fast
+//! transformer the frame's ten codebooks; the codec turns frames into audio
+//! and a reference clip into frames. With a reference clip and its
+//! transcript the model speaks in that voice; with none it speaks in a voice
+//! of its own, which the request's seed makes repeatable.
+//!
+//! The family is its own: its model code started as a copy of the Fish S2
+//! family's, whose design the checkpoint follows, and changes wherever the
+//! checkpoint does (see `docs/dev/audio8.md`). Sharing code with that
+//! family would let a change for one silently alter the other, so nothing
+//! here imports another family: it may use `kernels`, `models::shared`,
+//! `kv`, `backends`, `engine` and `audio`. The isolation test at the bottom
+//! of this file holds that line.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -109,7 +124,7 @@ pub struct Audio8GenerationParams {
     pub top_k: usize,
     /// Reproducible Rust sampling seed; fast-codebook sampling uses seed + 1.
     pub seed: u64,
-    /// Retry recent semantic repeats using the upstream high-temperature policy.
+    /// Retry recent semantic repeats using the reference's high-temperature policy.
     /// A zero temperature remains greedy and bypasses this retry.
     pub repetition_aware: bool,
 }
@@ -134,7 +149,7 @@ pub struct Audio8TtsDiagnostics {
     pub semantic_end_token_id: u32,
     pub max_seq_len: usize,
     pub codec_support: &'static str,
-    /// The slow/fast transformers' load precision and self-check (FSH-11);
+    /// The slow/fast transformers' load precision and self-check;
     /// `None` without the native runtime.
     pub precision: Option<serde_json::Value>,
     /// The fast AR's CUDA frame graphs: why they are off, or their captures,
@@ -359,7 +374,7 @@ impl Audio8TtsModel {
 /// Slow-stack positions the load-time self-check runs.
 const AUDIO8_PROBE_TOKENS: usize = 16;
 
-/// The load-time self-check (report 13, FSH-11): see
+/// The load-time self-check : see
 /// [`audio8_numeric_probe`]. Every probed tensor must be finite and below
 /// the F16-safe range.
 fn audio8_numeric_self_check(
@@ -455,7 +470,7 @@ impl Audio8NativeRuntime {
         };
         let eos = tokenizer.specials().eos;
         // On Metal a dtype below F32 must keep the trunk's activations finite
-        // and in range (FSH-11: norm gains reach 48), or the slow and fast
+        // and in range (norm gains can be large), or the slow and fast
         // transformers reload in F32.
         let ((slow, mut fast, device), precision) = load_with_precision_fallback(
             "Audio8",
@@ -754,7 +769,7 @@ impl Audio8SemanticSampler {
     ) -> Result<u32> {
         let normal = self.sampler.sample(distribution)?;
         if self.repetition_aware && self.sampler.temperature > 0.0 {
-            // Upstream draws both policies each frame, then chooses the retry
+            // The reference draws both policies each frame, then chooses the retry
             // only when a semantic token repeats in the last ten frames. RNG
             // algorithms differ from Torch; this records and replays the
             // native Rust policy.
@@ -1174,7 +1189,7 @@ mod precision_tests {
         (slow, fast)
     }
 
-    /// FSH-11: the probe runs every slow layer and the semantic head, then a
+    /// The probe runs every slow layer and the semantic head, then a
     /// fast frame; on a healthy tiny model it passes in F16 and tracks F32.
     #[test]
     fn audio8_probe_passes_in_f16_and_tracks_f32() {
@@ -1204,7 +1219,7 @@ mod precision_tests {
         }
     }
 
-    /// FSH-11: when large norm gains push F16 activations out of range, the
+    /// When large norm gains push F16 activations out of range, the
     /// self-check fails and the transformers reload in F32; healthy gains
     /// keep F16.
     #[test]
@@ -1229,7 +1244,7 @@ mod precision_tests {
         }
     }
 
-    /// FSH-11: the probe runs on Metal in F16 and passes on the healthy
+    /// The probe runs on Metal in F16 and passes on the healthy
     /// tiny model, tracking CPU F32.
     #[cfg(feature = "metal")]
     #[test]
@@ -1338,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_frame_prompt_has_upstream_codebook_shape() {
+    fn generated_frame_prompt_has_the_reference_codebook_shape() {
         let frame = Audio8GeneratedFrame {
             semantic_token_id: 42,
             codebooks: vec![4, 5, 6],
@@ -1347,5 +1362,69 @@ mod tests {
         assert_eq!(prompt.prompt_length, 1);
         assert_eq!(prompt.vq_mask, vec![true]);
         assert_eq!(prompt.values, vec![vec![42], vec![4], vec![5], vec![6]]);
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use std::path::{Path, PathBuf};
+
+    /// No source file of the family names another architecture, by an
+    /// absolute path or a relative one.
+    #[test]
+    fn the_family_imports_no_other_architecture() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/models/architectures/audio8");
+        fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        assert!(files.len() >= 10);
+        // Every sibling family, so a relative `super::super::<family>::`
+        // path is caught as well.
+        let others = std::fs::read_dir(root.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter_map(|path| Some(path.file_stem()?.to_str()?.to_string()))
+            .filter(|name| name != "mod" && name != "audio8")
+            .collect::<Vec<_>>();
+        assert!(others.iter().any(|name| name == "fish_s2"));
+        let needle = concat!("architectures", "::");
+        let own = concat!("architectures", "::", "audio8");
+        for file in files {
+            let source = std::fs::read_to_string(&file).unwrap();
+            for (offset, _) in source.match_indices(needle) {
+                assert!(
+                    source[offset..].starts_with(own),
+                    "{} names another architecture at byte {offset}",
+                    file.display()
+                );
+            }
+            // `super::super::` would climb into `architectures` itself.
+            assert!(
+                !source.contains(concat!("super::super::super::", "architectures")),
+                "{}",
+                file.display()
+            );
+            for other in &others {
+                let path = format!("{other}::");
+                for (offset, _) in source.match_indices(&path) {
+                    let before = source[..offset].chars().next_back();
+                    assert!(
+                        before.is_some_and(|c| c.is_alphanumeric() || c == '_'),
+                        "{} names the {other} family at byte {offset}",
+                        file.display()
+                    );
+                }
+            }
+        }
     }
 }
