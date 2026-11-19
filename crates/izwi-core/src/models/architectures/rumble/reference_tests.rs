@@ -8,6 +8,10 @@
 //!   table, and the default prompt against those ids.
 //! * `rumble_transcribes_the_sample_clip_*` needs only the checkpoint and
 //!   the repository's `data/fox.wav`: a loose end-to-end check.
+//! * `the_retained_route_matches_the_atomic_route_*` needs the same: on the
+//!   sample clip, with and without a forced language and style, a retained
+//!   row (prefilled in spans, decoded alone or in a batch with the others)
+//!   must emit the atomic route's text, language and token count.
 //! * `rumble_matches_the_f32_reference_*` compares against transformers
 //!   (`scripts/fixtures/generate_rumble_reference.py`). It also needs the
 //!   fixture at `tests/fixtures/rumble/reference.json` and the 16 kHz audio
@@ -102,6 +106,11 @@ fn load(profile: DeviceProfile) -> RumbleAsrModel {
 }
 
 fn cache(model: &RumbleAsrModel) -> PhysicalPagedKvCache {
+    caches(model, 1).pop().expect("one cache")
+}
+
+/// `rows` caches on one pool, as rows that decode in one batch hold.
+fn caches(model: &RumbleAsrModel, rows: usize) -> Vec<PhysicalPagedKvCache> {
     let text = &model.config().text_config;
     test_physical_caches_with_dtype_on(
         &model.device().device,
@@ -110,10 +119,8 @@ fn cache(model: &RumbleAsrModel) -> PhysicalPagedKvCache {
         text.num_key_value_heads,
         model.config().decoder_head_dim(),
         model.sequence_tokens(),
-        1,
+        rows,
     )
-    .pop()
-    .expect("one cache")
 }
 
 fn sampled_error(actual: &[f32], sample: &FixtureSample, label: &str) -> f32 {
@@ -269,6 +276,176 @@ fn rumble_transcribes_the_sample_clip_on_metal() {
         return;
     }
     transcribe_sample(profile);
+}
+
+/// Each request below runs atomically, then as a retained row decoded
+/// alone, then as one row of a batch of all of them.
+fn compare_retained_with_atomic(profile: DeviceProfile) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav");
+    let (samples, rate) = decode_audio_bytes(&std::fs::read(path).unwrap()).unwrap();
+    let model = load(profile);
+    let requests = [
+        RumbleRequestOptions::default(),
+        RumbleRequestOptions {
+            language: Some("English".into()),
+            ..RumbleRequestOptions::default()
+        },
+        RumbleRequestOptions {
+            language: Some("English".into()),
+            style: RumbleTranscriptStyle {
+                digits: false,
+                fillers: true,
+                verbatim: false,
+            },
+            ..RumbleRequestOptions::default()
+        },
+        // A shorter clip, so the batch's rows finish at different steps.
+        RumbleRequestOptions {
+            prompt: Some("fox, dog".into()),
+            ..RumbleRequestOptions::default()
+        },
+    ];
+    let audio = |index: usize| -> &[f32] {
+        if index == 3 {
+            &samples[..samples.len() / 2]
+        } else {
+            &samples
+        }
+    };
+    let begin = |index: usize, cache: PhysicalPagedKvCache| {
+        let artifact = model
+            .prepare_prompt_artifact(audio(index), rate, &requests[index])
+            .unwrap();
+        let mut state = model
+            .begin_resumable_prefill_managed(artifact, RumbleGenerationOptions::default(), cache)
+            .unwrap();
+        // Prefill in spans, as the scheduler resumes it.
+        let total = state.prefill_token_count();
+        let mut start = 0;
+        while start < total {
+            let end = (start + 48).min(total);
+            model
+                .continue_resumable_prefill(&mut state, start, end)
+                .unwrap();
+            let _ = state.take_managed_write_completions();
+            start = end;
+        }
+        state
+    };
+    let mut atomic = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        let mut cache = cache(&model);
+        let transcription = model
+            .transcribe_physical(
+                audio(index),
+                rate,
+                request,
+                RumbleGenerationOptions::default(),
+                &mut cache,
+                None,
+            )
+            .unwrap();
+        let generated = transcription.diagnostics.as_ref().unwrap()["generated_tokens"]
+            .as_u64()
+            .unwrap() as usize;
+        eprintln!(
+            "atomic {index}: {:?} {:?} ({generated} tokens)",
+            transcription.language, transcription.text
+        );
+        assert!(!transcription.text.is_empty(), "request {index}");
+        atomic.push((transcription.text, transcription.language, generated));
+    }
+
+    let mut alone_ids = Vec::new();
+    for (index, (text, language, generated)) in atomic.iter().enumerate() {
+        let mut state = begin(index, cache(&model));
+        let decoded = loop {
+            let step = model.decode_step(&mut state).unwrap();
+            let _ = state.take_managed_write_completions();
+            if step.finished {
+                break step.text;
+            }
+        };
+        assert_eq!(&decoded, text, "alone, request {index}");
+        assert_eq!(state.language(), language.as_deref(), "request {index}");
+        assert_eq!(state.generated_ids().len(), *generated, "request {index}");
+        alone_ids.push(state.generated_ids().to_vec());
+    }
+
+    let mut states = caches(&model, requests.len())
+        .into_iter()
+        .enumerate()
+        .map(|(index, cache)| begin(index, cache))
+        .collect::<Vec<_>>();
+    let mut texts = vec![None; states.len()];
+    let mut widths = Vec::new();
+    loop {
+        let mut live = states
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, state)| !state.finished())
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            break;
+        }
+        widths.push(live.len());
+        let indices = live.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        let mut rows = live
+            .iter_mut()
+            .map(|(_, state)| &mut **state)
+            .collect::<Vec<_>>();
+        let steps = model.decode_step_batch(&mut rows).unwrap();
+        for (index, step) in indices.into_iter().zip(steps) {
+            if step.finished {
+                texts[index] = Some(step.text);
+            }
+        }
+        for state in states.iter_mut() {
+            let _ = state.take_managed_write_completions();
+        }
+    }
+    eprintln!("batch widths: {widths:?}");
+    assert_eq!(widths[0], requests.len());
+    assert!(widths.iter().any(|width| *width < requests.len()));
+    for (index, (text, language, _)) in atomic.iter().enumerate() {
+        assert_eq!(
+            texts[index].as_deref(),
+            Some(text.as_str()),
+            "batched {index}"
+        );
+        assert_eq!(
+            states[index].language(),
+            language.as_deref(),
+            "batched {index}"
+        );
+        assert_eq!(
+            states[index].generated_ids(),
+            alone_ids[index],
+            "batched {index}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the Rumble-2-Flash checkpoint"]
+fn the_retained_route_matches_the_atomic_route_on_cpu() {
+    compare_retained_with_atomic(DeviceProfile::cpu());
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the Rumble-2-Flash checkpoint"]
+fn the_retained_route_matches_the_atomic_route_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "the_retained_route_matches_the_atomic_route_on_metal",
+    );
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, candle_core::Device::Metal(_)) {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    compare_retained_with_atomic(profile);
 }
 
 fn fixture() -> Fixture {

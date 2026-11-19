@@ -45,7 +45,8 @@ Metal and CUDA attention paths come with it.
 | `transcript.rs` | Splitting `language {Name}<asr_text>{text}` on token ids |
 | `precision.rs` | Per-device dtypes and their overrides |
 | `model.rs` | Load, one-invocation transcription, the published state |
-| `synthetic.rs`, `tests.rs` | A tiny checkpoint in the published layout and tests on it |
+| `retained.rs` | The retained row: prompt artifact, resumable prefill, single and batched decode steps |
+| `synthetic.rs`, `tests.rs`, `retained_tests.rs` | A tiny checkpoint in the published layout and tests on it |
 | `reference_tests.rs` | Ignored tests on the published checkpoint |
 
 ## Loading
@@ -116,19 +117,56 @@ name; other values pass through title-cased.
 
 ## Execution
 
-Every request runs as atomic invocations on a lifecycle-owned paged KV lease
-(`row(F::RumbleAsr, C::Asr, Loaded::Scalar, Invocation).chunked()`): encode,
-prefill the prompt in one pass, decode greedily one token a step. The lease
-holds 1,536 tokens: the prompt's markers and context (at most 256 tokens),
-one window of audio tokens (390) and the decode budget (512 by default; a
-larger request budget is narrowed to the room the prompt leaves).
+The ASR capability offers two graphs
+(`row(F::RumbleAsr, C::Asr, Loaded::RumbleAsr, RetainedAndInvocation).sequence().resumable().chunked()`).
+
+**Retained rows** take audio the chunk planner leaves whole (up to 28.5 s).
+Request preparation computes the log-mel on a host worker, then
+`RumbleEncoderBatcher` encodes the audio and splices it into the prompt on
+the device, one request at a time (`asr.encoder.rumble`, a scalar stage).
+The prompt prefills onto retained decoder pages in resumable spans
+(`asr.rumble.prefill.scalar`), and the row then decodes beside the other
+rows, one batched step per token (`asr.rumble.decode.tensor_continuous`).
+Each row claims its prompt plus its decode budget from a pool that holds one
+sequence per retained row and never less than one 1,536-token sequence. The
+budget is 512 tokens by default; any budget is narrowed to the room the
+sequence leaves after the prompt. A row decodes the same tokens alone and in
+a batch, and the same tokens as an atomic invocation.
+
+**Atomic invocations** take longer audio: each chunk is one invocation on a
+lifecycle-owned paged KV lease of 1,536 tokens (the prompt's markers and
+context, at most 256 tokens; one window of audio tokens, 390; and the decode
+budget), chunked inside the dispatch. An atomic invocation holds the device
+for its whole decode.
+
+`IZWI_RUMBLE_RETAINED_DECODE=false` turns the retained route off: every
+request then runs atomically and the load fits no retained decoder state.
+
+The decode width is the engine's rows on CPU and Metal and the default CUDA
+width; Rumble is not certified for the wider CUDA tier.
+
+Measured on an M1 Pro, where the engine's automatic width is 2, against the
+same build with the route off:
+
+| | Retained route | Atomic only |
+|---|---|---|
+| Metal, 9 concurrent requests (3.6 s, 12.4 s and 27.3 s clips) | 6.1 to 6.9 s | 7.5 s |
+| Metal, one 3.6 s clip | 0.35 s | 0.25 s |
+| Metal, one 27.3 s clip | 1.77 s | 1.63 s |
+| CPU, 8 concurrent requests | 25.9 s | 21.5 s |
+
+A retained row pays for its extra dispatches (the encoder job, the prefill
+and one scheduler quantum per token), about 0.1 s a request here. At width 2
+that buys little on Metal and costs throughput on the CPU, where a
+two-row step takes as long as two steps. The route is built for wider
+devices; it has not been measured on one.
 
 Live transcription and dictation use the generic rolling-window route, the
 diarization pipeline uses the model as its transcription stage, and word
 timestamps come from the forced aligner.
 
-Not implemented: retained rows with batched decode across requests (each
-invocation decodes alone, so concurrent requests take turns), CUDA decode
+Not implemented: a batched audio encoder across requests (the encoder takes
+about 30 ms a request on an M1 Pro, against 15 ms a decode step), CUDA decode
 graphs on the trunk, and the checkpoint's auxiliary CTC head, which izwi does
 not download.
 
@@ -148,11 +186,18 @@ census (`tests/fixtures/asr_residency/rumble_2_flash.json`):
 - Unit tests on the synthetic checkpoint: the loader and its census refusal,
   the prompt against the template, the output split, streaming, the decode
   loop's budget and cache bookkeeping, and that the audio conditions the
-  decode.
+  decode. For the retained route: it emits the atomic route's tokens when
+  prefilled in spans, a row decodes the same alone and in a batch, and
+  misuse is refused. The loaded adapter's graphs and the load's retained
+  state are tested per backend.
 - The tensor plan and the memory plan against the published header.
 - On the published checkpoint (`reference_tests.rs`, CPU): the special ids
   against the published added-token table, the default prompt, and a
-  transcript of `data/fox.wav` with a forced and a detected language.
+  transcript of `data/fox.wav` with a forced and a detected language. On
+  CPU and Metal: four requests (detected and forced language, a style, a
+  context prompt on a shorter clip) run atomically, as retained rows
+  prefilled in 48-token spans and decoded alone, and as one batch of four;
+  the text, language and tokens are the same each way.
 - Live, through a release server on CPU and on Metal (M1 Pro): download by
   the server's own downloader at the pin, load, and 13 requests with
   identical transcripts on both backends: forced and detected language, each
@@ -162,6 +207,12 @@ census (`tests/fixtures/asr_residency/rumble_2_flash.json`):
   requests, the realtime WebSocket, a diarization job with Rumble as the
   transcription stage, and the CLI. Real-time factor about 0.06 on Metal and
   0.2 on the CPU.
+- With the retained route, the same 13 requests returned the same
+  transcripts, languages and diagnostics on both backends as the atomic
+  route had. Under 8, 9 and 16 concurrent requests every transcript equalled
+  its solo run, and the engine's metrics showed two-row decode steps. On
+  Metal the realtime WebSocket, a transcription job with a style option and
+  a diarization job were rerun on the retained route.
 
 Not verified:
 
