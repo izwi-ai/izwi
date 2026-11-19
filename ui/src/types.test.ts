@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   VIEW_CONFIGS,
   getSpeakerProfilesForVariant,
+  isAudio8Variant,
   isFishDrama3Variant,
   isFishS2TtsVariant,
   isLfm25AudioVariant,
@@ -280,6 +281,32 @@ describe("Kokoro speakers", () => {
     );
     expect(ids).toHaveLength(41);
     expect(ids.filter((id) => /^[jz]/.test(id))).toEqual([]);
+  });
+});
+
+describe("Audio8 TTS Realistic Air", () => {
+  it("is recognized by its ids and aliases, and is no other family", () => {
+    for (const variant of [
+      "Audio8-TTS-Realistic-Air",
+      "Edge0/Audio8-TTS-Realistic-Air",
+      "Audio8 TTS Realistic Air",
+      "audio8",
+    ]) {
+      expect(isAudio8Variant(variant)).toBe(true);
+    }
+    expect(isAudio8Variant("FishAudio-S2-Pro")).toBe(false);
+    expect(isAudio8Variant("Audio8-TTS-Preview-0.6b")).toBe(false);
+    expect(isFishS2TtsVariant("Audio8-TTS-Realistic-Air")).toBe(false);
+    expect(isFishDrama3Variant("Audio8-TTS-Realistic-Air")).toBe(false);
+  });
+
+  it("clones voices and has no built-in speakers", () => {
+    const variant = "Audio8-TTS-Realistic-Air";
+    expect(VIEW_CONFIGS["voice-clone"].modelFilter(variant)).toBe(true);
+    expect(VIEW_CONFIGS["voice-design"].modelFilter(variant)).toBe(false);
+    expect(VIEW_CONFIGS.chat.modelFilter(variant)).toBe(false);
+    expect(VIEW_CONFIGS.transcription.modelFilter(variant)).toBe(false);
+    expect(getSpeakerProfilesForVariant(variant)).toEqual([]);
   });
 });
 
