@@ -1122,6 +1122,7 @@ impl NativeExecutor {
                             }
                         }
                     };
+                    let mut stream_diagnostics = None;
                     let text = match route {
                         PhysicalAsrRoute::Qwen3 => {
                             with_single_invocation_cache(request, scheduled, |cache| {
@@ -1178,9 +1179,9 @@ impl NativeExecutor {
                             })?
                         }
                         PhysicalAsrRoute::Rumble => {
-                            with_single_invocation_cache(request, scheduled, |cache| {
-                                model
-                                    .transcribe_rumble_physical(
+                            let details =
+                                with_single_invocation_cache(request, scheduled, |cache| {
+                                    model.transcribe_rumble_physical(
                                         samples,
                                         sample_rate,
                                         &rumble_request,
@@ -1188,8 +1189,11 @@ impl NativeExecutor {
                                         cache,
                                         Some(&mut emit),
                                     )
-                                    .map(|details| details.text)
-                            })?
+                                })?;
+                            // The stream's final event names the language
+                            // the model detected.
+                            stream_diagnostics = details.diagnostics;
+                            details.text
                         }
                         PhysicalAsrRoute::Whisper => with_whisper_invocation_state(
                             request,
@@ -1242,7 +1246,7 @@ impl NativeExecutor {
                         &request.id,
                         &mut sequence,
                     )?;
-                    return Ok(AsrTranscriptionStep::Complete(text, None));
+                    return Ok(AsrTranscriptionStep::Complete(text, stream_diagnostics));
                 }
             }
             let details = match route {
