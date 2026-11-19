@@ -6,6 +6,7 @@ Voxtral-4B-TTS-2603
 VibeVoice-1.5B
 FishAudio-S2-Pro
 FishAudio-Drama-3
+Audio8-TTS-Realistic-Air
 Chatterbox-500M
 Parakeet-TDT-0.6B-v3
 Whisper-Large-v3-Turbo

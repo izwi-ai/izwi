@@ -70,6 +70,13 @@ reference_audio = "../../data/fox.wav"
 reference_text_file = "../../data/fox.md"
 
 [[benchmarks]]
+name = "audio8-tts-cuda"
+command = "tts"
+model = "Audio8-TTS-Realistic-Air"
+iterations = 1
+text = "CUDA model evidence."
+
+[[benchmarks]]
 name = "fish-drama3-tts-cuda"
 command = "tts"
 model = "FishAudio-Drama-3"

@@ -362,7 +362,8 @@ pub enum Commands {
         /// Model to use. The default speaks with a built-in voice; voice-clone
         /// models (e.g. qwen3-tts-0.6b-base) need --reference-audio and
         /// --reference-text or --saved-voice-id. Chatterbox clones from
-        /// --reference-audio alone.
+        /// --reference-audio alone. Audio8-TTS-Realistic-Air and
+        /// FishAudio-Drama-3 also speak with no voice given.
         #[arg(short, long, default_value = "Kokoro-82M")]
         model: String,
 
@@ -414,8 +415,8 @@ pub enum Commands {
         script: Option<PathBuf>,
 
         /// Sampling seed: the same seed and inputs give the same audio. A
-        /// speaker without a reference speaks in a voice it sets (Fish Audio
-        /// Drama 3)
+        /// speaker without a reference speaks in a voice it sets (Audio8,
+        /// Fish Audio Drama 3)
         #[arg(long)]
         seed: Option<u64>,
 
