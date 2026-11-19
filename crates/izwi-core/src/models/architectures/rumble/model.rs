@@ -27,6 +27,7 @@ use crate::kv::v2::{
     WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::architectures::qwen3::core::{Qwen3Model, Qwen3WeightLayout};
+use crate::models::architectures::qwen3::decode_graph::RUMBLE_DECODE_GRAPHS_ENV;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::memory::metal::metal_pool_for_device;
@@ -204,7 +205,7 @@ impl RumbleAsrModel {
             |tower| audio_self_check(tower, audio_selection.dtype, &device.device),
         )?;
         let trunk_config = config.trunk_config()?;
-        let (text_model, text_precision) = load_with_precision_fallback(
+        let (mut text_model, text_precision) = load_with_precision_fallback(
             "Rumble decoder",
             &text_selection,
             check,
@@ -231,6 +232,11 @@ impl RumbleAsrModel {
             text_precision.reason
         );
         let retained_decode = super::retained::rumble_retained_decode_enabled(device.kind.into());
+        // Only the retained route decodes through the trunk's batched step,
+        // the one its CUDA graphs replay.
+        if retained_decode {
+            text_model.enable_asr_decode_graph("Rumble", RUMBLE_DECODE_GRAPHS_ENV);
+        }
         Ok(Self {
             model_identity: NEXT_MODEL_IDENTITY.fetch_add(1, Ordering::Relaxed),
             model_dir: model_dir.to_path_buf(),
@@ -244,6 +250,11 @@ impl RumbleAsrModel {
             text_precision,
             retained_decode,
         })
+    }
+
+    /// The decoder's CUDA decode graphs, or why this load has none.
+    pub(crate) fn decode_graph_diagnostics(&self) -> serde_json::Value {
+        self.text_model.decode_graph_diagnostics()
     }
 
     /// Whether this load offers the retained sequence route.

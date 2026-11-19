@@ -282,3 +282,28 @@ fn misuse_of_a_retained_row_is_refused() {
     assert!(geometry.preparation_workspace_bytes <= seal.max_workspace_bytes);
     assert!(model.continuous_decode_workspace_per_row_bytes().unwrap() > 0);
 }
+
+/// The decoder's CUDA decode graphs belong to the retained route and to
+/// CUDA: a CPU load reports why it has none.
+#[test]
+fn decode_graphs_stay_off_off_cuda() {
+    let checkpoint = SyntheticRumbleCheckpoint::write();
+    let model = RumbleAsrModel::load(
+        checkpoint.path(),
+        ModelVariant::Rumble2Flash,
+        DeviceProfile::cpu(),
+    )
+    .expect("synthetic Rumble loads");
+    let off = model.decode_graph_diagnostics()["off"]
+        .as_str()
+        .expect("a CPU load has no graphs")
+        .to_string();
+    if model.retained_decode() {
+        // The switch forced the route on: the graphs were asked for.
+        assert!(off.contains("CUDA only") || off.contains("IZWI_"), "{off}");
+    } else {
+        assert!(off.contains("not enabled"), "{off}");
+    }
+    let registry = crate::models::registry::NativeAsrModel::Rumble(model);
+    assert!(registry.decode_graph_diagnostics().is_some());
+}

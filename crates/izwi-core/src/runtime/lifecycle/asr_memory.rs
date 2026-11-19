@@ -111,7 +111,8 @@ use crate::models::architectures::qwen3::core::{
     qwen3_quantized_projection_grouping_for_hidden_size,
 };
 use crate::models::architectures::qwen3::decode_graph::{
-    qwen3_decode_graph_device_bytes, QWEN3_ASR_DECODE_GRAPHS_ENV, VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
+    qwen3_decode_graph_device_bytes, QWEN3_ASR_DECODE_GRAPHS_ENV, RUMBLE_DECODE_GRAPHS_ENV,
+    VIBEVOICE_ASR_DECODE_GRAPHS_ENV,
 };
 use crate::models::architectures::sortformer::diarization::{
     sortformer_checkpoint_paths, sortformer_extraction_is_current,
@@ -293,7 +294,11 @@ pub(super) fn residency_plan(
             nemotron_transcribe_plan(model_path, backend)
         }
         _ if variant.family() == ModelFamily::RumbleAsr => {
+            // The decoder's CUDA graphs allocate their memory on first use;
+            // only a load with the retained route takes them.
+            let graphs = rumble_decode_graph_device_bytes(backend);
             rumble_plan(model_path, device, backend, Precision::Selected)
+                .map(|plan| plan.map(|plan| plan.with_deferred_device_bytes(graphs)))
         }
         ModelVariant::VoxtralMini4BRealtime2602 => {
             // The language model's CUDA decode graphs allocate their memory
@@ -1925,6 +1930,16 @@ pub(super) fn precision_reload_plan(
         "Priced the F32 reload of a lowered-precision load whose probe failed"
     );
     plan.resource_plan().map(Some)
+}
+
+/// Device bytes Rumble's CUDA decode graphs take on a `backend` load: none
+/// off CUDA, with their switch off, or on a load without the retained route.
+fn rumble_decode_graph_device_bytes(backend: BackendKind) -> u64 {
+    if crate::models::architectures::rumble::rumble_retained_decode_enabled(backend) {
+        qwen3_decode_graph_device_bytes(backend, RUMBLE_DECODE_GRAPHS_ENV)
+    } else {
+        0
+    }
 }
 
 /// Rumble's plan for the checkpoint in `model_path`, or `None` while its
