@@ -1002,7 +1002,25 @@ impl RuntimeService {
             Err(failure) => Err(release_failed_preparation(failure, prepared)),
         }
     }
-    pub(super) async fn prepare_audio8_tts_for_binding(
+
+    /// Audio8 preparation: tokenize the prompt and, with a reference clip,
+    /// encode it to codec frames.
+    ///
+    /// Boxed: every request's pipeline awaits this in turn, and inline its
+    /// future (a request, the text and the decoded reference at each step)
+    /// would be a temporary in the pipeline's poll frame for every family's
+    /// requests. That was enough to take a debug build's Fish Audio Drama 3
+    /// request past a 2 MiB thread stack on Metal.
+    pub(super) fn prepare_audio8_tts_for_binding<'a>(
+        &'a self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&'a ModelResidencyLease>,
+    ) -> futures::future::BoxFuture<'a, Result<(EngineCoreRequest, JobLease)>> {
+        Box::pin(self.prepare_audio8_tts_for_binding_inline(request, job, residency_lease))
+    }
+
+    async fn prepare_audio8_tts_for_binding_inline(
         &self,
         request: EngineCoreRequest,
         job: JobLease,
@@ -2667,6 +2685,30 @@ impl RuntimeService {
         Box::pin(self.prepare_request_for_binding_inline(request, job, residency_lease))
     }
 
+    /// The DualAR speech families (Fish S2, Audio8, Fish Drama 3) as one
+    /// boxed step of the pipeline. Each step of
+    /// `prepare_request_for_binding_inline` keeps its own copies of the
+    /// request in that future's poll frame in a debug build, so a family
+    /// added there deepens the stack of every request; added here it does
+    /// not.
+    fn prepare_dual_ar_tts_for_binding<'a>(
+        &'a self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&'a ModelResidencyLease>,
+    ) -> futures::future::BoxFuture<'a, Result<(EngineCoreRequest, JobLease)>> {
+        Box::pin(async move {
+            let (request, job) = self
+                .prepare_fish_s2_tts_for_binding(request, job, residency_lease)
+                .await?;
+            let (request, job) = self
+                .prepare_audio8_tts_for_binding(request, job, residency_lease)
+                .await?;
+            self.prepare_fish_drama3_tts_for_binding(request, job, residency_lease)
+                .await
+        })
+    }
+
     async fn prepare_request_for_binding_inline(
         &self,
         mut request: EngineCoreRequest,
@@ -2684,13 +2726,7 @@ impl RuntimeService {
             .prepare_vibevoice_tts_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
-            .prepare_fish_s2_tts_for_binding(request, job, residency_lease)
-            .await?;
-        let (request, job) = self
-            .prepare_audio8_tts_for_binding(request, job, residency_lease)
-            .await?;
-        let (request, job) = self
-            .prepare_fish_drama3_tts_for_binding(request, job, residency_lease)
+            .prepare_dual_ar_tts_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
             .prepare_voxtral_tts_for_binding(request, job, residency_lease)

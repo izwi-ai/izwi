@@ -1842,7 +1842,32 @@ impl ModelLifecycleController {
         Ok(())
     }
     /// Audio8 TTS: retained and invocation state.
-    pub(super) async fn allocate_audio8_tts_state(
+    ///
+    /// Boxed, and resolved without a future for every other family: the load
+    /// awaits each family's allocation in turn, and inline this one's future
+    /// would be a temporary in the load's poll frame under every model's
+    /// load, deep enough to take a debug build past a 2 MiB thread stack.
+    pub(super) fn allocate_audio8_tts_state<'a>(
+        &'a self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        backend: BackendKind,
+        bundle_draft: &'a LoadedModelBundleDraft,
+        state_publications: &'a mut HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        if variant.family() != crate::catalog::ModelFamily::Audio8Tts {
+            return Box::pin(std::future::ready(Ok(())));
+        }
+        Box::pin(self.allocate_audio8_tts_state_inline(
+            variant,
+            model_instance_id,
+            backend,
+            bundle_draft,
+            state_publications,
+        ))
+    }
+
+    async fn allocate_audio8_tts_state_inline(
         &self,
         variant: ModelVariant,
         model_instance_id: ModelInstanceId,
