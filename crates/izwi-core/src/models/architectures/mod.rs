@@ -19,6 +19,7 @@ pub mod lfm3;
 pub mod lfm3_audio;
 pub mod maya1;
 pub mod maya2;
+pub mod ming_tts;
 pub mod nemotron;
 pub mod nemotron_transcribe;
 pub mod parakeet;

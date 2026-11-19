@@ -1,0 +1,947 @@
+//! Ming's Qwen2 transformer stacks (`Qwen2Model`: GQA 14/2, head 64,
+//! half-split RoPE at theta 1e6, biased q/k/v, SwiGLU), family-local.
+//!
+//! The same layer runs two ways:
+//!
+//! * [`MingTrunk`]: the language model on izwi's shared paged attention.
+//!   One call carries rows from any requests; its inputs are embeddings,
+//!   not token ids (the prompt splices speaker and audio rows in, and every
+//!   decode step feeds an audio latent's embedding back), and it returns
+//!   each row's last hidden state after the final norm.
+//! * [`MingWindowStack`]: the VAE's stacks, one sequence at a time, causal
+//!   with a sliding window. Each layer keeps the keys and values a later
+//!   chunk can still see, so a sequence decoded in chunks is the sequence
+//!   decoded at once.
+
+use std::sync::Arc;
+
+use candle_core::{DType, Device, Tensor, D};
+use candle_nn::VarBuilder;
+
+use super::config::MingStackConfig;
+use crate::error::{Error, Result};
+use crate::models::shared::attention::mixed::{
+    MixedRowLayout, MixedRowSpan, PreparedPhysicalMixedStep,
+};
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::rope::{rope_frequencies, RopeFrequencies, RopeScaling};
+
+/// The most decode rows one language-model forward takes.
+pub(crate) const MAX_DECODE_GROUP: usize = 32;
+
+/// RMSNorm with its statistics in F32 whatever the model dtype: `eps` 1e-6
+/// is below F16's smallest normal number.
+pub(crate) fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    let dtype = x.dtype();
+    let wide = x.to_dtype(DType::F32)?;
+    let variance = wide.sqr()?.mean_keepdim(D::Minus1)?;
+    let normed = wide.broadcast_div(&(variance + eps)?.sqrt()?)?;
+    Ok(normed.to_dtype(dtype)?.broadcast_mul(weight)?)
+}
+
+/// `x` [rows, in] through `weight` [out, in] (+ `bias`), each row rounded
+/// the same however many requests share the call, so a request sounds the
+/// same under load as alone: Candle picks a matmul's kernel from its row
+/// count and each rounds a row's sums differently. On the CPU and Metal a
+/// decode-sized call runs row by row; on CUDA it is padded to
+/// [`MAX_DECODE_GROUP`] rows, one shape for every batch. A longer span is
+/// one request's prefill, whose shape is its own.
+pub(crate) fn project_rows(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    let rows = x.dim(0)?;
+    let product = if rows > MAX_DECODE_GROUP {
+        x.matmul(&weight.t()?)?
+    } else if x.device().is_cuda() {
+        let padded = x.pad_with_zeros(0, 0, MAX_DECODE_GROUP - rows)?;
+        padded.matmul(&weight.t()?)?.narrow(0, 0, rows)?
+    } else if rows == 1 {
+        x.matmul(&weight.t()?)?
+    } else {
+        let weight_t = weight.t()?;
+        let products = (0..rows)
+            .map(|row| Ok(x.narrow(0, row, 1)?.matmul(&weight_t)?))
+            .collect::<Result<Vec<_>>>()?;
+        Tensor::cat(&products, 0)?
+    };
+    match bias {
+        Some(bias) => Ok(product.broadcast_add(bias)?),
+        None => Ok(product),
+    }
+}
+
+fn project(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    let product = x.matmul(&weight.t()?)?;
+    match bias {
+        Some(bias) => Ok(product.broadcast_add(bias)?),
+        None => Ok(product),
+    }
+}
+
+pub(crate) struct MingLayer {
+    input_norm: Tensor,
+    /// q, k and v stacked: [q_out + 2 kv_out, hidden], and their biases.
+    qkv: Tensor,
+    qkv_bias: Tensor,
+    o_proj: Tensor,
+    post_norm: Tensor,
+    /// gate and up stacked: [2 intermediate, hidden].
+    gate_up: Tensor,
+    down: Tensor,
+}
+
+impl MingLayer {
+    fn load(cfg: &MingStackConfig, vb: &VarBuilder) -> Result<Self> {
+        let hidden = cfg.hidden_size;
+        let attn = vb.pp("self_attn");
+        let mlp = vb.pp("mlp");
+        let weight = |vb: VarBuilder, rows: usize, cols: usize| -> Result<Tensor> {
+            Ok(vb.get((rows, cols), "weight")?)
+        };
+        let bias = |vb: VarBuilder, rows: usize| -> Result<Tensor> { Ok(vb.get(rows, "bias")?) };
+        let qkv = Tensor::cat(
+            &[
+                weight(attn.pp("q_proj"), cfg.q_out(), hidden)?,
+                weight(attn.pp("k_proj"), cfg.kv_out(), hidden)?,
+                weight(attn.pp("v_proj"), cfg.kv_out(), hidden)?,
+            ],
+            0,
+        )?;
+        let qkv_bias = Tensor::cat(
+            &[
+                bias(attn.pp("q_proj"), cfg.q_out())?,
+                bias(attn.pp("k_proj"), cfg.kv_out())?,
+                bias(attn.pp("v_proj"), cfg.kv_out())?,
+            ],
+            0,
+        )?;
+        let gate_up = Tensor::cat(
+            &[
+                weight(mlp.pp("gate_proj"), cfg.intermediate_size, hidden)?,
+                weight(mlp.pp("up_proj"), cfg.intermediate_size, hidden)?,
+            ],
+            0,
+        )?;
+        Ok(Self {
+            input_norm: vb.pp("input_layernorm").get(hidden, "weight")?,
+            qkv,
+            qkv_bias,
+            o_proj: weight(attn.pp("o_proj"), hidden, cfg.q_out())?,
+            post_norm: vb.pp("post_attention_layernorm").get(hidden, "weight")?,
+            gate_up,
+            down: weight(mlp.pp("down_proj"), hidden, cfg.intermediate_size)?,
+        })
+    }
+
+    /// q [tokens, heads, dim], k and v [tokens, kv_heads, dim], q and k
+    /// rotated.
+    fn qkv(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cfg: &MingStackConfig,
+        rows_independent: bool,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let tokens = x.dim(0)?;
+        let (q_out, kv_out, head_dim) = (cfg.q_out(), cfg.kv_out(), cfg.head_dim);
+        let normed = rms_norm(x, &self.input_norm, cfg.rms_norm_eps)?;
+        let qkv = if rows_independent {
+            project_rows(&normed, &self.qkv, Some(&self.qkv_bias))?
+        } else {
+            project(&normed, &self.qkv, Some(&self.qkv_bias))?
+        };
+        let q = qkv
+            .narrow(1, 0, q_out)?
+            .reshape((tokens, cfg.num_attention_heads, head_dim))?;
+        let k =
+            qkv.narrow(1, q_out, kv_out)?
+                .reshape((tokens, cfg.num_key_value_heads, head_dim))?;
+        let v = qkv
+            .narrow(1, q_out + kv_out, kv_out)?
+            .reshape((tokens, cfg.num_key_value_heads, head_dim))?
+            .contiguous()?;
+        Ok((
+            rotate_half_split(&q, cos, sin)?,
+            rotate_half_split(&k, cos, sin)?,
+            v,
+        ))
+    }
+
+    /// The residual branches after attention: `attn` is [tokens, q_out].
+    fn finish(
+        &self,
+        x: &Tensor,
+        attn: &Tensor,
+        cfg: &MingStackConfig,
+        rows_independent: bool,
+    ) -> Result<Tensor> {
+        let run = |x: &Tensor, weight: &Tensor| -> Result<Tensor> {
+            if rows_independent {
+                project_rows(x, weight, None)
+            } else {
+                project(x, weight, None)
+            }
+        };
+        let x = x.add(&run(attn, &self.o_proj)?)?;
+        let gate_up = run(
+            &rms_norm(&x, &self.post_norm, cfg.rms_norm_eps)?,
+            &self.gate_up,
+        )?;
+        let gate = gate_up.narrow(1, 0, cfg.intermediate_size)?;
+        let up = gate_up.narrow(1, cfg.intermediate_size, cfg.intermediate_size)?;
+        let mlp = run(&candle_nn::ops::silu(&gate)?.mul(&up)?, &self.down)?;
+        Ok(x.add(&mlp)?)
+    }
+}
+
+/// The half-split rotation of `x` [tokens, heads, dim] by per-token
+/// `cos`/`sin` [tokens, dim / 2].
+fn rotate_half_split(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let half = x.dim(D::Minus1)? / 2;
+    let x1 = x.narrow(D::Minus1, 0, half)?;
+    let x2 = x.narrow(D::Minus1, half, half)?;
+    let cos = cos.unsqueeze(1)?;
+    let sin = sin.unsqueeze(1)?;
+    let first = x1.broadcast_mul(&cos)?.sub(&x2.broadcast_mul(&sin)?)?;
+    let second = x1.broadcast_mul(&sin)?.add(&x2.broadcast_mul(&cos)?)?;
+    Ok(Tensor::cat(&[first, second], D::Minus1)?.contiguous()?)
+}
+
+fn load_layers(cfg: &MingStackConfig, vb: &VarBuilder) -> Result<Vec<MingLayer>> {
+    (0..cfg.num_hidden_layers)
+        .map(|index| MingLayer::load(cfg, &vb.pp(format!("layers.{index}"))))
+        .collect()
+}
+
+fn frequencies(cfg: &MingStackConfig) -> Result<RopeFrequencies> {
+    rope_frequencies(cfg.head_dim, cfg.rope_theta, &RopeScaling::Default)
+}
+
+/// RoPE cos/sin for positions `start..start + len`, [len, head_dim / 2],
+/// computed on the host in F64.
+fn rope_table(
+    freqs: &RopeFrequencies,
+    start: usize,
+    len: usize,
+    pairs: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let (cos, sin) = freqs.cos_sin_table(start, len);
+    let table = |values: Vec<f32>| -> Result<Tensor> {
+        Ok(Tensor::from_vec(values, (len, pairs), &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(device)?)
+    };
+    Ok((table(cos)?, table(sin)?))
+}
+
+// ------------------------------------------------------------ language model
+
+/// One row of a language-model forward: `embeds` [count, hidden] appended
+/// to `cache`.
+pub struct MingForwardRow<'a> {
+    pub embeds: &'a Tensor,
+    pub cache: &'a mut PhysicalPagedKvCache,
+}
+
+pub struct MingTrunk {
+    cfg: MingStackConfig,
+    dtype: DType,
+    device: Device,
+    /// The token table, [vocab, hidden].
+    embed: Tensor,
+    layers: Vec<MingLayer>,
+    norm: Tensor,
+    rope_cos: Tensor,
+    rope_sin: Tensor,
+    max_positions: usize,
+}
+
+impl MingTrunk {
+    /// Load the language model from `vb` (rooted at `model.model`) in its
+    /// dtype.
+    pub fn load(
+        cfg: MingStackConfig,
+        vocab_size: usize,
+        vb: VarBuilder,
+        max_positions: usize,
+    ) -> Result<Self> {
+        let dtype = vb.dtype();
+        let device = vb.device().clone();
+        let embed = vb.get((vocab_size, cfg.hidden_size), "embed_tokens.weight")?;
+        let layers = load_layers(&cfg, &vb)?;
+        let norm = vb.pp("norm").get(cfg.hidden_size, "weight")?;
+        let (rope_cos, rope_sin) = rope_table(
+            &frequencies(&cfg)?,
+            0,
+            max_positions,
+            cfg.head_dim / 2,
+            dtype,
+            &device,
+        )?;
+        Ok(Self {
+            cfg,
+            dtype,
+            device,
+            embed,
+            layers,
+            norm,
+            rope_cos,
+            rope_sin,
+            max_positions,
+        })
+    }
+
+    pub fn config(&self) -> &MingStackConfig {
+        &self.cfg
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn max_positions(&self) -> usize {
+        self.max_positions
+    }
+
+    /// The embeddings of `ids`, [ids, hidden] in the model dtype.
+    pub fn embed_tokens(&self, ids: &[u32]) -> Result<Tensor> {
+        if let Some(&id) = ids
+            .iter()
+            .find(|&&id| id as usize >= self.embed.dim(0).unwrap_or(0))
+        {
+            return Err(Error::InvalidInput(format!(
+                "Ming token {id} is outside the vocabulary"
+            )));
+        }
+        let ids = Tensor::from_vec(ids.to_vec(), ids.len(), &self.device)?;
+        Ok(self.embed.index_select(&ids, 0)?)
+    }
+
+    /// Requests' rows as the engine batches them: each row's last hidden
+    /// state after the final norm, [rows, hidden] F32 in row order, the
+    /// bits each row gets alone. A prefill row runs by itself (its span
+    /// alone sets its matmul shapes); single-position decode rows share
+    /// forwards in groups of at most [`MAX_DECODE_GROUP`].
+    pub(crate) fn forward_batch(&self, rows: &mut [MingForwardRow<'_>]) -> Result<Tensor> {
+        let mut decode = true;
+        for row in rows.iter() {
+            decode &= row.embeds.dim(0)? == 1;
+        }
+        let group = if decode { MAX_DECODE_GROUP } else { 1 };
+        let mut parts = rows
+            .chunks_mut(group)
+            .map(|chunk| self.forward(chunk))
+            .collect::<Result<Vec<_>>>()?;
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("one forward"));
+        }
+        Ok(Tensor::cat(&parts, 0)?)
+    }
+
+    /// Run `rows` through the model and return each row's final-norm hidden
+    /// state at its last position, [rows, hidden] in row order (F32).
+    pub fn forward(&self, rows: &mut [MingForwardRow<'_>]) -> Result<Tensor> {
+        if rows.is_empty() {
+            return Err(Error::InvalidInput("Ming forward has no rows".into()));
+        }
+        let cfg = &self.cfg;
+        let mut spans = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            let (count, width) = row.embeds.dims2()?;
+            let start = row.cache.context_len();
+            let end = start.saturating_add(count);
+            if count == 0
+                || width != cfg.hidden_size
+                || end > self.max_positions
+                || end > row.cache.capacity_tokens()
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Ming row of {count} positions at {start} exceeds its capacity ({} positions, cache {})",
+                    self.max_positions,
+                    row.cache.capacity_tokens()
+                )));
+            }
+            row.cache.validate_model(
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            )?;
+            spans.push(MixedRowSpan {
+                start_pos: start,
+                q_len: count,
+            });
+        }
+
+        // Rows grouped by arena, decode rows first within each group; the
+        // flattened position order is group after group.
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for index in 0..rows.len() {
+            let arena = rows[index].cache.arena();
+            match groups
+                .iter_mut()
+                .find(|group| Arc::ptr_eq(rows[group[0]].cache.arena(), arena))
+            {
+                Some(group) => group.push(index),
+                None => groups.push(vec![index]),
+            }
+        }
+        for group in &mut groups {
+            group.sort_by_key(|&index| spans[index].q_len != 1);
+        }
+        let order = groups.iter().flatten().copied().collect::<Vec<_>>();
+
+        let mut steps = Vec::with_capacity(groups.len());
+        let mut group_tokens = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let caches = group.iter().map(|&i| &*rows[i].cache).collect::<Vec<_>>();
+            let decode_rows = group.iter().filter(|&&i| spans[i].q_len == 1).count();
+            let layout =
+                MixedRowLayout::new(group.iter().map(|&i| spans[i]).collect(), decode_rows)?;
+            group_tokens.push(layout.total_tokens());
+            steps.push(PreparedPhysicalMixedStep::new(&caches, layout)?);
+        }
+
+        let result = (|| -> Result<Tensor> {
+            let inputs = order
+                .iter()
+                .map(|&i| rows[i].embeds.to_dtype(self.dtype))
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            let mut hidden = if inputs.len() == 1 {
+                inputs.into_iter().next().expect("one row")
+            } else {
+                Tensor::cat(&inputs, 0)?
+            };
+            let rows_independent = hidden.dim(0)? <= MAX_DECODE_GROUP;
+            let positions = order
+                .iter()
+                .flat_map(|&i| {
+                    let span = spans[i];
+                    (span.start_pos..span.start_pos + span.q_len).map(|p| p as u32)
+                })
+                .collect::<Vec<_>>();
+            let positions = Tensor::from_vec(positions.clone(), positions.len(), &self.device)?;
+            let cos = self.rope_cos.index_select(&positions, 0)?;
+            let sin = self.rope_sin.index_select(&positions, 0)?;
+            let caches = groups
+                .iter()
+                .map(|group| group.iter().map(|&i| &*rows[i].cache).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+            for (index, layer) in self.layers.iter().enumerate() {
+                let tokens = hidden.dim(0)?;
+                let (q, k, v) = layer.qkv(&hidden, &cos, &sin, cfg, rows_independent)?;
+                let mut outputs = Vec::with_capacity(steps.len());
+                let mut offset = 0usize;
+                for ((step, group), &count) in steps.iter_mut().zip(&caches).zip(&group_tokens) {
+                    let slice = |t: &Tensor| t.narrow(0, offset, count)?.contiguous();
+                    outputs.push(step.write_and_attend(
+                        group,
+                        index,
+                        &slice(&q)?,
+                        &slice(&k)?,
+                        &slice(&v)?,
+                        scale,
+                        None,
+                        None,
+                    )?);
+                    offset += count;
+                }
+                let attn = if outputs.len() == 1 {
+                    outputs.pop().expect("one group")
+                } else {
+                    Tensor::cat(&outputs, 0)?
+                };
+                hidden = layer.finish(
+                    &hidden,
+                    &attn.reshape((tokens, cfg.q_out()))?,
+                    cfg,
+                    rows_independent,
+                )?;
+            }
+            // Last position of each row, back in row order.
+            let mut offsets = vec![0usize; rows.len()];
+            let mut offset = 0usize;
+            for &i in &order {
+                offset += spans[i].q_len;
+                offsets[i] = offset - 1;
+            }
+            let last = Tensor::from_vec(
+                offsets.iter().map(|&o| o as u32).collect::<Vec<_>>(),
+                offsets.len(),
+                &self.device,
+            )?;
+            let tails = hidden.index_select(&last, 0)?;
+            Ok(rms_norm(&tails, &self.norm, cfg.rms_norm_eps)?.to_dtype(DType::F32)?)
+        })();
+
+        let outcome = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let mut slots = rows
+            .iter_mut()
+            .map(|row| Some(&mut *row.cache))
+            .collect::<Vec<_>>();
+        let mut finish_error = None;
+        for (group, step) in groups.iter().zip(steps) {
+            let mut caches = group
+                .iter()
+                .map(|&i| slots[i].take().expect("each row belongs to one group"))
+                .collect::<Vec<_>>();
+            let status = outcome.clone().map_err(Error::InferenceError);
+            if let Err(error) = step.finish(&mut caches, status) {
+                finish_error.get_or_insert(error);
+            }
+        }
+        let hidden = result?;
+        if let Some(error) = finish_error {
+            return Err(error);
+        }
+        Ok(hidden)
+    }
+}
+
+// ------------------------------------------------------------- VAE stacks
+
+/// The keys and values of one sequence's recent positions, per layer: what
+/// a later chunk can still attend to.
+#[derive(Clone, Default)]
+pub struct MingWindowState {
+    /// Positions consumed so far.
+    position: usize,
+    /// Per layer: (k, v), each [kept, kv_heads, head_dim].
+    kept: Vec<Option<(Tensor, Tensor)>>,
+}
+
+impl MingWindowState {
+    pub fn position(&self) -> usize {
+        self.position
+    }
+}
+
+/// A causal Qwen2 stack with a sliding attention window, for one sequence.
+pub struct MingWindowStack {
+    cfg: MingStackConfig,
+    dtype: DType,
+    device: Device,
+    layers: Vec<MingLayer>,
+    norm: Tensor,
+    freqs: RopeFrequencies,
+    /// Keys a position attends to, itself included.
+    window_keys: usize,
+}
+
+/// Positions one attention call takes: bounds the score tensor of a long
+/// sequence run at once.
+const WINDOW_CHUNK: usize = 256;
+
+impl MingWindowStack {
+    pub fn load(cfg: MingStackConfig, vb: VarBuilder, window_keys: usize) -> Result<Self> {
+        if window_keys < 2 {
+            return Err(Error::ModelLoadError(
+                "Ming VAE attention window must keep at least two keys".into(),
+            ));
+        }
+        Ok(Self {
+            dtype: vb.dtype(),
+            device: vb.device().clone(),
+            layers: load_layers(&cfg, &vb)?,
+            norm: vb.pp("norm").get(cfg.hidden_size, "weight")?,
+            freqs: frequencies(&cfg)?,
+            cfg,
+            window_keys,
+        })
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn config(&self) -> &MingStackConfig {
+        &self.cfg
+    }
+
+    pub fn window_keys(&self) -> usize {
+        self.window_keys
+    }
+
+    /// Run `x` [positions, hidden] as the next positions of `state`'s
+    /// sequence; the final-norm hidden states, [positions, hidden].
+    pub fn forward(&self, x: &Tensor, state: &mut MingWindowState) -> Result<Tensor> {
+        let (total, width) = x.dims2()?;
+        if total == 0 || width != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(
+                "Ming VAE stack input has the wrong shape".into(),
+            ));
+        }
+        if state.kept.is_empty() {
+            state.kept = vec![None; self.layers.len()];
+        }
+        let mut outputs = Vec::with_capacity(total.div_ceil(WINDOW_CHUNK));
+        let mut offset = 0usize;
+        while offset < total {
+            let count = WINDOW_CHUNK.min(total - offset);
+            outputs.push(self.forward_chunk(&x.narrow(0, offset, count)?, state)?);
+            offset += count;
+        }
+        if outputs.len() == 1 {
+            return Ok(outputs.pop().expect("one chunk"));
+        }
+        Ok(Tensor::cat(&outputs, 0)?)
+    }
+
+    fn forward_chunk(&self, x: &Tensor, state: &mut MingWindowState) -> Result<Tensor> {
+        let cfg = &self.cfg;
+        let count = x.dim(0)?;
+        let start = state.position;
+        let (cos, sin) = rope_table(
+            &self.freqs,
+            start,
+            count,
+            cfg.head_dim / 2,
+            self.dtype,
+            &self.device,
+        )?;
+        let kept = state.kept[0]
+            .as_ref()
+            .map_or(0, |(k, _)| k.dim(0).unwrap_or(0));
+        let mask = self.window_mask(kept, count)?;
+        let groups = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let scale = 1.0 / (cfg.head_dim as f64).sqrt();
+        let mut hidden = x.to_dtype(self.dtype)?;
+        for (layer, slot) in self.layers.iter().zip(state.kept.iter_mut()) {
+            let (q, k, v) = layer.qkv(&hidden, &cos, &sin, cfg, false)?;
+            let (keys, values) = match slot.take() {
+                Some((kept_k, kept_v)) => (
+                    Tensor::cat(&[&kept_k, &k], 0)?,
+                    Tensor::cat(&[&kept_v, &v], 0)?,
+                ),
+                None => (k, v),
+            };
+            let span = keys.dim(0)?;
+            // q [kv, groups, count, dim] against k, v [kv, 1, span, dim]:
+            // query head h reads KV head h / groups.
+            let q = q
+                .reshape((count, cfg.num_key_value_heads, groups, cfg.head_dim))?
+                .permute((1, 2, 0, 3))?
+                .contiguous()?;
+            let k = keys.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
+            let v = values.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
+            let scores = (q.broadcast_matmul(&k.transpose(2, 3)?)? * scale)?
+                .to_dtype(DType::F32)?
+                .broadcast_add(&mask)?;
+            let weights = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(self.dtype)?;
+            let attn = weights
+                .broadcast_matmul(&v)?
+                .permute((2, 0, 1, 3))?
+                .contiguous()?
+                .reshape((count, cfg.q_out()))?;
+            hidden = layer.finish(&hidden, &attn, cfg, false)?;
+            // Later positions see at most `window_keys - 1` of these.
+            let keep = span.min(self.window_keys - 1);
+            *slot = Some((
+                keys.narrow(0, span - keep, keep)?.contiguous()?,
+                values.narrow(0, span - keep, keep)?.contiguous()?,
+            ));
+        }
+        state.position = start + count;
+        rms_norm(&hidden, &self.norm, cfg.rms_norm_eps)
+    }
+
+    /// The additive mask of `count` new positions over `kept` earlier keys
+    /// and themselves, [count, kept + count] F32: a query sees keys at or
+    /// before it and fewer than `window_keys` positions back.
+    fn window_mask(&self, kept: usize, count: usize) -> Result<Tensor> {
+        let span = kept + count;
+        let mut mask = vec![f32::NEG_INFINITY; count * span];
+        for query in 0..count {
+            let position = kept + query;
+            let first = (position + 1).saturating_sub(self.window_keys);
+            mask[query * span + first..=query * span + position].fill(0.0);
+        }
+        Ok(Tensor::from_vec(mask, (count, span), &self.device)?)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::models::shared::noise::SplitMix64;
+
+    pub(crate) fn tiny_stack_config(layers: usize) -> MingStackConfig {
+        MingStackConfig {
+            hidden_size: 32,
+            num_hidden_layers: layers,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            intermediate_size: 48,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+        }
+    }
+
+    pub(crate) fn random(rng: &mut SplitMix64, shape: &[usize], scale: f32) -> Tensor {
+        let count = shape.iter().product::<usize>();
+        let values = rng
+            .standard_normals(count)
+            .into_iter()
+            .map(|value| value * scale)
+            .collect::<Vec<_>>();
+        Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
+    }
+
+    /// Random weights of a stack under `prefix` (`"x."` or `""`).
+    pub(crate) fn tiny_stack_weights(
+        cfg: &MingStackConfig,
+        prefix: &str,
+        rng: &mut SplitMix64,
+        tensors: &mut HashMap<String, Tensor>,
+    ) {
+        let hidden = cfg.hidden_size;
+        let mut put = |name: String, shape: &[usize], scale: f32, offset: f32| {
+            let tensor = (random(rng, shape, scale) + offset as f64).unwrap();
+            tensors.insert(format!("{prefix}{name}"), tensor);
+        };
+        put("norm.weight".into(), &[hidden], 0.05, 1.0);
+        for layer in 0..cfg.num_hidden_layers {
+            let name = |suffix: &str| format!("layers.{layer}.{suffix}");
+            put(name("input_layernorm.weight"), &[hidden], 0.05, 1.0);
+            put(
+                name("post_attention_layernorm.weight"),
+                &[hidden],
+                0.05,
+                1.0,
+            );
+            put(
+                name("self_attn.q_proj.weight"),
+                &[cfg.q_out(), hidden],
+                0.2,
+                0.0,
+            );
+            put(name("self_attn.q_proj.bias"), &[cfg.q_out()], 0.1, 0.0);
+            put(
+                name("self_attn.k_proj.weight"),
+                &[cfg.kv_out(), hidden],
+                0.2,
+                0.0,
+            );
+            put(name("self_attn.k_proj.bias"), &[cfg.kv_out()], 0.1, 0.0);
+            put(
+                name("self_attn.v_proj.weight"),
+                &[cfg.kv_out(), hidden],
+                0.2,
+                0.0,
+            );
+            put(name("self_attn.v_proj.bias"), &[cfg.kv_out()], 0.1, 0.0);
+            put(
+                name("self_attn.o_proj.weight"),
+                &[hidden, cfg.q_out()],
+                0.2,
+                0.0,
+            );
+            put(
+                name("mlp.gate_proj.weight"),
+                &[cfg.intermediate_size, hidden],
+                0.2,
+                0.0,
+            );
+            put(
+                name("mlp.up_proj.weight"),
+                &[cfg.intermediate_size, hidden],
+                0.2,
+                0.0,
+            );
+            put(
+                name("mlp.down_proj.weight"),
+                &[hidden, cfg.intermediate_size],
+                0.2,
+                0.0,
+            );
+        }
+    }
+
+    fn host(tensor: &Tensor) -> Vec<f32> {
+        tensor
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    pub(crate) fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                let d = (x - y).abs();
+                if d.is_finite() {
+                    d
+                } else {
+                    f32::INFINITY
+                }
+            })
+            .fold(0.0, f32::max)
+    }
+
+    /// An independent dense reference of the stack: full causal attention
+    /// with an explicit window mask, one position at a time semantics.
+    fn dense_reference(
+        cfg: &MingStackConfig,
+        tensors: &HashMap<String, Tensor>,
+        x: &Tensor,
+        window_keys: Option<usize>,
+    ) -> Tensor {
+        let get = |name: &str| tensors[name].clone();
+        let total = x.dim(0).unwrap();
+        let freqs = frequencies(cfg).unwrap();
+        let (cos, sin) =
+            rope_table(&freqs, 0, total, cfg.head_dim / 2, DType::F32, &Device::Cpu).unwrap();
+        let groups = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let mut mask = vec![f32::NEG_INFINITY; total * total];
+        for query in 0..total {
+            for key in 0..=query {
+                if window_keys.is_none_or(|keys| query - key < keys) {
+                    mask[query * total + key] = 0.0;
+                }
+            }
+        }
+        let mask = Tensor::from_vec(mask, (total, total), &Device::Cpu).unwrap();
+        let mut hidden = x.clone();
+        for layer in 0..cfg.num_hidden_layers {
+            let name = |suffix: &str| format!("layers.{layer}.{suffix}");
+            let lin = |x: &Tensor, w: &str, b: Option<&str>| {
+                let y = x.matmul(&get(&name(w)).t().unwrap()).unwrap();
+                match b {
+                    Some(b) => y.broadcast_add(&get(&name(b))).unwrap(),
+                    None => y,
+                }
+            };
+            let normed = rms_norm(&hidden, &get(&name("input_layernorm.weight")), 1e-6).unwrap();
+            let q = lin(
+                &normed,
+                "self_attn.q_proj.weight",
+                Some("self_attn.q_proj.bias"),
+            )
+            .reshape((total, cfg.num_attention_heads, cfg.head_dim))
+            .unwrap();
+            let k = lin(
+                &normed,
+                "self_attn.k_proj.weight",
+                Some("self_attn.k_proj.bias"),
+            )
+            .reshape((total, cfg.num_key_value_heads, cfg.head_dim))
+            .unwrap();
+            let v = lin(
+                &normed,
+                "self_attn.v_proj.weight",
+                Some("self_attn.v_proj.bias"),
+            )
+            .reshape((total, cfg.num_key_value_heads, cfg.head_dim))
+            .unwrap();
+            let q = rotate_half_split(&q, &cos, &sin).unwrap();
+            let k = rotate_half_split(&k, &cos, &sin).unwrap();
+            let mut heads = Vec::new();
+            for head in 0..cfg.num_attention_heads {
+                let kv = head / groups;
+                let qh = q.narrow(1, head, 1).unwrap().squeeze(1).unwrap();
+                let kh = k.narrow(1, kv, 1).unwrap().squeeze(1).unwrap();
+                let vh = v.narrow(1, kv, 1).unwrap().squeeze(1).unwrap();
+                let scores = (qh.matmul(&kh.t().unwrap()).unwrap() / (cfg.head_dim as f64).sqrt())
+                    .unwrap()
+                    .add(&mask)
+                    .unwrap();
+                let weights = candle_nn::ops::softmax_last_dim(&scores).unwrap();
+                heads.push(weights.matmul(&vh).unwrap());
+            }
+            let attn = Tensor::cat(&heads, 1).unwrap();
+            let x1 = hidden
+                .add(&lin(&attn, "self_attn.o_proj.weight", None))
+                .unwrap();
+            let normed =
+                rms_norm(&x1, &get(&name("post_attention_layernorm.weight")), 1e-6).unwrap();
+            let gate = candle_nn::ops::silu(&lin(&normed, "mlp.gate_proj.weight", None)).unwrap();
+            let up = lin(&normed, "mlp.up_proj.weight", None);
+            hidden = x1
+                .add(&lin(&gate.mul(&up).unwrap(), "mlp.down_proj.weight", None))
+                .unwrap();
+        }
+        rms_norm(&hidden, &get("norm.weight"), 1e-6).unwrap()
+    }
+
+    fn window_stack(window_keys: usize) -> (MingWindowStack, HashMap<String, Tensor>) {
+        let cfg = tiny_stack_config(3);
+        let mut rng = SplitMix64::new(11);
+        let mut tensors = HashMap::new();
+        tiny_stack_weights(&cfg, "", &mut rng, &mut tensors);
+        let vb = VarBuilder::from_tensors(tensors.clone(), DType::F32, &Device::Cpu);
+        (
+            MingWindowStack::load(cfg, vb, window_keys).unwrap(),
+            tensors,
+        )
+    }
+
+    #[test]
+    fn window_stack_matches_a_dense_masked_reference() {
+        let (stack, tensors) = window_stack(5);
+        let x = random(&mut SplitMix64::new(3), &[23, 32], 1.0);
+        let expected = dense_reference(stack.config(), &tensors, &x, Some(5));
+        let got = stack.forward(&x, &mut MingWindowState::default()).unwrap();
+        assert!(max_diff(&host(&got), &host(&expected)) < 2e-5);
+        // The window matters: full causal attention gives something else.
+        let full = dense_reference(stack.config(), &tensors, &x, None);
+        assert!(max_diff(&host(&got), &host(&full)) > 1e-3);
+    }
+
+    #[test]
+    fn a_sequence_in_chunks_is_the_sequence_at_once() {
+        let (stack, _) = window_stack(6);
+        let x = random(&mut SplitMix64::new(4), &[31, 32], 1.0);
+        let whole = stack.forward(&x, &mut MingWindowState::default()).unwrap();
+        let mut state = MingWindowState::default();
+        let mut parts = Vec::new();
+        let mut offset = 0;
+        for count in [1usize, 4, 2, 9, 7, 8] {
+            parts.push(
+                stack
+                    .forward(&x.narrow(0, offset, count).unwrap(), &mut state)
+                    .unwrap(),
+            );
+            offset += count;
+        }
+        assert_eq!(offset, 31);
+        assert_eq!(state.position(), 31);
+        let chunked = Tensor::cat(&parts, 0).unwrap();
+        assert!(max_diff(&host(&whole), &host(&chunked)) < 2e-5);
+    }
+
+    #[test]
+    fn rms_norm_computes_in_f32_for_half_precision() {
+        let x = Tensor::from_vec(vec![1e-3f32, -2e-3, 3e-3, 4e-3], (1, 4), &Device::Cpu).unwrap();
+        let weight = Tensor::ones(4, DType::F32, &Device::Cpu).unwrap();
+        let wide = host(&rms_norm(&x, &weight, 1e-6).unwrap());
+        let half = host(
+            &rms_norm(
+                &x.to_dtype(DType::F16).unwrap(),
+                &weight.to_dtype(DType::F16).unwrap(),
+                1e-6,
+            )
+            .unwrap(),
+        );
+        assert!(max_diff(&wide, &half) < 2e-3, "{wide:?} vs {half:?}");
+        assert!(wide.iter().all(|value| value.is_finite()));
+    }
+}

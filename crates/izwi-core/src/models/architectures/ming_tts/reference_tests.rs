@@ -1,0 +1,356 @@
+//! Tests on the real checkpoint (ignored: they need the 3 GB download).
+//!
+//! `IZWI_MING_TTS_MODEL_DIR` names a Ming-3.0-tts-0.5B folder holding
+//! `model.safetensors`, the tokenizer, `config.json` and
+//! `campplus_cn_common.bin`. `IZWI_MING_TTS_OUT_DIR`, when set, receives
+//! the generated audio as WAV files for listening and for a
+//! speech-recognition round trip.
+//!
+//! Parity with the PyTorch reference is checked against the fixtures
+//! `scripts/fixtures/generate_ming_tts_reference.py` writes; those tests
+//! skip while the fixtures are absent.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use candle_core::{DType, Device};
+
+use super::config::{MingTtsConfig, LATENT_DIM, LATENT_SAMPLES, PINNED_TOKENS, TOKENIZER_FILE};
+use super::prompt::MingTokenizer;
+use super::speaker::{CampPlus, SPEAKER_EMBEDDING_DIM};
+use super::{
+    MingControl, MingEmotion, MingGenerationParams, MingReferenceVoice, MingRequest, MingRuntime,
+    MingStopReason, MingVoice, DEFAULT_GUIDANCE, SAMPLE_RATE, SPEAKER_WEIGHTS_FILE,
+};
+
+fn model_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("IZWI_MING_TTS_MODEL_DIR")
+            .expect("set IZWI_MING_TTS_MODEL_DIR to a Ming-3.0-tts-0.5B download"),
+    )
+}
+
+fn device() -> (Device, DType) {
+    match std::env::var("IZWI_MING_TTS_TEST_DEVICE").as_deref() {
+        Ok("metal") => (Device::new_metal(0).expect("a Metal device"), DType::F16),
+        Ok("metal-f32") => (Device::new_metal(0).expect("a Metal device"), DType::F32),
+        _ => (Device::Cpu, DType::F32),
+    }
+}
+
+fn runtime() -> MingRuntime {
+    let (device, dtype) = device();
+    MingRuntime::load(&model_dir(), &device, dtype, DType::F32).unwrap()
+}
+
+fn write_wav(name: &str, samples: &[f32]) {
+    let Ok(dir) = std::env::var("IZWI_MING_TTS_OUT_DIR") else {
+        return;
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = samples
+        .iter()
+        .flat_map(|sample| ((sample.clamp(-1.0, 1.0) * 32_767.0) as i16).to_le_bytes())
+        .collect::<Vec<_>>();
+    let mut wav = Vec::with_capacity(44 + data.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&data);
+    std::fs::write(Path::new(&dir).join(format!("{name}.wav")), wav).unwrap();
+}
+
+fn params(seed: u64) -> MingGenerationParams {
+    MingGenerationParams {
+        guidance: DEFAULT_GUIDANCE,
+        max_new_latents: 300,
+        seed,
+    }
+}
+
+fn speak(runtime: &MingRuntime, name: &str, request: &MingRequest, seed: u64) -> Vec<f32> {
+    let mut cache = runtime.scratch_cache(super::CONTEXT_POSITIONS).unwrap();
+    let started = std::time::Instant::now();
+    let output = runtime
+        .generate_physical(request, &params(seed), &mut cache)
+        .unwrap();
+    let seconds = output.samples.len() as f32 / SAMPLE_RATE as f32;
+    eprintln!(
+        "{name}: {} prompt positions, {} latents, {:?}, {seconds:.2} s of audio in {:.2} s \
+         (lm {:.0} ms, codec {:.0} ms)",
+        output.prompt_positions,
+        output.latents,
+        output.stop_reason,
+        started.elapsed().as_secs_f32(),
+        output.lm_ms,
+        output.codec_ms,
+    );
+    assert_eq!(output.stop_reason, MingStopReason::EndOfSpeech, "{name}");
+    assert!(output.samples.iter().all(|sample| sample.is_finite()));
+    let peak = output
+        .samples
+        .iter()
+        .fold(0f32, |peak, s| peak.max(s.abs()));
+    assert!(peak > 0.02 && peak < 1.5, "{name} peak {peak}");
+    write_wav(name, &output.samples);
+    output.samples
+}
+
+fn built_in(text: &str, voice: &str, language: Option<&str>) -> MingRequest {
+    MingRequest {
+        text: text.to_string(),
+        language: language.map(str::to_string),
+        voice: MingVoice::Captioned,
+        control: MingControl::BuiltInVoice(voice.to_string()),
+    }
+}
+
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn published_config_and_tokenizer_match_the_port() {
+    let dir = model_dir();
+    assert_eq!(MingTtsConfig::load(&dir).unwrap(), MingTtsConfig::pinned());
+    let tokenizer = MingTokenizer::load(&dir.join(TOKENIZER_FILE)).unwrap();
+    let prompt = tokenizer
+        .prompt_ids("Hello there.", Some("English"), true, Some("{}"), None)
+        .unwrap();
+    // <|im_start|> system \n ... and the speaker slot in order.
+    assert_eq!(prompt.ids[0], PINNED_TOKENS[1].1);
+    let row = prompt.speaker_row.unwrap();
+    assert_eq!(prompt.ids[row - 1], super::config::TOKEN_SPEAKER_START);
+    assert_eq!(prompt.ids[row], super::config::TOKEN_SPEAKER_PAD);
+    assert_eq!(prompt.ids[row + 1], super::config::TOKEN_SPEAKER_END);
+    assert_eq!(
+        *prompt.ids.last().unwrap(),
+        super::config::TOKEN_AUDIO_START
+    );
+    assert!(prompt.text_tokens >= 3);
+    let with_reference = tokenizer
+        .prompt_ids("Hello there.", None, true, None, Some(("A reference.", 7)))
+        .unwrap();
+    let latent_row = with_reference.latent_row.unwrap();
+    assert_eq!(with_reference.ids.len(), latent_row + 7);
+    assert!(with_reference.ids[latent_row..]
+        .iter()
+        .all(|&id| id == super::config::TOKEN_AUDIO_PATCH));
+}
+
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn built_in_voices_speak_english_and_chinese() {
+    let runtime = runtime();
+    speak(
+        &runtime,
+        "builtin_en_emma",
+        &built_in(
+            "The old radio crackled softly as the storm moved across the valley.",
+            "US_Emma",
+            Some("en"),
+        ),
+        11,
+    );
+    speak(
+        &runtime,
+        "builtin_en_george",
+        &built_in(
+            "Please keep your tickets ready, the train leaves in four minutes.",
+            "UK_George",
+            Some("en"),
+        ),
+        12,
+    );
+    speak(
+        &runtime,
+        "builtin_zh_xiaorou",
+        &built_in(
+            "傍晚的风从山口吹过来，远处的云慢慢染成了金色。",
+            "灵小柔",
+            Some("zh"),
+        ),
+        13,
+    );
+}
+
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn a_seed_reproduces_and_another_seed_differs() {
+    let runtime = runtime();
+    let request = built_in("Same words, same seed.", "US_Emma", None);
+    let a = speak(&runtime, "seed_a", &request, 5);
+    let b = speak(&runtime, "seed_a_again", &request, 5);
+    assert_eq!(a, b);
+    let c = speak(&runtime, "seed_b", &request, 6);
+    assert_ne!(a, c);
+}
+
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn voice_design_and_controls_speak() {
+    let runtime = runtime();
+    let request = |text: &str, control: MingControl| MingRequest {
+        text: text.to_string(),
+        language: None,
+        voice: MingVoice::Captioned,
+        control,
+    };
+    speak(
+        &runtime,
+        "design_warm_storyteller",
+        &request(
+            "Once upon a time, a small boat drifted quietly down the river.",
+            MingControl::VoiceDesign(
+                "A warm, intimate storytelling voice with a gentle pace and a hint of nostalgia."
+                    .into(),
+            ),
+        ),
+        21,
+    );
+    speak(
+        &runtime,
+        "freeform_excited",
+        &request(
+            "We did it, every single test passed on the first try!",
+            MingControl::Freeform(
+                "Speak with bright, excited energy, a little out of breath.".into(),
+            ),
+        ),
+        22,
+    );
+    speak(
+        &runtime,
+        "tags_sigh_cough",
+        &built_in(
+            "[Sigh] It is still raining, [Cough] so we will have to move the party indoors.",
+            "US_Emma",
+            None,
+        ),
+        23,
+    );
+}
+
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn a_reference_voice_clones_with_and_without_its_transcript() {
+    let runtime = runtime();
+    // The reference is a built-in voice's own audio, so the test needs no
+    // recording: clone what the model just said.
+    let source_text = "This is the voice I would like you to copy, please.";
+    let source = speak(
+        &runtime,
+        "clone_source",
+        &built_in(source_text, "UK_George", None),
+        31,
+    );
+    let with_text = runtime
+        .encode_reference(&source, SAMPLE_RATE, Some(source_text))
+        .unwrap();
+    assert_eq!(with_text.embedding.len(), SPEAKER_EMBEDDING_DIM);
+    assert_eq!(
+        with_text.latent_count(),
+        source.len().div_ceil(LATENT_SAMPLES)
+    );
+    assert_eq!(with_text.latents.len() % LATENT_DIM, 0);
+    // The same clip encodes the same way every time.
+    assert_eq!(
+        runtime
+            .encode_reference(&source, SAMPLE_RATE, Some(source_text))
+            .unwrap(),
+        with_text
+    );
+    let target = "And now the same voice says something entirely new.";
+    let clone = |voice: MingReferenceVoice, control: MingControl| MingRequest {
+        text: target.to_string(),
+        language: None,
+        voice: MingVoice::Reference(Arc::new(voice)),
+        control,
+    };
+    speak(
+        &runtime,
+        "clone_with_transcript",
+        &clone(with_text.clone(), MingControl::None),
+        32,
+    );
+    let audio_only = runtime
+        .encode_reference(&source, SAMPLE_RATE, None)
+        .unwrap();
+    assert!(audio_only.latents.is_empty());
+    speak(
+        &runtime,
+        "clone_audio_only",
+        &clone(audio_only.clone(), MingControl::None),
+        33,
+    );
+    speak(
+        &runtime,
+        "clone_emotion_sad",
+        &clone(audio_only, MingControl::Emotion(MingEmotion::Sad)),
+        34,
+    );
+    // Reference encode → decode keeps the clip recognisable in level.
+    let decoded = runtime.decoder().decode(&with_text.latents).unwrap();
+    assert_eq!(decoded.len(), with_text.latent_count() * LATENT_SAMPLES);
+    write_wav("clone_source_roundtrip", &decoded);
+    let rms = |samples: &[f32]| {
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    };
+    let ratio = rms(&decoded) / rms(&source);
+    assert!(
+        (0.5..2.0).contains(&ratio),
+        "round-trip level ratio {ratio}"
+    );
+}
+
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn speaker_encoder_separates_voices() {
+    let runtime = runtime();
+    let speaker = CampPlus::open(&model_dir().join(SPEAKER_WEIGHTS_FILE)).unwrap();
+    let text = "A short sentence for comparing two different speakers.";
+    let emma_a = speak(&runtime, "spk_emma_a", &built_in(text, "US_Emma", None), 41);
+    let emma_b = speak(
+        &runtime,
+        "spk_emma_b",
+        &built_in(
+            "Another line, spoken by the very same voice.",
+            "US_Emma",
+            None,
+        ),
+        42,
+    );
+    let george = speak(
+        &runtime,
+        "spk_george",
+        &built_in(text, "UK_George", None),
+        43,
+    );
+    let embed = |samples: &[f32]| speaker.embed_clip(samples, SAMPLE_RATE).unwrap();
+    let cosine = |a: &[f32], b: &[f32]| {
+        let dot = a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (norm(a) * norm(b))
+    };
+    let (a, b, g) = (embed(&emma_a), embed(&emma_b), embed(&george));
+    let same = cosine(&a, &b);
+    let other = cosine(&a, &g);
+    eprintln!("speaker cosine: same voice {same:.3}, other voice {other:.3}");
+    assert!(same > other + 0.1, "same {same} vs other {other}");
+}
+
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn half_precision_passes_its_range_probe() {
+    let (device, dtype) = device();
+    let runtime = MingRuntime::load(&model_dir(), &device, dtype, DType::F32).unwrap();
+    let report = runtime.numeric_self_check();
+    eprintln!("{}", report.diagnostics());
+    assert!(report.passed, "{}", report.reason);
+}
