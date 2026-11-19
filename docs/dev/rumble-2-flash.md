@@ -280,11 +280,20 @@ census (`tests/fixtures/asr_residency/rumble_2_flash.json`):
     punctuation, case or one-word differences in 32 compared.
   - 600 s files ran their 29 chunks serially in one dispatch: 69 audio s/s
     for one file and 77 for four. Chunk rows were added for this.
+- Chunk rows, live on Metal (M1 Pro, two rows in flight) with a 150 s and a
+  600 s interview recording:
+  - Transcripts and detected language were identical with chunk rows on and
+    off, on the retained route and on the default atomic route.
+  - Three concurrent 150 s files each matched their solo run.
+  - With the retained route forced on, the 600 s file took 39.6 s against
+    57.6 s without chunk rows.
+  - On the default route it took 49.1 s against 55.6 s, and three
+    concurrent 150 s files took 33.3 s against 41.3 s.
 
 Not verified:
 
 - Parity against transformers. `scripts/fixtures/generate_rumble_reference.py`
   writes the fixture the ignored parity tests read; it has not been run.
-- Long files as chunk rows on CUDA, and the decode graphs' gain over the
-  standard decode (the A/B was cut short when the spot VM was preempted).
+- Long files as chunk rows on CUDA (only on Metal so far), and the decode
+  graphs' gain over the standard decode (the A/B was cut short when the spot VM was preempted).
 - Languages other than English, and accuracy on a benchmark set.
