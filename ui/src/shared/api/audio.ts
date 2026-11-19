@@ -845,6 +845,19 @@ export interface TranscriptionProcessingProgress {
   percent?: number | null;
 }
 
+/**
+ * How a transcript is written, for models whose route capabilities report
+ * `transcript_style`. An unset option keeps the model's default.
+ */
+export interface TranscriptStyle {
+  /** Numbers as digits (true) or as words (false). */
+  digits?: boolean;
+  /** Keep fillers such as "um" and "uh". */
+  filler?: boolean;
+  /** Keep repeated words (true) or collapse them (false). */
+  verbatim?: boolean;
+}
+
 export interface TranscriptionRecord {
   id: string;
   created_at: number;
@@ -857,6 +870,8 @@ export interface TranscriptionRecord {
   target_language?: string | null;
   /** Terms the job biased recognition toward. */
   keywords?: string[];
+  /** The transcript style options the job set (models that take them). */
+  transcript_style?: TranscriptStyle;
   processing_status: TranscriptionProcessingStatus;
   processing_error?: string | null;
   processing_progress?: TranscriptionProcessingProgress | null;
@@ -893,6 +908,8 @@ export interface TranscriptionRecordCreateRequest {
   target_language?: string;
   /** Terms to bias recognition toward (models with keyword biasing). */
   keywords?: string[];
+  /** Transcript style (models with `transcript_style`); unset keeps the model's default. */
+  transcript_style?: TranscriptStyle;
   include_timestamps?: boolean;
   generate_summary?: boolean;
 }
@@ -3281,6 +3298,12 @@ export class AudioApiClient {
       for (const keyword of request.keywords ?? []) {
         form.append("keywords", keyword);
       }
+      for (const option of ["digits", "filler", "verbatim"] as const) {
+        const value = request.transcript_style?.[option];
+        if (value !== undefined) {
+          form.append(option, value ? "true" : "false");
+        }
+      }
       if (request.include_timestamps) {
         form.append("include_timestamps", "true");
       }
@@ -3312,6 +3335,9 @@ export class AudioApiClient {
         language: request.language,
         target_language: request.target_language,
         keywords: request.keywords,
+        digits: request.transcript_style?.digits,
+        filler: request.transcript_style?.filler,
+        verbatim: request.transcript_style?.verbatim,
         include_timestamps: Boolean(request.include_timestamps),
         generate_summary: Boolean(request.generate_summary),
         stream,

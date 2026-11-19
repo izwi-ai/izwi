@@ -1021,6 +1021,10 @@ export function TranscriptionPage({
                       selectedModelSupportsKeywords={
                         newTranscriptionRouteCapabilities?.keyword_biasing === true
                       }
+                      selectedModelSupportsTranscriptStyle={
+                        newTranscriptionRouteCapabilities?.transcript_style ===
+                        true
+                      }
                       selectedModelHasNativeWordTimestamps={
                         newTranscriptionRouteCapabilities?.native_word_timestamps ===
                         true
