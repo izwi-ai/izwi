@@ -814,6 +814,11 @@ fn decoder_kv_geometry(variant: ModelVariant) -> Option<DecoderKvGeometry> {
                 kv_width: 512,
             }
         }
+        // Rumble's Qwen3 trunk: 14 layers, 8 KV heads of 128.
+        ModelVariant::Rumble2Flash => DecoderKvGeometry {
+            layers: 14,
+            kv_width: 1024,
+        },
         _ => return None,
     })
 }
@@ -1210,6 +1215,7 @@ mod tests {
                         | ModelFamily::Voxtral
                         | ModelFamily::GraniteSpeechAsr
                         | ModelFamily::GraniteSpeech5Asr
+                        | ModelFamily::RumbleAsr
                 );
             assert_eq!(row(variant).is_some(), wide, "{variant}");
         }
@@ -1334,6 +1340,28 @@ mod tests {
         }
     }
 
+    /// A Rumble row holds 14 layers' BF16 K and V and a BF16 prompt
+    /// embedding over its 1,051-token minimum sequence (the 128-token prompt
+    /// reserve, one window's audio tokens and its 512-token budget) and an
+    /// F32 logits row: about 59 MiB, so 32 rows take about 1.9 GiB.
+    #[test]
+    fn a_rumble_cuda_decode_row_is_priced_for_the_width_fit() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        let rumble = cuda_decode_row_bytes(ModelVariant::Rumble2Flash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rumble, 1_051 * (2 * 14 * 1024 * 2 + 1024 * 2) + 99_630 * 4);
+        assert_eq!(rumble / MIB, 59);
+        for (headroom, width) in [(70 * GIB, 32), (13 * GIB, 32), (3 * GIB, 16), (GIB, 8)] {
+            assert_eq!(
+                crate::catalog::fit_asr_decode_width(32, 8, rumble, headroom),
+                width,
+                "{headroom}"
+            );
+        }
+    }
+
     /// The pinned decoder KV widths match the checkpoints' K projections.
     #[test]
     fn decoder_kv_geometry_matches_the_checkpoint_census() {
@@ -1394,6 +1422,11 @@ mod tests {
                     "../../../tests/fixtures/asr_residency/granite_speech_5_0_2b_gguf_q8_0.json"
                 ),
                 "blk.{i}.attn_k.weight",
+            ),
+            (
+                ModelVariant::Rumble2Flash,
+                include_str!("../../../tests/fixtures/asr_residency/rumble_2_flash.json"),
+                "model.language_model.layers.{i}.self_attn.k_proj.weight",
             ),
         ] {
             let geometry = decoder_kv_geometry(variant).unwrap();
