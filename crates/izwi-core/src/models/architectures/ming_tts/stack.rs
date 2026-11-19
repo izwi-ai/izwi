@@ -30,13 +30,15 @@ use crate::models::shared::rope::{rope_frequencies, RopeFrequencies, RopeScaling
 pub(crate) const MAX_DECODE_GROUP: usize = 32;
 
 /// RMSNorm with its statistics in F32 whatever the model dtype: `eps` 1e-6
-/// is below F16's smallest normal number.
+/// is below F16's smallest normal number. The result has `x`'s dtype.
 pub(crate) fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     let dtype = x.dtype();
     let wide = x.to_dtype(DType::F32)?;
     let variance = wide.sqr()?.mean_keepdim(D::Minus1)?;
     let normed = wide.broadcast_div(&(variance + eps)?.sqrt()?)?;
-    Ok(normed.to_dtype(dtype)?.broadcast_mul(weight)?)
+    Ok(normed
+        .to_dtype(dtype)?
+        .broadcast_mul(&weight.to_dtype(dtype)?)?)
 }
 
 /// `x` [rows, in] through `weight` [out, in] (+ `bias`), each row rounded
@@ -76,15 +78,23 @@ fn project(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor>
     }
 }
 
+/// One layer's weights, each as the checkpoint stores it. Nothing is
+/// joined on the device: a joined tensor is a device-written buffer, which
+/// Metal rounds up to a power of two (the 35 MB gate-and-up pair of an F32
+/// stack would take 64 MB), and the load plan prices the stored tensors.
 pub(crate) struct MingLayer {
     input_norm: Tensor,
-    /// q, k and v stacked: [q_out + 2 kv_out, hidden], and their biases.
-    qkv: Tensor,
-    qkv_bias: Tensor,
+    q: Tensor,
+    q_bias: Tensor,
+    k: Tensor,
+    k_bias: Tensor,
+    v: Tensor,
+    v_bias: Tensor,
     o_proj: Tensor,
     post_norm: Tensor,
-    /// gate and up stacked: [2 intermediate, hidden].
-    gate_up: Tensor,
+    gate: Tensor,
+    up: Tensor,
+    /// The down projection, F32 under F16 weights (see [`Self::finish`]).
     down: Tensor,
 }
 
@@ -97,42 +107,41 @@ impl MingLayer {
             Ok(vb.get((rows, cols), "weight")?)
         };
         let bias = |vb: VarBuilder, rows: usize| -> Result<Tensor> { Ok(vb.get(rows, "bias")?) };
-        let qkv = Tensor::cat(
-            &[
-                weight(attn.pp("q_proj"), cfg.q_out(), hidden)?,
-                weight(attn.pp("k_proj"), cfg.kv_out(), hidden)?,
-                weight(attn.pp("v_proj"), cfg.kv_out(), hidden)?,
-            ],
-            0,
-        )?;
-        let qkv_bias = Tensor::cat(
-            &[
-                bias(attn.pp("q_proj"), cfg.q_out())?,
-                bias(attn.pp("k_proj"), cfg.kv_out())?,
-                bias(attn.pp("v_proj"), cfg.kv_out())?,
-            ],
-            0,
-        )?;
-        let gate_up = Tensor::cat(
-            &[
-                weight(mlp.pp("gate_proj"), cfg.intermediate_size, hidden)?,
-                weight(mlp.pp("up_proj"), cfg.intermediate_size, hidden)?,
-            ],
-            0,
-        )?;
         Ok(Self {
             input_norm: vb.pp("input_layernorm").get(hidden, "weight")?,
-            qkv,
-            qkv_bias,
+            q: weight(attn.pp("q_proj"), cfg.q_out(), hidden)?,
+            q_bias: bias(attn.pp("q_proj"), cfg.q_out())?,
+            k: weight(attn.pp("k_proj"), cfg.kv_out(), hidden)?,
+            k_bias: bias(attn.pp("k_proj"), cfg.kv_out())?,
+            v: weight(attn.pp("v_proj"), cfg.kv_out(), hidden)?,
+            v_bias: bias(attn.pp("v_proj"), cfg.kv_out())?,
             o_proj: weight(attn.pp("o_proj"), hidden, cfg.q_out())?,
             post_norm: vb.pp("post_attention_layernorm").get(hidden, "weight")?,
-            gate_up,
-            down: weight(mlp.pp("down_proj"), hidden, cfg.intermediate_size)?,
+            gate: weight(mlp.pp("gate_proj"), cfg.intermediate_size, hidden)?,
+            up: weight(mlp.pp("up_proj"), cfg.intermediate_size, hidden)?,
+            down: {
+                let down = mlp.pp("down_proj");
+                if vb.dtype() == DType::F16 {
+                    down.get_with_hints_dtype(
+                        (hidden, cfg.intermediate_size),
+                        "weight",
+                        Default::default(),
+                        DType::F32,
+                    )?
+                } else {
+                    weight(down, hidden, cfg.intermediate_size)?
+                }
+            },
         })
     }
 
-    /// q [tokens, heads, dim], k and v [tokens, kv_heads, dim], q and k
-    /// rotated.
+    /// The dtype the layer's matmuls run in.
+    fn dtype(&self) -> DType {
+        self.q.dtype()
+    }
+
+    /// q [tokens, heads, dim], k and v [tokens, kv_heads, dim] in the
+    /// layer's dtype, q and k rotated; `x` is the residual stream (F32).
     fn qkv(
         &self,
         x: &Tensor,
@@ -142,21 +151,19 @@ impl MingLayer {
         rows_independent: bool,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let tokens = x.dim(0)?;
-        let (q_out, kv_out, head_dim) = (cfg.q_out(), cfg.kv_out(), cfg.head_dim);
-        let normed = rms_norm(x, &self.input_norm, cfg.rms_norm_eps)?;
-        let qkv = if rows_independent {
-            project_rows(&normed, &self.qkv, Some(&self.qkv_bias))?
-        } else {
-            project(&normed, &self.qkv, Some(&self.qkv_bias))?
+        let head_dim = cfg.head_dim;
+        let normed = rms_norm(x, &self.input_norm, cfg.rms_norm_eps)?.to_dtype(self.dtype())?;
+        let run = |weight: &Tensor, bias: &Tensor| -> Result<Tensor> {
+            if rows_independent {
+                project_rows(&normed, weight, Some(bias))
+            } else {
+                project(&normed, weight, Some(bias))
+            }
         };
-        let q = qkv
-            .narrow(1, 0, q_out)?
-            .reshape((tokens, cfg.num_attention_heads, head_dim))?;
-        let k =
-            qkv.narrow(1, q_out, kv_out)?
-                .reshape((tokens, cfg.num_key_value_heads, head_dim))?;
-        let v = qkv
-            .narrow(1, q_out + kv_out, kv_out)?
+        let (cos, sin) = (&cos.to_dtype(self.dtype())?, &sin.to_dtype(self.dtype())?);
+        let q = run(&self.q, &self.q_bias)?.reshape((tokens, cfg.num_attention_heads, head_dim))?;
+        let k = run(&self.k, &self.k_bias)?.reshape((tokens, cfg.num_key_value_heads, head_dim))?;
+        let v = run(&self.v, &self.v_bias)?
             .reshape((tokens, cfg.num_key_value_heads, head_dim))?
             .contiguous()?;
         Ok((
@@ -166,7 +173,15 @@ impl MingLayer {
         ))
     }
 
-    /// The residual branches after attention: `attn` is [tokens, q_out].
+    /// The residual branches after attention: `attn` is [tokens, q_out] in
+    /// the layer's dtype, `x` and the result the residual stream (F32).
+    ///
+    /// The residual stream stays in F32 whatever the weights' dtype, and so
+    /// do the gated product and the down projection: on the published
+    /// weights layer 3's down projection writes values past F16's 65,504
+    /// (its gated product already reaches 21,056 on a short prompt), a
+    /// "massive activation" channel Qwen2.5 carries. In F16 they become
+    /// infinities that reach every later layer and the flow head.
     fn finish(
         &self,
         x: &Tensor,
@@ -181,15 +196,14 @@ impl MingLayer {
                 project(x, weight, None)
             }
         };
-        let x = x.add(&run(attn, &self.o_proj)?)?;
-        let gate_up = run(
-            &rms_norm(&x, &self.post_norm, cfg.rms_norm_eps)?,
-            &self.gate_up,
-        )?;
-        let gate = gate_up.narrow(1, 0, cfg.intermediate_size)?;
-        let up = gate_up.narrow(1, cfg.intermediate_size, cfg.intermediate_size)?;
+        let wide = x.dtype();
+        let x = x.add(&run(attn, &self.o_proj)?.to_dtype(wide)?)?;
+        let normed = rms_norm(&x, &self.post_norm, cfg.rms_norm_eps)?.to_dtype(self.dtype())?;
+        let down_dtype = self.down.dtype();
+        let gate = run(&normed, &self.gate)?.to_dtype(down_dtype)?;
+        let up = run(&normed, &self.up)?.to_dtype(down_dtype)?;
         let mlp = run(&candle_nn::ops::silu(&gate)?.mul(&up)?, &self.down)?;
-        Ok(x.add(&mlp)?)
+        Ok(x.add(&mlp.to_dtype(wide)?)?)
     }
 }
 
@@ -409,7 +423,7 @@ impl MingTrunk {
         let result = (|| -> Result<Tensor> {
             let inputs = order
                 .iter()
-                .map(|&i| rows[i].embeds.to_dtype(self.dtype))
+                .map(|&i| rows[i].embeds.to_dtype(DType::F32))
                 .collect::<candle_core::Result<Vec<_>>>()?;
             let mut hidden = if inputs.len() == 1 {
                 inputs.into_iter().next().expect("one row")
@@ -617,7 +631,7 @@ impl MingWindowStack {
         let mask = self.window_mask(kept, count)?;
         let groups = cfg.num_attention_heads / cfg.num_key_value_heads;
         let scale = 1.0 / (cfg.head_dim as f64).sqrt();
-        let mut hidden = x.to_dtype(self.dtype)?;
+        let mut hidden = x.to_dtype(DType::F32)?;
         for (layer, slot) in self.layers.iter().zip(state.kept.iter_mut()) {
             let (q, k, v) = layer.qkv(&hidden, &cos, &sin, cfg, false)?;
             let (keys, values) = match slot.take() {
@@ -655,6 +669,75 @@ impl MingWindowStack {
         }
         state.position = start + count;
         rms_norm(&hidden, &self.norm, cfg.rms_norm_eps)
+    }
+
+    /// [`Self::forward`] of one chunk from position 0, reporting for each
+    /// layer the largest magnitude of its attention input, attention
+    /// output, gate, up, gated product, MLP output and residual stream (a
+    /// diagnostic for precision limits).
+    #[cfg(test)]
+    pub(crate) fn trace_layers(&self, x: &Tensor) -> Result<Vec<[f32; 7]>> {
+        let cfg = &self.cfg;
+        let count = x.dim(0)?;
+        let max = |t: &Tensor| -> Result<f32> {
+            Ok(t.to_dtype(DType::F32)?
+                .abs()?
+                .flatten_all()?
+                .max(0)?
+                .to_scalar::<f32>()?)
+        };
+        let (cos, sin) = rope_table(
+            &self.freqs,
+            0,
+            count,
+            cfg.head_dim / 2,
+            self.dtype,
+            &self.device,
+        )?;
+        let mask = self.window_mask(0, count)?;
+        let groups = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let scale = 1.0 / (cfg.head_dim as f64).sqrt();
+        let mut hidden = x.to_dtype(DType::F32)?;
+        let mut rows = Vec::new();
+        for layer in &self.layers {
+            let (q, k, v) = layer.qkv(&hidden, &cos, &sin, cfg, false)?;
+            let q = q
+                .reshape((count, cfg.num_key_value_heads, groups, cfg.head_dim))?
+                .permute((1, 2, 0, 3))?
+                .contiguous()?;
+            let k = k.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
+            let v = v.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
+            let scores = (q.broadcast_matmul(&k.transpose(2, 3)?)? * scale)?
+                .to_dtype(DType::F32)?
+                .broadcast_add(&mask)?;
+            let weights = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(self.dtype)?;
+            let attn = weights
+                .broadcast_matmul(&v)?
+                .permute((2, 0, 1, 3))?
+                .contiguous()?
+                .reshape((count, cfg.q_out()))?;
+            let attn_in = max(&q)?;
+            let o = project(&attn, &layer.o_proj, None)?;
+            let mid = hidden.add(&o.to_dtype(DType::F32)?)?;
+            let normed =
+                rms_norm(&mid, &layer.post_norm, cfg.rms_norm_eps)?.to_dtype(self.dtype)?;
+            let down_dtype = layer.down.dtype();
+            let gate = project(&normed, &layer.gate, None)?.to_dtype(down_dtype)?;
+            let up = project(&normed, &layer.up, None)?.to_dtype(down_dtype)?;
+            let act = candle_nn::ops::silu(&gate)?.mul(&up)?;
+            let mlp = project(&act, &layer.down, None)?;
+            hidden = mid.add(&mlp.to_dtype(DType::F32)?)?;
+            rows.push([
+                attn_in,
+                max(&o)?,
+                max(&gate)?,
+                max(&up)?,
+                max(&act)?,
+                max(&mlp)?,
+                max(&hidden)?,
+            ]);
+        }
+        Ok(rows)
     }
 
     /// The additive mask of `count` new positions over `kept` earlier keys

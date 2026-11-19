@@ -15,12 +15,11 @@ use super::retained::{
     ming_decode_batch, ming_prefill_batch, MingDecodeStep, MingPhase, MingPrefillStep,
     MingPreparedArtifact, MingRetainedState, MingStepRow,
 };
-use super::{MingGenerationParams, MingReferenceVoice, MingRequest, MingRuntime};
+use super::{MingGenerationParams, MingPrecision, MingReferenceVoice, MingRequest, MingRuntime};
 use crate::backends::{BackendKind, DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelVariant, MING_TTS_VOICES};
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
-use crate::kernels::numeric_check::load_with_precision_fallback;
 use crate::models::shared::attention::paged::default_kv_page_size;
 
 static NEXT_MING_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -42,8 +41,10 @@ pub struct MingTtsDiagnostics {
     pub model_family: &'static str,
     pub variant: String,
     pub sample_rate: u32,
-    /// The language model's and flow path's dtype.
+    /// The language model's dtype.
     pub dtype: String,
+    /// The aggregator's and flow head's dtype.
+    pub flow_dtype: String,
     /// The VAE's dtype.
     pub vae_dtype: String,
     pub context_positions: usize,
@@ -68,9 +69,9 @@ pub fn ming_lm_precision(device: &DeviceProfile) -> DTypeSelection {
     device.resolve_dtype(DTypeSelectionRequest::new(None).with_model_family(ModelFamily::MingTts))
 }
 
-/// Whether a model loaded in `dtype` reloads in F32 when its probe fails:
-/// on every backend (the F32 weights of the probed parts are 2.8 GB), and
-/// never from F32 itself.
+/// Whether a model loaded in `dtype` may reload in another precision when
+/// its probe fails (see [`MingPrecision::ladder`]): on every backend, never
+/// from F32 itself.
 pub(crate) fn ming_reloads_in_f32(_device: &DeviceProfile, dtype: DType) -> bool {
     dtype != DType::F32
 }
@@ -88,19 +89,39 @@ impl MingTtsModel {
         // spectrum whose magnitudes span several orders, and it runs once
         // per audio window.
         let selection = ming_lm_precision(&device);
-        let (runtime, precision) = load_with_precision_fallback(
-            "Ming language model and flow path",
-            &selection,
-            ming_reloads_in_f32(&device, selection.dtype),
-            DType::F32,
-            |dtype| MingRuntime::load(model_dir, &device.device, dtype, DType::F32),
-            MingRuntime::numeric_self_check,
-        )?;
+        let ladder = MingPrecision::ladder(selection.dtype);
+        let last = ladder.len() - 1;
+        let mut loaded = None;
+        for (step, precision) in ladder.into_iter().enumerate() {
+            let runtime = MingRuntime::load(model_dir, &device.device, precision)?;
+            if step == last {
+                loaded = Some((runtime, precision, None));
+                break;
+            }
+            let report = runtime.numeric_self_check();
+            if report.passed {
+                loaded = Some((runtime, precision, Some(report)));
+                break;
+            }
+            tracing::warn!(
+                "Ming TTS {:?} failed its range probe on {:?} ({}); trying the next precision",
+                precision,
+                BackendKind::from(device.kind),
+                report.reason
+            );
+            // Free this attempt's weights before loading the next.
+            drop(runtime);
+            device.device.synchronize()?;
+        }
+        let (runtime, precision, report) = loaded.expect("the ladder ends in F32");
         tracing::info!(
-            "Ming TTS dtype on {:?}: {:?} ({}); VAE F32, {} keys per frame",
+            "Ming TTS on {:?}: language model {:?}, flow path {:?}, VAE {:?} ({}; {}); {} keys per VAE frame",
             BackendKind::from(device.kind),
-            precision.loaded,
-            precision.reason,
+            precision.lm,
+            precision.flow,
+            precision.vae,
+            selection.reason,
+            report.map_or_else(|| "F32, no probe".to_string(), |report| report.reason),
             vae_window_keys(),
         );
         Ok(Self {
@@ -141,6 +162,7 @@ impl MingTtsModel {
             variant: self.variant.to_string(),
             sample_rate: SAMPLE_RATE,
             dtype: format!("{:?}", self.runtime.lm_dtype()),
+            flow_dtype: format!("{:?}", self.runtime.flow_dtype()),
             vae_dtype: format!("{:?}", self.runtime.vae_dtype()),
             context_positions: self.context_tokens(),
             max_new_tokens: MAX_NEW_LATENTS,

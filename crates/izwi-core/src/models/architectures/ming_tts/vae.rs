@@ -35,8 +35,12 @@ const MAX_MAGNITUDE: f32 = 100.0;
 /// The floor added to the posterior's scale (`softplus(scale) + 1e-4`).
 const POSTERIOR_SCALE_FLOOR: f32 = 1e-4;
 
-fn linear(x: &Tensor, weight_t: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-    let y = x.matmul(weight_t)?;
+/// `x` [rows, in] through `weight` [out, in] as stored (transposed as a
+/// view, so no transposed copy is written on the device).
+fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    // Metal's matmul takes a left operand only with unit row stride: the
+    // encoder's group tokens are a strided view.
+    let y = x.contiguous()?.matmul(&weight.t()?)?;
     match bias {
         Some(bias) => Ok(y.broadcast_add(bias)?),
         None => Ok(y),
@@ -44,7 +48,7 @@ fn linear(x: &Tensor, weight_t: &Tensor, bias: Option<&Tensor>) -> Result<Tensor
 }
 
 fn weight_t(vb: &VarBuilder, output: usize, input: usize) -> Result<Tensor> {
-    Ok(vb.get((output, input), "weight")?.t()?.contiguous()?)
+    Ok(vb.get((output, input), "weight")?)
 }
 
 /// The inverse STFT of the head: one frame's spectrum to its windowed
@@ -386,7 +390,8 @@ impl MingVaeEncoder {
         let tokens = grouped
             .reshape((latents, FRAMES_PER_LATENT + 1, width))?
             .narrow(1, FRAMES_PER_LATENT, 1)?
-            .squeeze(1)?;
+            .squeeze(1)?
+            .contiguous()?;
         let moments = linear(&tokens, &self.fc3_t, Some(&self.fc3_bias))?
             .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?;

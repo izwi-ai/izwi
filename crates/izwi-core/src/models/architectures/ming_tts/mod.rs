@@ -72,6 +72,53 @@ use stack::{MingForwardRow, MingTrunk};
 use stream::MingAudioStream;
 use vae::{MingVaeDecoder, MingVaeEncoder};
 
+/// What each part of the model runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MingPrecision {
+    /// The language model.
+    pub lm: DType,
+    /// The aggregator and the flow head.
+    pub flow: DType,
+    /// The VAE.
+    pub vae: DType,
+}
+
+impl MingPrecision {
+    /// Everything in F32.
+    pub const F32: Self = Self {
+        lm: DType::F32,
+        flow: DType::F32,
+        vae: DType::F32,
+    };
+
+    /// The flow path's dtype beside a language model in `dtype`: the same.
+    pub fn flow_dtype_for(dtype: DType) -> DType {
+        dtype
+    }
+
+    /// The order loads try for a device whose policy picks `dtype`: the
+    /// language model and flow path in it; then the flow path in F32; then
+    /// everything in F32. The VAE is F32 throughout.
+    pub fn ladder(dtype: DType) -> Vec<Self> {
+        let first = Self {
+            lm: dtype,
+            flow: Self::flow_dtype_for(dtype),
+            vae: DType::F32,
+        };
+        let mut steps = vec![first];
+        if first.flow != DType::F32 {
+            steps.push(Self {
+                flow: DType::F32,
+                ..first
+            });
+        }
+        if first != Self::F32 {
+            steps.push(Self::F32);
+        }
+        steps
+    }
+}
+
 /// The noise streams of one request's seed.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MingNoiseStream {
@@ -235,18 +282,19 @@ fn host_f32(tensor: &Tensor) -> Result<Vec<f32>> {
 }
 
 impl MingRuntime {
-    /// Load the language model and the flow path in `lm_dtype` and the VAE
-    /// in `vae_dtype` from `model_dir`.
-    pub fn load(
-        model_dir: &Path,
-        device: &Device,
-        lm_dtype: DType,
-        vae_dtype: DType,
-    ) -> Result<Self> {
+    /// Load the language model in `precision.lm`, the aggregator and flow
+    /// head in `precision.flow` and the VAE in `precision.vae` from
+    /// `model_dir`.
+    pub fn load(model_dir: &Path, device: &Device, precision: MingPrecision) -> Result<Self> {
         let cfg = MingTtsConfig::load(model_dir)?;
         let tokenizer = MingTokenizer::load(&model_dir.join(TOKENIZER_FILE))?;
-        let lm = weights::mmap_checkpoint(model_dir, lm_dtype, device)?;
-        let vae = weights::mmap_checkpoint(model_dir, vae_dtype, device)?;
+        let lm = weights::mmap_checkpoint(model_dir, precision.lm, device)?;
+        let flow = if precision.flow == precision.lm {
+            lm.clone()
+        } else {
+            weights::mmap_checkpoint(model_dir, precision.flow, device)?
+        };
+        let vae = weights::mmap_checkpoint(model_dir, precision.vae, device)?;
         let host = weights::mmap_checkpoint(model_dir, DType::F32, &Device::Cpu)?;
         let speaker_path = model_dir.join(SPEAKER_WEIGHTS_FILE);
         let speaker = if speaker_path.is_file() {
@@ -258,7 +306,9 @@ impl MingRuntime {
             );
             None
         };
-        Self::assemble(model_dir, cfg, tokenizer, &lm, &vae, &host, speaker, device)
+        Self::assemble(
+            model_dir, cfg, tokenizer, &lm, &flow, &vae, &host, speaker, device,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -267,6 +317,7 @@ impl MingRuntime {
         cfg: MingTtsConfig,
         tokenizer: MingTokenizer,
         lm: &candle_nn::VarBuilder,
+        flow: &candle_nn::VarBuilder,
         vae: &candle_nn::VarBuilder,
         host: &candle_nn::VarBuilder,
         speaker: Option<CampPlus>,
@@ -287,12 +338,12 @@ impl MingRuntime {
             )?,
             aggregator: MingAggregator::load(
                 cfg.aggregator.clone(),
-                lm.pp("linear_proj_audio"),
+                flow.pp("linear_proj_audio"),
                 hidden,
             )?,
             flow: MingFlowHead::load(
                 cfg.flow.clone(),
-                lm.pp("flowloss").pp("cfm").pp("model"),
+                flow.pp("flowloss").pp("cfm").pp("model"),
                 hidden,
             )?,
             stop_weight: host_f32(&stop.get((2, hidden), "weight")?)?,
@@ -326,6 +377,18 @@ impl MingRuntime {
 
     pub fn vae_dtype(&self) -> DType {
         self.decoder.dtype()
+    }
+
+    pub fn flow_dtype(&self) -> DType {
+        self.flow.dtype()
+    }
+
+    pub fn precision(&self) -> MingPrecision {
+        MingPrecision {
+            lm: self.lm_dtype(),
+            flow: self.flow_dtype(),
+            vae: self.vae_dtype(),
+        }
     }
 
     pub fn trunk(&self) -> &MingTrunk {
@@ -569,7 +632,11 @@ impl MingRuntime {
     pub fn numeric_self_check(&self) -> NumericSelfCheckReport {
         const STEPS: usize = 3;
         run_numeric_self_check(
-            format!("Ming language model and flow path {:?}", self.trunk.dtype()),
+            format!(
+                "Ming language model {:?}, flow path {:?}",
+                self.trunk.dtype(),
+                self.flow.dtype()
+            ),
             F16_SAFE_MAX_ABS,
             || -> Result<Vec<(String, Tensor)>> {
                 let prompt = self.prompt(&MingRequest {
@@ -689,6 +756,21 @@ mod tests {
         params.max_new_tokens = MIN_LATENTS;
         params.guidance = f32::NAN;
         assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn the_precision_ladder_steps_down_to_f32() {
+        assert_eq!(MingPrecision::ladder(DType::F32), vec![MingPrecision::F32]);
+        let f16 = MingPrecision::ladder(DType::F16);
+        assert_eq!(f16.len(), 3);
+        assert_eq!((f16[0].lm, f16[0].flow), (DType::F16, DType::F16));
+        assert_eq!((f16[1].lm, f16[1].flow), (DType::F16, DType::F32));
+        assert_eq!(f16[2], MingPrecision::F32);
+        let bf16 = MingPrecision::ladder(DType::BF16);
+        assert_eq!(bf16.len(), 3);
+        assert_eq!((bf16[0].lm, bf16[0].flow), (DType::BF16, DType::BF16));
+        assert_eq!((bf16[1].lm, bf16[1].flow), (DType::BF16, DType::F32));
+        assert!(bf16.iter().chain(&f16).all(|step| step.vae == DType::F32));
     }
 
     #[test]

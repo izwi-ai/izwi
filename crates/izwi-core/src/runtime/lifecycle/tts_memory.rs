@@ -52,7 +52,8 @@ use crate::models::architectures::maya2::{
     maya2_mimi_bf16_device_bytes, maya2_reloads_in_f32,
 };
 use crate::models::architectures::ming_tts::{
-    ming_lm_precision, ming_reloads_in_f32, unused_tensors as ming_unused_tensors, MingTtsConfig,
+    ming_lm_precision, ming_reloads_in_f32, unused_tensors as ming_unused_tensors, MingPrecision,
+    MingTtsConfig,
     WEIGHTS_FILE as MING_TTS_WEIGHTS_FILE,
 };
 use crate::models::architectures::qwen3::core::qwen3_dense_projection_fusion_enabled;
@@ -556,18 +557,24 @@ fn ming_tts_plan(
         .map(|(name, _)| name)
         .collect::<Vec<_>>();
     let dtype = ming_lm_precision(device).dtype;
-    let plan = price_ming_tts(&files, backend, dtype, &unused)?;
+    let plan = price_ming_tts(
+        &files,
+        backend,
+        dtype,
+        MingPrecision::flow_dtype_for(dtype),
+        &unused,
+    )?;
     if ming_reloads_in_f32(device, dtype) {
-        // A language model or flow path that fails its load-time probe
-        // reloads in F32.
-        let dense = price_ming_tts(&files, backend, DType::F32, &unused)?;
+        // A model that fails its load-time probe reloads in F32.
+        let dense = price_ming_tts(&files, backend, DType::F32, DType::F32, &unused)?;
         return Ok(Some(plan.with_fallback_peak(&dense)));
     }
     Ok(Some(plan))
 }
 
 /// Ming-3.0-tts (`ming_tts/model.rs`), read through the staged loader: the
-/// language model, aggregator and flow head at `dtype`, the VAE at F32, the
+/// language model at `dtype` (its down projections in F32 under F16), the
+/// aggregator and flow head at `flow_dtype`, the VAE at F32, the
 /// two small heads on the host. The tensors inference never reads (the VAE
 /// stacks' one-row token tables, an unused layer norm, the stored window
 /// and the rotary buffers) are not loaded. CAM++ (28 MB) lives on the host.
@@ -575,6 +582,7 @@ fn price_ming_tts(
     files: &[CensusFile],
     backend: BackendKind,
     dtype: DType,
+    flow_dtype: DType,
     unused: &[String],
 ) -> Result<AsrResidencyPlan> {
     let mut ledger = Ledger::staged(backend);
@@ -589,6 +597,11 @@ fn price_ming_tts(
                 continue;
             }
             if name.starts_with("audio.") {
+                ledger.var(tensor, Source::Mapped, &[DType::F32])?;
+            } else if name.starts_with("linear_proj_audio.") || name.starts_with("flowloss.") {
+                ledger.var(tensor, Source::Mapped, &[flow_dtype])?;
+            } else if dtype == DType::F16 && name.ends_with(".mlp.down_proj.weight") {
+                // Kept in F32 under F16 weights (`ming_tts/stack.rs`).
                 ledger.var(tensor, Source::Mapped, &[DType::F32])?;
             } else {
                 ledger.var(tensor, Source::Mapped, &[dtype])?;
@@ -1154,10 +1167,12 @@ mod tests {
         )
     }
 
-    /// Ming-3.0-tts priced from its published tensors: the language model,
-    /// aggregator and flow head (698.9M parameters) at the backend's dtype
-    /// and the VAE (780.4M) in F32, with the tensors inference skips left
-    /// out: 5.51 GiB on the CPU, 4.21 GiB on Metal and CUDA.
+    /// Ming-3.0-tts priced from its published tensors: the language model
+    /// (494.0M parameters) and the aggregator and flow head (204.9M) at the
+    /// backend's dtype, the language model's down projections (104.6M) in
+    /// F32 under F16, the VAE (780.4M) in F32, with the tensors inference
+    /// skips left out: 5.51 GiB on the CPU, 4.40 GiB on Metal, 4.21 GiB on
+    /// CUDA.
     #[test]
     fn ming_tts_plan_prices_the_language_model_at_its_dtype_and_the_vae_in_f32() {
         let cfg = MingTtsConfig::pinned();
@@ -1189,10 +1204,11 @@ mod tests {
             .collect::<Vec<_>>();
         for (backend, dtype, gib) in [
             (BackendKind::Cpu, DType::F32, 5.51),
-            (BackendKind::Metal, DType::F16, 4.21),
+            (BackendKind::Metal, DType::F16, 4.40),
             (BackendKind::Cuda, DType::BF16, 4.21),
         ] {
-            let estimate = price_ming_tts(&files, backend, dtype, &unused)
+            let flow = MingPrecision::flow_dtype_for(dtype);
+            let estimate = price_ming_tts(&files, backend, dtype, flow, &unused)
                 .unwrap()
                 .estimate()
                 .unwrap();

@@ -30,15 +30,17 @@ const TIME_SCALE: f64 = 1_000.0;
 /// x_transformers' `RotaryEmbedding` base.
 const ROTARY_BASE: f64 = 10_000.0;
 
+/// A linear layer with its weight as stored, [out, in]: transposed as a
+/// view at each call, so no transposed copy is written on the device.
 struct Linear {
-    weight_t: Tensor,
+    weight: Tensor,
     bias: Option<Tensor>,
 }
 
 impl Linear {
     fn load(vb: VarBuilder, input: usize, output: usize, bias: bool) -> Result<Self> {
         Ok(Self {
-            weight_t: vb.get((output, input), "weight")?.t()?.contiguous()?,
+            weight: vb.get((output, input), "weight")?,
             bias: if bias {
                 Some(vb.get(output, "bias")?)
             } else {
@@ -52,7 +54,7 @@ impl Linear {
         let dims = x.dims().to_vec();
         let input = *dims.last().expect("a linear input has a last dim");
         let rows = dims[..dims.len() - 1].iter().product::<usize>();
-        let mut y = x.reshape((rows, input))?.matmul(&self.weight_t)?;
+        let mut y = x.reshape((rows, input))?.matmul(&self.weight.t()?)?;
         if let Some(bias) = &self.bias {
             y = y.broadcast_add(bias)?;
         }

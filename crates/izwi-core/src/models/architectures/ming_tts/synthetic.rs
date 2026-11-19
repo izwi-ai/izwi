@@ -130,6 +130,7 @@ pub(crate) fn tiny_runtime_on(device: &Device, dtype: DType) -> MingRuntime {
     let cfg = tiny_config();
     let tensors = tiny_weights(&cfg);
     let lm = VarBuilder::from_tensors(tensors.clone(), dtype, device);
+    let flow = lm.clone();
     let vae = VarBuilder::from_tensors(tensors.clone(), DType::F32, device);
     let host = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
     MingRuntime::assemble(
@@ -137,6 +138,7 @@ pub(crate) fn tiny_runtime_on(device: &Device, dtype: DType) -> MingRuntime {
         cfg,
         tiny_tokenizer(),
         &lm,
+        &flow,
         &vae,
         &host,
         None,

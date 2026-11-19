@@ -19,8 +19,8 @@ use super::config::{MingTtsConfig, LATENT_DIM, LATENT_SAMPLES, PINNED_TOKENS, TO
 use super::prompt::MingTokenizer;
 use super::speaker::{CampPlus, SPEAKER_EMBEDDING_DIM};
 use super::{
-    MingControl, MingEmotion, MingGenerationParams, MingReferenceVoice, MingRequest, MingRuntime,
-    MingStopReason, MingVoice, DEFAULT_GUIDANCE, SAMPLE_RATE, SPEAKER_WEIGHTS_FILE,
+    MingControl, MingEmotion, MingGenerationParams, MingPrecision, MingReferenceVoice, MingRequest,
+    MingRuntime, MingStopReason, MingVoice, DEFAULT_GUIDANCE, SAMPLE_RATE, SPEAKER_WEIGHTS_FILE,
 };
 
 fn model_dir() -> PathBuf {
@@ -40,7 +40,17 @@ fn device() -> (Device, DType) {
 
 fn runtime() -> MingRuntime {
     let (device, dtype) = device();
-    MingRuntime::load(&model_dir(), &device, dtype, DType::F32).unwrap()
+    let precision = MingPrecision::ladder(dtype)
+        .into_iter()
+        .find(|precision| {
+            let runtime = MingRuntime::load(&model_dir(), &device, *precision).unwrap();
+            let report = runtime.numeric_self_check();
+            eprintln!("{}", report.reason);
+            report.passed
+        })
+        .expect("a precision that passes its probe");
+    eprintln!("precision: {precision:?}");
+    MingRuntime::load(&model_dir(), &device, precision).unwrap()
 }
 
 fn write_wav(name: &str, samples: &[f32]) {
@@ -348,9 +358,44 @@ fn speaker_encoder_separates_voices() {
 #[test]
 #[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
 fn half_precision_passes_its_range_probe() {
-    let (device, dtype) = device();
-    let runtime = MingRuntime::load(&model_dir(), &device, dtype, DType::F32).unwrap();
+    // Some step of the ladder passes; the language model keeps the device's
+    // dtype whatever the flow path needs.
+    let runtime = runtime();
+    let (_, dtype) = device();
+    assert_eq!(runtime.lm_dtype(), dtype);
     let report = runtime.numeric_self_check();
     eprintln!("{}", report.diagnostics());
     assert!(report.passed, "{}", report.reason);
+}
+
+/// Where the language model's values outgrow F16: each layer's largest
+/// magnitudes, run densely in F16 on the test device (a diagnostic; it
+/// asserts nothing).
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn trace_language_model_magnitudes() {
+    let (device, dtype) = device();
+    let host = MingRuntime::load(&model_dir(), &Device::Cpu, MingPrecision::F32).unwrap();
+    let prompt = host
+        .prompt(&built_in(
+            "The quick brown fox jumps over the lazy dog, twice!",
+            "US_Emma",
+            None,
+        ))
+        .unwrap();
+    let cfg = MingTtsConfig::load(&model_dir()).unwrap();
+    let vb = super::weights::mmap_checkpoint(&model_dir(), dtype, &device).unwrap();
+    let stack =
+        super::stack::MingWindowStack::load(cfg.llm.clone(), vb.pp("model").pp("model"), 4_096)
+            .unwrap();
+    let x = candle_core::Tensor::from_vec(
+        prompt.embeds.clone(),
+        (prompt.positions, cfg.llm.hidden_size),
+        &device,
+    )
+    .unwrap();
+    eprintln!("layer | q | attn out | gate | up | gated | mlp out | residual ({dtype:?})");
+    for (layer, row) in stack.trace_layers(&x).unwrap().iter().enumerate() {
+        eprintln!("{layer:2} | {row:?}");
+    }
 }

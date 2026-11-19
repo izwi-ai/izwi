@@ -1012,8 +1012,10 @@ impl LoadedExecutionAdapter for MingTtsExecutionAdapter {
         preparation.concurrency = ConcurrencyClass::Exclusive;
         preparation.shape_policy = StageShapePolicy::Exact;
         preparation.max_work_units = 16_384;
-        // Normalising and tokenizing the prompt on the host.
-        preparation.max_workspace_bytes = 64 * 1024 * 1024;
+        // Tokenizing the prompt on the host; a new reference clip also runs
+        // the VAE encoder (in 256-frame attention chunks) and CAM++ over up
+        // to 20 s.
+        preparation.max_workspace_bytes = 768 * 1024 * 1024;
 
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),

@@ -1074,9 +1074,11 @@ impl ModelVariant {
             // 3.5 GB of Q8_0 weights, ~0.5 GB of F32 KV per 2,300-position
             // request and SNAC.
             Self::Maya13BGguf => 5.0,
-            // 1.48B parameters. On the CPU all F32 (5.9 GB); elsewhere the
-            // language model and flow path at F16 / BF16 (1.4 GB) beside
-            // the F32 VAE (3.1 GB), plus ~10 MB of KV per request.
+            // 1.48B parameters. On the CPU all F32 (5.9 GB); on Metal the
+            // language model and flow path in F16 (1.4 GB, the language
+            // model's down projections in F32: +0.2 GB) beside the F32 VAE
+            // (3.1 GB); on CUDA the same in BF16 without the F32 down
+            // projections; ~10 MB of KV a request.
             Self::Ming30Tts05B => 6.5,
             // 5.0 GB of weights at F16/BF16 (10 GB in F32 on the CPU, priced
             // by its residency plan), Mimi in F32, ~0.22 GB of KV per
