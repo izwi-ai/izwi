@@ -89,10 +89,12 @@ fn runtime_without_model(models: &ModelsDir, rows: usize) -> RuntimeService {
     .expect("runtime")
 }
 
+// The runtime's load and transcribe futures are boxed: a test's body future
+// lives on the test thread's stack, and inline they overflow its 2 MiB in an
+// unoptimized build (a long file's chunk rows did).
 async fn runtime_with(models: &ModelsDir, rows: usize) -> RuntimeService {
     let runtime = runtime_without_model(models, rows);
-    runtime
-        .load_model(VARIANT)
+    Box::pin(runtime.load_model(VARIANT))
         .await
         .expect("load the synthetic checkpoint");
     runtime
@@ -105,10 +107,11 @@ async fn transcribe_with(
     prompt: Option<&str>,
     keywords: &[&str],
 ) -> crate::error::Result<AsrTranscription> {
-    runtime
-        .asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
+    let variant = VARIANT.to_string();
+    Box::pin(
+        runtime.asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
             clip,
-            Some(&VARIANT.to_string()),
+            Some(&variant),
             language,
             prompt,
             crate::engine::AsrTaskOptions::new(
@@ -119,8 +122,9 @@ async fn transcribe_with(
             None,
             RuntimeRequestContext::default(),
             false,
-        )
-        .await
+        ),
+    )
+    .await
 }
 
 async fn transcribe(
@@ -243,10 +247,11 @@ async fn synthetic_requests_are_validated_before_admission() {
         );
     }
     // The model neither translates nor tags speakers.
-    let error = runtime
-        .asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
+    let variant = VARIANT.to_string();
+    let error = Box::pin(
+        runtime.asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
             &clip,
-            Some(&VARIANT.to_string()),
+            Some(&variant),
             None,
             None,
             crate::engine::AsrTaskOptions::new(Some("en".into()), Vec::new()),
@@ -254,9 +259,10 @@ async fn synthetic_requests_are_validated_before_admission() {
             None,
             RuntimeRequestContext::default(),
             false,
-        )
-        .await
-        .unwrap_err();
+        ),
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(error, crate::error::Error::InvalidInput(_)),
         "{error}"
