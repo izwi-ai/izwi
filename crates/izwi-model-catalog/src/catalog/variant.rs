@@ -148,6 +148,14 @@ impl ModelFamily {
         )
     }
 
+    /// Whether one ASR invocation may fill the model's audio window to its
+    /// last sample, with no planning margin: the window is a fixed feature
+    /// window the model checks itself, and a full one always fits the
+    /// model's own sequence. Rumble's 30 s window is such a window.
+    pub fn asr_single_pass_fills_invocation_window(self) -> bool {
+        matches!(self, Self::RumbleAsr)
+    }
+
     /// Whether the chunked ASR route can stream this family's text token by
     /// token while a chunk decodes. Granite's chunk decode replays earlier
     /// text as a prefix and may re-decode a looping chunk, so its chunk text is
