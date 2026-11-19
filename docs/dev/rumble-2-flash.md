@@ -128,8 +128,13 @@ full window.
 
 **Retained rows** take audio that fits one pass, on a load that offers the
 route. Request preparation computes the log-mel on a host worker, then
-`RumbleEncoderBatcher` encodes the audio and splices it into the prompt on
-the device, one request at a time (`asr.encoder.rumble`, a scalar stage).
+`RumbleEncoderBatcher` encodes the audio and splices it into each prompt on
+the device (`asr.encoder.rumble`). Requests that queue while a pass runs
+encode together in the next one, up to the engine's rows: the tower packs
+every row's conv chunks and attends inside each row's own windows, so rows
+of any length share a pass with no padding (a ragged batch, each row priced
+at its own geometry). A packed and a lone encode agree up to rounding; one
+row takes the scalar path.
 The prompt prefills onto retained decoder pages in resumable spans
 (`asr.rumble.prefill.scalar`), and the row then decodes beside the other
 rows, one batched step per token (`asr.rumble.decode.tensor_continuous`).
@@ -155,8 +160,20 @@ atomically and the load fits no retained decoder state. The measurements
 below are why: at a width of a few rows the route costs a single request
 latency and gains the CPU nothing under load.
 
-The decode width is the engine's rows on CPU and Metal and the default CUDA
-width; Rumble is not certified for the wider CUDA tier.
+The decode width is the engine's rows on CPU and Metal. On CUDA with no
+width fixed it is up to 32 rows: each load fits 32, 16 or 8 to its memory
+from a priced row (14 layers of BF16 K and V over the 1,051-token minimum
+sequence, about 59 MiB). The encoder and prefill keep the engine's rows.
+
+On CUDA the batched decode step replays as one CUDA graph per padded width
+(1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 rows), the graphs Qwen3-ASR uses on the
+same trunk. A graph is checked against the eager body on its first two
+steps and each width's first step against the standard decode; a mismatch
+turns the graphs off for the process. `IZWI_RUMBLE_DECODE_GRAPHS=false`
+keeps the standard decode, a load prices 256 MiB for the graphs, and
+`decode_graph` in a row's diagnostics reports captures, replays and why the
+graphs are off. They need a BF16 or F16 decoder: a decoder that reloaded in
+F32 decodes without them. None of this has run on a GPU.
 
 Measured on an M1 Pro, where the engine's automatic width is 2, with the
 route switched on against the same build with it off:
@@ -179,10 +196,9 @@ Live transcription and dictation use the generic rolling-window route, the
 diarization pipeline uses the model as its transcription stage, and word
 timestamps come from the forced aligner.
 
-Not implemented: a batched audio encoder across requests (the encoder takes
-about 30 ms a request on an M1 Pro, against 15 ms a decode step), CUDA decode
-graphs on the trunk, and the checkpoint's auxiliary CTC head, which izwi does
-not download.
+Not implemented: the checkpoint's auxiliary CTC head, which izwi does not
+download, and argmax inside the decode graph (the logits are read back each
+step, as for Qwen3-ASR).
 
 ## Memory
 
@@ -230,6 +246,12 @@ census (`tests/fixtures/asr_residency/rumble_2_flash.json`):
   clip and a 150 s English one reported their language from three and seven
   chunks. A durable job on the German clip and the realtime WebSocket were
   rerun on Metal.
+- With the batched encoder (route forced on): on the published checkpoint,
+  four requests encoded in one tower pass and decoded as one batch emit the
+  atomic route's text, language and tokens on CPU and Metal. Live on Metal,
+  the 13 requests and the language clips returned the same transcripts as
+  before, 9 and 16 concurrent requests matched their solo runs, and the
+  metrics showed two-row encoder passes.
 - With the retained route, the same 13 requests returned the same
   transcripts, languages and diagnostics on both backends as the atomic
   route had. Under 8, 9 and 16 concurrent requests every transcript equalled
