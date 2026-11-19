@@ -251,6 +251,8 @@ pub struct AdminModelRouteCapabilities {
     pub speech_translation: bool,
     /// Transcription requests may bias recognition with `keywords`.
     pub keyword_biasing: bool,
+    /// Transcription requests may set `digits`, `filler` and `verbatim`.
+    pub transcript_style: bool,
     /// Speaker-attributed ASR jobs: the model writes speaker turns itself.
     pub speaker_attributed_asr: bool,
     /// Word timestamps come from the model itself (no forced aligner).
@@ -557,6 +559,7 @@ impl AdminModelRouteCapabilities {
             speech_to_text_realtime: variant.serves_live_asr() || variant.is_audio_chat(),
             speech_translation: variant.supports_asr_translation(),
             keyword_biasing: variant.supports_asr_keyword_biasing(),
+            transcript_style: variant.supports_asr_transcript_style(),
             speaker_attributed_asr: variant.supports_speaker_attributed_asr(),
             native_word_timestamps: variant.supports_native_word_timestamps(),
             diarization_records: variant.supports_diarization_records(),

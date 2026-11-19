@@ -33,6 +33,7 @@ pub(crate) mod tts_long_form;
 pub(crate) mod tts_policy;
 pub mod voice;
 pub mod voice_realtime;
+mod web_ui;
 
 pub use router::create_router;
 pub(crate) use router::DESKTOP_CORS_ORIGINS;

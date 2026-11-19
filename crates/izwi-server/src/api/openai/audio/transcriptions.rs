@@ -32,7 +32,7 @@ use crate::error::{core_api_error, ApiError};
 use crate::state::AppState;
 use izwi_core::{
     parse_model_variant, resolve_asr_model_variant, validate_asr_language, AlignmentSource,
-    AsrTaskOptions, AsrTranscription, WindowedAlignment, WorkloadClass,
+    AsrTaskOptions, AsrTranscriptStyle, AsrTranscription, WindowedAlignment, WorkloadClass,
 };
 
 const TRANSCRIPTION_STREAM_CAPACITY: usize = 64;
@@ -170,6 +170,8 @@ struct TranscriptionRequest {
     keywords: Vec<String>,
     /// Tag speakers in the transcript (models that do).
     speaker_labels: bool,
+    /// How the transcript is written (models with style options).
+    style: AsrTranscriptStyle,
     max_tokens: Option<usize>,
     /// OpenAI's sampling temperature. Checked, then unused: every ASR
     /// family decodes greedily (`validate_openai_decoding_options`).
@@ -189,6 +191,7 @@ impl TranscriptionRequest {
     fn task(&self) -> AsrTaskOptions {
         AsrTaskOptions::new(self.target_language.clone(), self.keywords.clone())
             .with_speaker_attribution(self.speaker_labels)
+            .with_style(self.style)
     }
 }
 
@@ -857,6 +860,12 @@ pub(crate) struct JsonRequestBody {
     #[serde(default)]
     speaker_labels: Option<bool>,
     #[serde(default)]
+    digits: Option<bool>,
+    #[serde(default)]
+    filler: Option<bool>,
+    #[serde(default)]
+    verbatim: Option<bool>,
+    #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
@@ -893,6 +902,11 @@ impl JsonRequestBody {
                 .map(KeywordsField::into_keywords)
                 .unwrap_or_default(),
             speaker_labels: self.speaker_labels.unwrap_or(false),
+            style: AsrTranscriptStyle {
+                digits: self.digits,
+                filler: self.filler,
+                verbatim: self.verbatim,
+            },
             max_tokens: self.max_tokens,
             temperature: self.temperature,
             chunking_strategy: self.chunking_strategy,
@@ -1120,6 +1134,28 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                                 "Invalid multipart 'speaker_labels' field: expected true or false",
                             )),
                         };
+                }
+                "digits" | "filler" | "verbatim" => {
+                    let text = field.text().await.map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart '{name}' field: {e}"
+                        ))
+                    })?;
+                    let value = match text.trim().to_ascii_lowercase().as_str() {
+                        "" => None,
+                        "false" | "0" | "no" | "off" => Some(false),
+                        "true" | "1" | "yes" | "on" => Some(true),
+                        _ => {
+                            return Err(ApiError::bad_request(format!(
+                                "Invalid multipart '{name}' field: expected true or false"
+                            )))
+                        }
+                    };
+                    match name.as_str() {
+                        "digits" => out.style.digits = value,
+                        "filler" => out.style.filler = value,
+                        _ => out.style.verbatim = value,
+                    }
                 }
                 "max_tokens" => {
                     let text = field.text().await.map_err(|e| {
@@ -1854,6 +1890,71 @@ mod tests {
 
         assert_eq!(task.translate_to.as_deref(), Some("English"));
         assert_eq!(task.keywords, vec!["Izwi", "Granite Speech"]);
+    }
+
+    #[tokio::test]
+    async fn requests_read_the_transcript_style_fields() {
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": wav_data_url(),
+                    "model": "Rumble-2-Flash",
+                    "digits": false,
+                    "filler": true
+                })
+                .to_string(),
+            ))
+            .expect("request should build");
+        let task = parse_transcription_request(request)
+            .await
+            .expect("request should parse")
+            .task();
+        assert_eq!(task.style.digits, Some(false));
+        assert_eq!(task.style.filler, Some(true));
+        assert_eq!(task.style.verbatim, None);
+
+        let boundary = "izwi-boundary";
+        let field = |name: &str, value: &str| {
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+        };
+        let multipart = |fields: Vec<String>| {
+            let body = [fields.concat(), format!("--{boundary}--\r\n")].concat();
+            Request::builder()
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .expect("request should build")
+        };
+        let task = parse_transcription_request(multipart(vec![
+            field("model", "Rumble-2-Flash"),
+            field("digits", "false"),
+            field("verbatim", "0"),
+        ]))
+        .await
+        .expect("request should parse")
+        .task();
+        assert_eq!(task.style.digits, Some(false));
+        assert_eq!(task.style.filler, None);
+        assert_eq!(task.style.verbatim, Some(false));
+
+        // Unset fields leave the model's defaults.
+        let task = parse_transcription_request(multipart(vec![field("model", "Rumble-2-Flash")]))
+            .await
+            .expect("request should parse")
+            .task();
+        assert!(task.style.is_default());
+
+        assert!(parse_transcription_request(multipart(vec![
+            field("model", "Rumble-2-Flash"),
+            field("filler", "maybe"),
+        ]))
+        .await
+        .is_err());
     }
 
     #[tokio::test]

@@ -94,6 +94,7 @@ impl ModelLifecycleController {
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::RumbleAsr
             | ModelFamily::NemotronTranscribeAsr
             | ModelFamily::SovTranscribeAsr
             | ModelFamily::Qwen3ForcedAligner => {

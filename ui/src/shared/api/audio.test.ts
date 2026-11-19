@@ -624,6 +624,39 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     );
   });
 
+  it("sends only the transcript style options a job set", async () => {
+    const fetchMock = vi.fn().mockImplementation(
+      async () =>
+        new Response(JSON.stringify(createdTranscriptionRecord), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new AudioApiClient(new ApiHttpClient("http://localhost/v1"));
+
+    await client.createTranscriptionRecord({
+      audio_base64: "UklGRg==",
+      model_id: "Rumble-2-Flash",
+      transcript_style: { digits: false, filler: true },
+    });
+    const json = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(json.digits).toBe(false);
+    expect(json.filler).toBe(true);
+    expect("verbatim" in json).toBe(false);
+
+    await client.createTranscriptionRecord({
+      audio_file: new Blob(["audio"], { type: "audio/wav" }),
+      audio_filename: "clip.wav",
+      model_id: "Rumble-2-Flash",
+      transcript_style: { verbatim: false },
+    });
+    const form = fetchMock.mock.calls[1][1].body as FormData;
+    expect(form.get("verbatim")).toBe("false");
+    expect(form.has("digits")).toBe(false);
+    expect(form.has("filler")).toBe(false);
+  });
+
   it("creates speaker-attributed ASR records through the SAA job kind", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

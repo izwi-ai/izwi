@@ -76,6 +76,24 @@ mod tests {
     }
 
     #[test]
+    fn a_transcript_style_needs_a_model_with_style_options() {
+        let style = AsrTaskOptions::default().with_style(izwi_core::AsrTranscriptStyle {
+            verbatim: Some(false),
+            ..Default::default()
+        });
+        validate_asr_task_request(Some("Rumble-2-Flash"), None, None, &style, false).unwrap();
+        validate_asr_task_request(Some("Rumble-2-Flash"), Some("en"), None, &style, true).unwrap();
+        assert!(
+            validate_asr_task_request(Some("Qwen3-ASR-0.6B-GGUF"), None, None, &style, false)
+                .is_err()
+        );
+        assert!(
+            validate_asr_task_request(Some("Parakeet-TDT-0.6B-v3"), None, None, &style, false)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn a_translation_needs_a_translating_model_and_no_timestamps() {
         let translate = AsrTaskOptions::new(Some("English".to_string()), Vec::new());
         validate_asr_task_request(

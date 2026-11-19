@@ -429,6 +429,130 @@ async fn granite_speech5_load_publishes_retained_asr_state() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+/// A Rumble load publishes retained decoder pages for its retained graph
+/// beside the atomic graph's invocation pages, and the bundle seals them:
+/// an ordinary or streaming requirement binds the retained sequence graph
+/// on the managed pages, a long-form one the atomic graph and its
+/// invocation state. With the retained route off
+/// (`IZWI_RUMBLE_RETAINED_DECODE`, the default on CPU and Metal) it
+/// publishes invocation state only and every requirement binds the atomic
+/// graph.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn rumble_load_publishes_retained_asr_state() {
+    // The runtime below is a CPU runtime.
+    let backend = BackendKind::Cpu;
+    use crate::models::architectures::rumble::{
+        rumble_retained_decode_enabled, rumble_test_physical_state_spec,
+    };
+    use crate::runtime::adapters::{
+        LoadedModelBundleDraft, LoadedStatePublication, StreamingRequirements,
+    };
+    let retained_route = rumble_retained_decode_enabled(backend);
+    // Serialize against OOM-ladder poison windows and load-transaction
+    // reservations on the process-global resource authority.
+    let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let directory = std::env::temp_dir().join(format!(
+        "izwi-rumble-state-publication-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: directory.clone(),
+        backend: BackendPreference::Cpu,
+        max_sequence_length: ContextLengthPreference::explicit(1024).unwrap(),
+        max_retained_sequences: 2,
+        max_staged_transactions: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let variant = ModelVariant::Rumble2Flash;
+    let authority = vector_authority(all_memory_capacity(1024));
+    let lease = authority
+        .reserve(
+            ReservationOwner::new(ReservationClass::Model, "rumble-load-publication"),
+            ResourceVector::zero(),
+        )
+        .unwrap();
+    let instance = runtime
+        .model_lifecycle
+        .install_loading_slot(variant, lease)
+        .unwrap();
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in_with_execution_limits(2, 1).unwrap(),
+        ExecutionGroupId::new(994),
+        instance,
+        variant,
+        backend,
+    )
+    .unwrap();
+    draft
+        .install_test_preparation_seals(backend, 2)
+        .unwrap();
+    let publication = runtime
+        .model_lifecycle
+        .load_rumble_state_publication(
+            variant,
+            instance,
+            &draft,
+            rumble_test_physical_state_spec,
+        )
+        .await
+        .unwrap();
+    let LoadedStatePublication::PhysicalV2 {
+        descriptor,
+        retained,
+        retained_uses,
+        ..
+    } = &publication
+    else {
+        panic!("Rumble ASR must publish physical state");
+    };
+    assert_eq!(retained.is_some(), retained_route);
+    assert_eq!(!retained_uses.is_empty(), retained_route);
+    assert_eq!(
+        !matches!(descriptor.retained, RetainedStateCapability::Stateless),
+        retained_route
+    );
+    let bundle = draft
+        .seal(HashMap::from([(CapabilityKind::Asr, publication)]))
+        .expect("a Rumble load must seal");
+    for streaming in [
+        StreamingRequirements::NONE,
+        StreamingRequirements::transport_only(),
+        StreamingRequirements::native(true),
+        StreamingRequirements::NONE.with_asr_long_form(true),
+        StreamingRequirements::transport_only().with_asr_long_form(true),
+    ] {
+        let contract = bundle
+            .contract_for_streaming(CapabilityKind::Asr, streaming)
+            .unwrap();
+        let sequence = retained_route && !streaming.asr_long_form;
+        assert_eq!(
+            contract.execution_profile.mode,
+            if sequence {
+                ExecutionMode::Sequence
+            } else {
+                ExecutionMode::Atomic
+            }
+        );
+        let binding = bundle
+            .capability_binding_for_streaming(CapabilityKind::Asr, streaming)
+            .unwrap();
+        assert_eq!(binding.execution, contract.adapter_binding().unwrap());
+        binding
+            .state
+            .validate_against(backend, &binding.execution)
+            .unwrap();
+        assert_eq!(binding.state.managed_kv_runtime().is_some(), sequence);
+    }
+    drop(bundle);
+    drop(runtime);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 fn invocation_execution(max_batch_size: usize) -> LoadedExecutionContract {
     let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
     let metadata = *RuntimeAdapterRegistry::built_in()

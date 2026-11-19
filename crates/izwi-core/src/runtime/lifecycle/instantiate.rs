@@ -74,6 +74,7 @@ pub(in crate::runtime::lifecycle) async fn load_into_registry(
         | ModelFamily::NemotronAsr
         | ModelFamily::GraniteSpeechAsr
         | ModelFamily::GraniteSpeech5Asr
+        | ModelFamily::RumbleAsr
         | ModelFamily::NemotronTranscribeAsr
         | ModelFamily::SovTranscribeAsr
         | ModelFamily::Qwen3ForcedAligner => {

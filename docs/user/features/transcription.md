@@ -56,6 +56,7 @@ izwi transcribe <audio-file>
 | `--output`, `-o` | Output file | stdout |
 | `--word-timestamps` | Include word timing | — |
 | `--speaker-labels` | Tag speakers and return the speaker turns (Nemotron 3.5 Transcribe); implies `verbose_json` | — |
+| `--numbers`, `--keep-fillers`, `--collapse-repeats` | Transcript style (Rumble 2 Flash) | model default |
 
 The CLI uploads the file as multipart form data. The server accepts up to 25 MiB per file by default; set `IZWI_OPENAI_AUDIO_UPLOAD_LIMIT_MB` on the server to raise it.
 
@@ -345,6 +346,72 @@ model repeated itself and was stopped).
 
 ---
 
+## Rumble 2 Flash
+
+`Rumble-2-Flash` is Reson8's compact (0.5B parameter) multilingual speech
+recognition model. It needs about 4 GB of memory on a Mac or CPU and 2 GB on
+an NVIDIA GPU.
+
+```bash
+izwi pull Rumble-2-Flash
+izwi transcribe meeting.wav --model Rumble-2-Flash
+```
+
+### Languages
+
+The model card lists 45 languages. Without `language` (CLI: `--language`), or
+with `auto`, the model detects the language and the response reports it.
+Naming the language skips detection. For these 30 the name or code is the one
+the model was trained with: Arabic, Cantonese, Chinese, Czech, Danish, Dutch,
+English, Filipino, Finnish, French, German, Greek, Hindi, Hungarian,
+Indonesian, Italian, Japanese, Korean, Macedonian, Malay, Persian, Polish,
+Portuguese, Romanian, Russian, Spanish, Swedish, Thai, Turkish and
+Vietnamese. For the other 15 (Afrikaans, Bengali, Bosnian, Catalan, Cebuano,
+Basque, Croatian, Icelandic, Lithuanian, Latvian, Maltese, Norwegian,
+Albanian, Serbian, Ukrainian) the card documents no name to force; leave the
+language unset and let the model detect it.
+
+### Transcript style
+
+Three options choose how the transcript is written. Each is optional; an
+option you leave out keeps the model's default.
+
+| API field | CLI flag | Effect | Default |
+|-----------|----------|--------|---------|
+| `digits` | `--numbers digits\|words` | Numbers as digits (`true`) or as words (`false`) | digits |
+| `filler` | `--keep-fillers` | Keep fillers such as "um" and "uh" | dropped |
+| `verbatim` | `--collapse-repeats` (sets `false`) | Keep repeated words (`true`) or collapse them | kept |
+
+```bash
+izwi transcribe meeting.wav --model Rumble-2-Flash --numbers words
+```
+
+```bash
+curl -X POST http://localhost:8080/v1/audio/transcriptions \
+  -F file=@meeting.wav -F model=Rumble-2-Flash \
+  -F digits=false -F filler=true
+```
+
+The fields are on `/v1/audio/transcriptions` and on transcription jobs
+(`/v1/speech-to-text/jobs`), which store them so a retry asks for the same
+style. In the app, the options appear in the new-transcription dialog when
+the selected model takes them. A model without style options answers `400`
+when one is set; `route_capabilities.transcript_style` on
+`/v1/admin/models` says which models take them.
+
+### Context, timestamps and long recordings
+
+- `prompt` adds context text (names, product terms) to the request, up to
+  about 256 tokens.
+- Word timestamps come from the forced aligner
+  (`Qwen3-ForcedAligner-0.6B`), as for other models without timings of their
+  own.
+- The model reads up to 30 seconds at a time; longer recordings are split at
+  pauses and the pieces joined.
+- It serves live transcription, dictation and the diarization pipeline's
+  transcription stage.
+- It does not translate, take keyword lists or label speakers.
+
 ## Supported Audio Formats
 
 | Format | Extension | Notes |
@@ -366,6 +433,7 @@ model repeated itself and was stopped).
 | `Whisper-Large-v3-Turbo` | 1.5 GB | Strong multilingual baseline | Medium |
 | `Qwen3-ASR-0.6B-GGUF` | 1.0 GB | Good | Fast |
 | `Qwen3-ASR-1.7B-GGUF` | 2.5 GB | Better | Medium |
+| `Rumble-2-Flash` | 1.0 GB | Reson8's 0.5B multilingual ASR with language detection and transcript style options | Fast |
 | `VibeVoice-ASR` | 16.2 GB | Long-form Microsoft ASR checkpoint | Medium |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | 2.37 GB | 40-locale NVIDIA FastConformer-RNNT; native offline transcription with prompt-conditioned language control | Medium |
 | `Granite-Speech-4.1-2B` | 4.6 GB | IBM ASR with punctuated, capitalized transcripts | Medium |

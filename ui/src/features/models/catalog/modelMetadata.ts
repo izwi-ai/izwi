@@ -59,6 +59,9 @@ export function getModelProviderLabel(variant: string): string {
   ) {
     return "IBM";
   }
+  if (variant.startsWith("Rumble-") || variant.startsWith("Reson8/")) {
+    return "Reson8";
+  }
   if (variant.startsWith("LFM2") || variant.startsWith("LFM3")) {
     return "Liquid AI";
   }
@@ -588,6 +591,15 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "16 kHz",
     ],
     size: "4.63 GB",
+  },
+  "Rumble-2-Flash": {
+    shortName: "Rumble 2 Flash",
+    fullName: "Reson8 Rumble 2 Flash",
+    description:
+      "Reson8 Rumble 2 Flash, a compact 0.5B multilingual speech recognition model with automatic language detection across 45 languages",
+    category: "asr",
+    capabilities: ["Transcription", "Language detection", "Multilingual", "16 kHz"],
+    size: "1.02 GB",
   },
   "Granite-Speech-5.0-2B": {
     shortName: "Granite Speech 5.0",

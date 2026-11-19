@@ -344,6 +344,34 @@ const GRANITE_SPEECH_5_FILES: &[&str] = &[
 /// revision (LFS sha256 `4151269881d2dd82…`).
 const GRANITE_SPEECH_5_MODEL_BYTES: u64 = 4_626_528_224;
 
+/// Rumble-2-Flash ships one `model.safetensors`; `tokenizer.json` covers the
+/// vocabulary, so `vocab.json` and `merges.txt` are not needed. The CTC head
+/// under `ctc/` is not used. The chat template and generation config are
+/// kept beside the weights as the record of the prompt contract.
+const RUMBLE_FILES: &[&str] = &[
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "model.safetensors",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
+/// Exact file sizes at the pinned revision (HF tree @92ec9141).
+fn rumble_file_bytes(file: &str) -> Option<u64> {
+    Some(match file {
+        "chat_template.jinja" => 2_963,
+        "config.json" => 2_710,
+        "generation_config.json" => 162,
+        "model.safetensors" => 1_017_318_776,
+        "preprocessor_config.json" => 356,
+        "tokenizer.json" => 7_422_837,
+        "tokenizer_config.json" => 1_553,
+        _ => return None,
+    })
+}
+
 /// Granite Speech 5.0's GGUF release: the two GGUFs from the GGUF repo, and
 /// the configs and tokenizer the loader reads from the safetensors release
 /// (the GGUF repo ships neither the processor configs nor `tokenizer.json`).
@@ -1942,6 +1970,7 @@ impl ModelDownloader {
                     .iter()
                     .all(|file| path.join(file).exists())
             }
+            ModelFamily::RumbleAsr => RUMBLE_FILES.iter().all(|file| path.join(file).exists()),
             ModelFamily::NemotronTranscribeAsr => nemotron_transcribe_bundle_is_complete(&path),
             ModelFamily::SovTranscribeAsr => sov_transcribe_bundle_is_complete(&path),
             ModelFamily::SortformerDiarization => {
@@ -2588,6 +2617,7 @@ impl ModelDownloader {
             ModelFamily::GraniteSpeechAsr | ModelFamily::GraniteSpeech5Asr => {
                 granite_speech_files(variant)
             }
+            ModelFamily::RumbleAsr => RUMBLE_FILES.iter().map(|file| (*file).to_string()).collect(),
             ModelFamily::NemotronTranscribeAsr => nemotron_transcribe_files(),
             ModelFamily::SovTranscribeAsr => sov_transcribe_files(),
             ModelFamily::SortformerDiarization => match variant {
@@ -3381,6 +3411,11 @@ impl ModelDownloader {
             .flatten()
         {
             pinned.bytes
+        } else if let Some(size) = (variant.family() == ModelFamily::RumbleAsr)
+            .then(|| rumble_file_bytes(file))
+            .flatten()
+        {
+            size
         } else if variant.family() == ModelFamily::GraniteSpeech5Asr && file == "model.safetensors"
         {
             GRANITE_SPEECH_5_MODEL_BYTES
@@ -4525,6 +4560,58 @@ mod tests {
         }
         assert!(!downloader.is_downloaded(variant));
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn rumble_files_are_the_pinned_bundle_without_the_ctc_head() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Rumble2Flash;
+        let files = downloader.get_model_files(variant);
+        assert_eq!(
+            files,
+            RUMBLE_FILES
+                .iter()
+                .map(|file| file.to_string())
+                .collect::<Vec<_>>()
+        );
+        for unused in [
+            "ctc/ctc_head.safetensors",
+            "ctc/ctc_vocab.json",
+            "ctc_head.py",
+            "vocab.json",
+            "merges.txt",
+        ] {
+            assert!(!files.iter().any(|file| file == unused), "{unused}");
+        }
+        // The catalog's size is the bundle's exact bytes at the pin.
+        let total = files
+            .iter()
+            .map(|file| downloader.get_single_file_size_estimate(variant, file))
+            .sum::<u64>();
+        assert_eq!(total, variant.estimated_size());
+        assert_eq!(
+            downloader.get_single_file_size_estimate(variant, "model.safetensors"),
+            1_017_318_776
+        );
+        for spec in downloader.get_model_file_specs(variant) {
+            assert_eq!(spec.source_repo, "Reson8/Rumble-2-Flash", "{}", spec.local_file);
+            assert_eq!(
+                spec.source_revision,
+                ModelVariant::RUMBLE_2_FLASH_ARTIFACT_REVISION,
+                "{}",
+                spec.local_file
+            );
+        }
+        assert!(!downloader.is_downloaded(variant));
+        let dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in &files {
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+        assert!(downloader.is_downloaded(variant));
+        std::fs::remove_file(dir.join("tokenizer.json")).unwrap();
+        assert!(!downloader.is_downloaded(variant));
+        std::fs::remove_dir_all(temp_dir).ok();
     }
 
     #[test]

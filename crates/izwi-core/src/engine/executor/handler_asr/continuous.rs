@@ -268,6 +268,7 @@ impl NativeExecutor {
                 | ModelFamily::VibeVoiceAsr
                 | ModelFamily::GraniteSpeechAsr
                 | ModelFamily::GraniteSpeech5Asr
+                | ModelFamily::RumbleAsr
         ) {
             return Err(Error::InvalidInput(
                 "continuous ASR batch contains a model without retained tensor decode".into(),

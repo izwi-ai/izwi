@@ -52,6 +52,7 @@ export function modelCategoryFromVariant(
 
   if (
     normalized.includes("qwen3-asr") ||
+    normalized.includes("rumble") ||
     normalized.includes("whisper") ||
     normalized.includes("parakeet") ||
     normalized.includes("voxtral") ||

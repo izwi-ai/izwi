@@ -159,6 +159,9 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             output,
             word_timestamps,
             speaker_labels,
+            numbers,
+            keep_fillers,
+            collapse_repeats,
         } => {
             commands::transcribe::execute(
                 commands::transcribe::TranscribeArgs {
@@ -173,6 +176,13 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                     output,
                     word_timestamps,
                     speaker_labels,
+                    style: commands::transcribe::TranscriptStyle {
+                        digits: numbers.map(|style| style == cli::NumberStyle::Digits),
+                        // The flags name the non-default choice; unset
+                        // leaves the model's default.
+                        filler: keep_fillers.then_some(true),
+                        verbatim: collapse_repeats.then_some(false),
+                    },
                 },
                 &server()?,
             )

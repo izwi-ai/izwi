@@ -225,6 +225,11 @@ pub(crate) struct AsrRouteCapabilities {
     /// with these capabilities (a long-form chunk row): it runs in one pass
     /// whatever its length and never chunks again.
     pub(crate) single_pass_only: bool,
+    /// The model's own window, when one pass may fill it exactly
+    /// (`asr_single_pass_fills_invocation_window`) and the effective context
+    /// does not narrow it. Audio up to it runs in one pass; longer audio is
+    /// chunked under the usual margin.
+    pub(crate) whole_window_single_pass_secs: Option<f32>,
 }
 
 impl AsrRouteCapabilities {
@@ -241,6 +246,7 @@ impl AsrRouteCapabilities {
             streams_within_chunk: family.asr_streams_within_chunk(),
             chunk_config: NativeExecutor::asr_long_form_config(),
             single_pass_only: false,
+            whole_window_single_pass_secs: None,
         }
     }
 
@@ -271,7 +277,13 @@ impl AsrRouteCapabilities {
             Some(cap) => Some(limit.map_or(cap, |limit| limit.min(cap))),
             None => limit,
         };
-        Ok(Self::for_family(variant.family(), limit).for_request(request))
+        let mut capabilities = Self::for_family(variant.family(), limit).for_request(request);
+        if variant.family().asr_single_pass_fills_invocation_window() {
+            capabilities.whole_window_single_pass_secs = window
+                .max_audio_seconds
+                .filter(|window| limit.is_some_and(|limit| limit >= *window));
+        }
+        Ok(capabilities)
     }
 
     pub(crate) fn with_chunk_config(mut self, chunk_config: AsrLongFormConfig) -> Self {
@@ -301,9 +313,13 @@ impl AsrRouteCapabilities {
         // The chunk planner's own single-chunk bound.
         let floor = self.chunk_config.min_chunk_secs.max(0.1);
         let chunk = self.chunk_config.hard_max_chunk_secs.max(floor);
-        Some(match self.tuned_chunk_limit_secs(&self.chunk_config) {
+        let planned = match self.tuned_chunk_limit_secs(&self.chunk_config) {
             Some(limit) => chunk.min(limit.max(floor)),
             None => chunk,
+        };
+        Some(match self.whole_window_single_pass_secs {
+            Some(window) => planned.max(window),
+            None => planned,
         })
     }
 
@@ -1729,6 +1745,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A model whose window one pass may fill takes audio up to the whole
+    /// window in one pass; longer audio is chunked under the usual margin,
+    /// and so is everything past the margin once the context narrows the
+    /// window.
+    #[test]
+    fn a_whole_window_single_pass_fills_the_model_window() {
+        let sr = 1_000u32;
+        let seconds = |secs: f32| vec![0.0f32; (secs * sr as f32) as usize];
+        let mut whole = caps(ModelFamily::RumbleAsr, Some(30.0));
+        whole.whole_window_single_pass_secs = Some(30.0);
+        assert_eq!(whole.single_pass_limit_secs(), Some(30.0));
+        for secs in [3.0, 28.5, 29.7, 30.0] {
+            let plan = NativeExecutor::asr_route_plan(&seconds(secs), sr, &whole, false);
+            assert!(!plan.requires_chunk_path(), "{secs}s");
+            assert_eq!(plan.chunks.len(), 1, "{secs}s");
+        }
+        let plan = NativeExecutor::asr_route_plan(&seconds(30.5), sr, &whole, false);
+        assert!(plan.requires_chunk_path());
+        for chunk in &plan.chunks {
+            assert!(chunk.len_samples() as f32 / sr as f32 <= 28.5 + 1e-3);
+        }
+
+        let margined = caps(ModelFamily::RumbleAsr, Some(30.0));
+        assert_eq!(margined.single_pass_limit_secs(), Some(28.5));
+        let plan = NativeExecutor::asr_route_plan(&seconds(29.7), sr, &margined, false);
+        assert!(plan.requires_chunk_path());
     }
 
     #[test]

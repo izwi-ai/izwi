@@ -90,6 +90,8 @@ export interface ModelRouteCapabilities {
   speech_translation?: boolean;
   /** The model accepts a keyword list to bias recognition toward. */
   keyword_biasing?: boolean;
+  /** Transcription requests may set `digits`, `filler` and `verbatim`. */
+  transcript_style?: boolean;
   /** The model writes speaker turns itself (speaker-attributed ASR jobs). */
   speaker_attributed_asr?: boolean;
   /** The model times words itself: word timestamps need no aligner. */

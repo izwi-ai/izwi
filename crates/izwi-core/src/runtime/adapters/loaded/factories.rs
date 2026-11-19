@@ -215,6 +215,9 @@ pub(super) struct GraniteSpeechPhysicalAsrAdapterFactory;
 pub(super) struct GraniteSpeech5PhysicalAsrAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct RumblePhysicalAsrAdapterFactory;
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct Lfm25AudioPhysicalAsrAdapterFactory;
 
 #[derive(Debug, Clone, Copy)]
@@ -846,6 +849,40 @@ impl LoadedExecutionAdapterFactory for GraniteSpeech5PhysicalAsrAdapterFactory {
     }
 }
 
+impl LoadedExecutionAdapterFactory for RumblePhysicalAsrAdapterFactory {
+    fn id(&self) -> &'static str {
+        LoadedAdapterKind::RumbleAsr.factory_id()
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        // Continuous decode batching lives on the retained sequence graph.
+        // A load whose backend leaves the retained route off publishes the
+        // atomic graph alone.
+        NativeBatchMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::RumbleAsr, metadata, backend_kind)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(
+            RumbleAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
+    }
+}
+
 impl LoadedExecutionAdapterFactory for VibeVoicePhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
         LoadedAdapterKind::VibeVoiceAsr.factory_id()
@@ -947,6 +984,7 @@ pub(in crate::runtime::adapters) fn built_in_loaded_adapter_factories() -> Vec<A
         Arc::new(VibeVoicePhysicalAsrAdapterFactory),
         Arc::new(GraniteSpeechPhysicalAsrAdapterFactory),
         Arc::new(GraniteSpeech5PhysicalAsrAdapterFactory),
+        Arc::new(RumblePhysicalAsrAdapterFactory),
         Arc::new(Lfm25AudioPhysicalAsrAdapterFactory),
         Arc::new(ParakeetPhysicalAsrAdapterFactory),
         Arc::new(NemotronPhysicalAsrAdapterFactory),

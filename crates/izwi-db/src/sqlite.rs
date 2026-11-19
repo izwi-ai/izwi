@@ -660,6 +660,7 @@ mod tests {
         ("transcription_records", "owner_node_id"),
         ("transcription_records", "target_language"),
         ("transcription_records", "keywords_json"),
+        ("transcription_records", "transcript_style_json"),
         ("speech_history_records", "saved_voice_id"),
         ("speech_history_records", "speed"),
         ("speech_history_records", "processing_status"),

@@ -644,6 +644,7 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
+            | PreparedAsrEncoderArtifactValue::Rumble(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
             | PreparedAsrEncoderArtifactValue::Nemotron(_)
@@ -705,6 +706,7 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
+            | PreparedAsrEncoderArtifactValue::Rumble(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
             | PreparedAsrEncoderArtifactValue::Nemotron(_)
@@ -766,6 +768,7 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
+            | PreparedAsrEncoderArtifactValue::Rumble(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
             | PreparedAsrEncoderArtifactValue::Nemotron(_)
@@ -860,6 +863,60 @@ impl EngineCoreRequest {
         }
     }
 
+    pub(crate) fn install_prepared_rumble_artifact(
+        &mut self,
+        model_variant: ModelVariant,
+        artifact: Arc<RumblePreparedPromptArtifact>,
+    ) -> Result<()> {
+        if model_variant.family() != ModelFamily::RumbleAsr
+            || self.task_type != TaskType::ASR
+            || self.model_variant != Some(model_variant)
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} Rumble artifact does not match its normal routed model",
+                self.id
+            )));
+        }
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
+        if self.prepared_asr_encoder_artifact.is_some() {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} already owns an encoder artifact",
+                self.id
+            )));
+        }
+        self.prepared_asr_encoder_artifact = Some(PreparedAsrEncoderArtifact {
+            model_variant,
+            artifact: DeviceOwned::new(PreparedAsrEncoderArtifactValue::Rumble(artifact)),
+            source_fingerprint,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn prepared_rumble_artifact_for_executor(
+        &self,
+    ) -> Result<Option<Arc<RumblePreparedPromptArtifact>>> {
+        let Some(prepared) = self.prepared_asr_encoder_artifact.as_ref() else {
+            return Ok(None);
+        };
+        if self.model_variant != Some(prepared.model_variant)
+            || self.asr_execution_source_fingerprint(prepared.model_variant)?
+                != prepared.source_fingerprint
+            || self.uses_asr_long_form_atomic()
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed after Rumble preparation",
+                self.id
+            )));
+        }
+        match &*prepared.artifact {
+            PreparedAsrEncoderArtifactValue::Rumble(value) => Ok(Some(value.clone())),
+            _ => Err(Error::InvalidInput(
+                "foreign encoder artifact was requested through the Rumble accessor".into(),
+            )),
+        }
+    }
+
     pub(crate) fn prepared_granite_speech_artifact_for_executor(
         &self,
     ) -> Result<Option<Arc<GraniteSpeechPreparedPromptArtifact>>> {
@@ -882,6 +939,7 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::Whisper(_)
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
+            | PreparedAsrEncoderArtifactValue::Rumble(_)
             | PreparedAsrEncoderArtifactValue::Lfm25Audio(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
             | PreparedAsrEncoderArtifactValue::Nemotron(_)
@@ -964,6 +1022,7 @@ impl EngineCoreRequest {
             | PreparedAsrEncoderArtifactValue::VibeVoice(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech(_)
             | PreparedAsrEncoderArtifactValue::GraniteSpeech5(_)
+            | PreparedAsrEncoderArtifactValue::Rumble(_)
             | PreparedAsrEncoderArtifactValue::Parakeet(_)
             | PreparedAsrEncoderArtifactValue::Nemotron(_)
             | PreparedAsrEncoderArtifactValue::Voxtral(_) => Err(Error::InvalidInput(

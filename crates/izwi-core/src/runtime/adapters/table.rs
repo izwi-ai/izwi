@@ -26,6 +26,7 @@ pub(crate) enum LoadedAdapterKind {
     VibeVoiceAsr,
     GraniteSpeechAsr,
     GraniteSpeech5Asr,
+    RumbleAsr,
     Lfm25AudioAsr,
     ParakeetAsr,
     NemotronAsr,
@@ -60,6 +61,7 @@ impl LoadedAdapterKind {
             Self::VibeVoiceAsr => "builtin.vibevoice_asr.physical_sequence",
             Self::GraniteSpeechAsr => "builtin.granite_speech_asr.physical_sequence",
             Self::GraniteSpeech5Asr => "builtin.granite_speech5_asr.physical_sequence",
+            Self::RumbleAsr => "builtin.rumble_asr.physical_sequence",
             Self::Lfm25AudioAsr => "builtin.lfm25_audio_asr.physical_sequence",
             Self::ParakeetAsr => "builtin.parakeet_asr.physical_recurrent",
             Self::NemotronAsr => "builtin.nemotron_asr.physical_recurrent",
@@ -386,6 +388,19 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
             F::GraniteSpeech5Asr,
             C::Asr,
             Loaded::GraniteSpeech5Asr,
+            RetainedAndInvocation,
+        )
+        .sequence()
+        .resumable()
+        .chunked(),
+        // Audio of up to 30 s encodes into a prompt and decodes as a retained
+        // row, one batched step per token; longer audio runs one atomic
+        // invocation per chunk on leased decoder pages, chunked inside the
+        // dispatch.
+        row(
+            F::RumbleAsr,
+            C::Asr,
+            Loaded::RumbleAsr,
             RetainedAndInvocation,
         )
         .sequence()

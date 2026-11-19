@@ -40,6 +40,9 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 utoipa = { workspace = true }
+# The web UI built into the binary (api/web_ui.rs).
+rust-embed = "8.13"
+mime_guess = "2"
 
 serde = { workspace = true }
 serde_json = { workspace = true }

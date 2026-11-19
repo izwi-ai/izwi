@@ -1,7 +1,7 @@
 //! Persistent transcription history storage backed by SQLite.
 
 use anyhow::{anyhow, Context};
-use izwi_core::AsrProgress;
+use izwi_core::{AsrProgress, AsrTranscriptStyle};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -188,6 +188,10 @@ pub struct TranscriptionRecord {
     pub target_language: Option<String>,
     /// The keywords the job biased recognition toward.
     pub keywords: Vec<String>,
+    /// The transcript style options the job set (models with
+    /// `transcript_style`); empty when it set none.
+    #[serde(default, skip_serializing_if = "AsrTranscriptStyle::is_default")]
+    pub transcript_style: AsrTranscriptStyle,
     pub processing_status: TranscriptionProcessingStatus,
     pub processing_error: Option<String>,
     pub processing_progress: Option<AsrProgress>,
@@ -229,6 +233,7 @@ pub struct NewTranscriptionRecord {
     pub language: Option<String>,
     pub target_language: Option<String>,
     pub keywords: Vec<String>,
+    pub transcript_style: AsrTranscriptStyle,
     pub processing_status: TranscriptionProcessingStatus,
     pub processing_error: Option<String>,
     pub processing_progress: Option<AsrProgress>,
@@ -538,6 +543,14 @@ impl TranscriptionStore {
             serde_json::to_string(&saa_warnings).context("Failed serializing SAA warnings")?;
         let keywords_json =
             serde_json::to_string(&keywords).context("Failed serializing keywords")?;
+        let transcript_style_json = if record.transcript_style.is_default() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&record.transcript_style)
+                    .context("Failed serializing the transcript style")?,
+            )
+        };
 
         if let Err(err) =
             transcription_records::Entity::insert(transcription_records::ActiveModel {
@@ -574,6 +587,7 @@ impl TranscriptionStore {
                 owner_node_id: Set(Some(self.node.id().to_string())),
                 target_language: Set(target_language),
                 keywords_json: Set(keywords_json),
+                transcript_style_json: Set(transcript_style_json),
             })
             .exec(db)
             .await
@@ -1231,7 +1245,8 @@ const TRANSCRIPTION_RECORD_COLUMNS: &str = r#"
     summary_updated_at,
     alignment_warnings_json,
     target_language,
-    keywords_json
+    keywords_json,
+    transcript_style_json
 "#;
 
 async fn fetch_record_without_audio(
@@ -1311,6 +1326,7 @@ fn map_transcription_record(row: &QueryResult) -> anyhow::Result<TranscriptionRe
         language: row.try_get_by_index(5)?,
         target_language: row.try_get_by_index(27)?,
         keywords: parse_json_vec(row.try_get_by_index(28)?),
+        transcript_style: parse_transcript_style(row.try_get_by_index(29)?),
         processing_status: parse_processing_status(row.try_get_by_index(6)?),
         processing_error: row.try_get_by_index(7)?,
         processing_progress: parse_processing_progress(row.try_get_by_index(8)?),
@@ -1615,6 +1631,12 @@ fn sanitize_speaker_turns(
         .collect()
 }
 
+/// A stored transcript style; unreadable JSON reads as no style set.
+fn parse_transcript_style(raw: Option<String>) -> AsrTranscriptStyle {
+    raw.and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
 fn sanitize_keywords(keywords: Vec<String>) -> Vec<String> {
     keywords
         .into_iter()
@@ -1748,6 +1770,7 @@ mod tests {
             language: Some("English".to_string()),
             target_language: None,
             keywords: Vec::new(),
+            transcript_style: AsrTranscriptStyle::default(),
             processing_status: TranscriptionProcessingStatus::Ready,
             processing_error: None,
             processing_progress: None,
@@ -1927,6 +1950,50 @@ mod tests {
         assert_eq!(fetched.segments[0].text, "Hello there.");
         assert!(fetched.target_language.is_none());
         assert!(fetched.keywords.is_empty());
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    #[tokio::test]
+    async fn persists_the_transcript_style_a_job_set() {
+        let (store, root) = build_test_store();
+        let mut record = sample_record();
+        record.model_id = Some("Rumble-2-Flash".to_string());
+        record.transcript_style = AsrTranscriptStyle {
+            digits: Some(false),
+            filler: None,
+            verbatim: Some(true),
+        };
+        let created = store
+            .create_record(record)
+            .await
+            .expect("record should be created");
+        let fetched = store
+            .get_record(created.id.clone())
+            .await
+            .expect("fetch should succeed")
+            .expect("record should exist");
+        for record in [&created, &fetched] {
+            assert_eq!(record.transcript_style.digits, Some(false));
+            assert_eq!(record.transcript_style.filler, None);
+            assert_eq!(record.transcript_style.verbatim, Some(true));
+        }
+        let json = serde_json::to_value(&fetched).unwrap();
+        assert_eq!(
+            json["transcript_style"],
+            serde_json::json!({ "digits": false, "verbatim": true })
+        );
+
+        // A job that set none stores nothing and reports nothing.
+        let plain = store
+            .create_record(sample_record())
+            .await
+            .expect("record should be created");
+        assert!(plain.transcript_style.is_default());
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("transcript_style")
+            .is_none());
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

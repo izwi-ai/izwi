@@ -1347,3 +1347,44 @@ fn granite_loop_recovery_budget_is_shorter_than_original() {
     assert!(retry < 84);
     assert!(retry >= 24);
 }
+
+/// A chunked transcript reports the language most of its chunks named, the
+/// earliest on a tie, and none when no chunk named one.
+#[test]
+fn a_chunked_transcript_reports_the_language_its_chunks_named() {
+    let chunk = |language: Option<&str>| {
+        serde_json::json!({ "index": 0, "model_diagnostics": { "language": language } })
+    };
+    let language = |chunks: &[serde_json::Value]| NativeExecutor::chunked_asr_language(chunks);
+    assert_eq!(language(&[]), None);
+    assert_eq!(language(&[chunk(None), serde_json::json!({})]), None);
+    assert_eq!(
+        language(&[chunk(None), chunk(Some("German")), chunk(None)]).as_deref(),
+        Some("German")
+    );
+    assert_eq!(
+        language(&[
+            chunk(Some("English")),
+            chunk(Some("French")),
+            chunk(Some("French"))
+        ])
+        .as_deref(),
+        Some("French")
+    );
+    assert_eq!(
+        language(&[chunk(Some("Dutch")), chunk(Some("German"))]).as_deref(),
+        Some("Dutch")
+    );
+
+    let plan = PlannedAsrChunks::unexecuted_for_tests();
+    let (text, diagnostics) = NativeExecutor::chunked_asr_result(
+        &plan,
+        super::ChunkedAsrTranscription {
+            text: "hallo".into(),
+            chunk_diagnostics: vec![chunk(Some("German"))],
+            timestamp_words: None,
+        },
+    );
+    assert_eq!(text, "hallo");
+    assert_eq!(diagnostics.unwrap()["language"], "German");
+}
