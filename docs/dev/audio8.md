@@ -161,6 +161,7 @@ builds of the server:
 | 4 and 8 concurrent requests equal their solo output byte for byte | not run | yes |
 | Streamed speech (`stream: true`), time to first audio | 0.9 s | 0.2 to 0.3 s |
 | CLI (`izwi list`, `izwi tts` seeded and cloned, missing-transcript error) | not run | yes |
+| Web UI: listed in the model picker, seeded-voice dialog, a take created | not run | yes |
 | Real-time factor, one request | about 4 | about 1.05 (1.33 in F32) |
 
 A long text with no reference keeps its voice: across the anchored take the
@@ -185,8 +186,5 @@ Not done:
 - CUDA is compile-checked only. Nothing has run on an NVIDIA GPU: the BF16
   path, the fast transformer's CUDA graphs and batched decode are
   unverified there.
-- The web UI was checked as far as the model picker (the model is listed
-  under Edge0 in the text-to-speech dialog); a take was not created from
-  the dialog against a live server.
 - `Audio8-TTS-Preview-0.6b`, the earlier checkpoint with the same shapes
   and codec, is not in the catalog.
