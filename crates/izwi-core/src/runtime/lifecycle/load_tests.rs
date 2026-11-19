@@ -1,6 +1,7 @@
 use super::{
     admit_asr_request_floor, asr_state_rows, automatic_state_group_budget, cuda_invocation_context,
-    estimate_from_tensor_inventory, fish_s2_resource_plan, is_metal_command_buffer_oom,
+    audio8_resource_plan, estimate_from_tensor_inventory, fish_s2_resource_plan,
+    is_metal_command_buffer_oom,
     kokoro_effective_context_tokens, loaded_asr_state_publication_route,
     managed_chat_capacity_policy, materialization_tolerance_bytes, model_memory_estimate,
     model_resource_plan, now_unix_millis, plan_invocation_allocations,
@@ -1861,6 +1862,87 @@ fn fish_s2_cuda_weight_lease_leaves_room_for_separately_charged_state() {
         .expect_err("the old flat 24 GiB lease left no room for state");
     assert!(matches!(error, Error::Overloaded(_)));
     drop(state);
+}
+
+/// Audio8's plan on each backend, from the pinned checkpoint's own memory
+/// (`audio8_model_memory`, as the family's ignored real-artifact test prints
+/// it for the CPU): weights where the backend keeps them, the reference
+/// cache on the host, and every authorization inside the catalog's figure
+/// for that backend.
+#[test]
+fn audio8_resource_plan_stays_inside_its_catalog_figures() {
+    use crate::models::architectures::audio8::weights::Audio8ModelMemory;
+    use crate::models::architectures::audio8::AUDIO8_REFERENCE_CACHE_BYTES;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let variant = ModelVariant::Audio8TtsRealisticAir;
+    let known = |amount: ResourceAmount| match amount {
+        ResourceAmount::Known(bytes) => bytes,
+        other => panic!("unpriced amount {other:?}"),
+    };
+    // F32 on the CPU: 601,159,424 transformer parameters and the codec.
+    let cpu_memory = Audio8ModelMemory {
+        resident_bytes: 3_775_726_532,
+        load_peak_bytes: 4_613_178_308,
+        metal_device_load_peak_bytes: 3_775_726_532,
+        cuda_host_load_peak_bytes: 1_502_971_392,
+    };
+    let cpu = audio8_resource_plan(BackendKind::Cpu, cpu_memory, 0).unwrap();
+    assert_eq!(
+        known(cpu.resident_authorization.host_bytes),
+        cpu_memory.resident_bytes + AUDIO8_REFERENCE_CACHE_BYTES
+    );
+    assert_eq!(
+        known(cpu.load_authorization.host_bytes),
+        cpu_memory.load_peak_bytes + AUDIO8_REFERENCE_CACHE_BYTES
+    );
+    assert_eq!(known(cpu.load_authorization.device_bytes), 0);
+    assert!(
+        known(cpu.load_authorization.host_bytes) as f64
+            <= f64::from(variant.memory_required_gb_on(BackendKind::Cpu)) * GIB
+    );
+
+    // 16-bit transformer weights on Metal and CUDA; the codec stays F32.
+    let half_resident = cpu_memory.resident_bytes - 601_159_424 * 2 - 4_097 * 896 * 2;
+    let half_memory = Audio8ModelMemory {
+        resident_bytes: half_resident,
+        load_peak_bytes: half_resident + 1_024 * 1_024 * 1_024,
+        metal_device_load_peak_bytes: half_resident,
+        ..cpu_memory
+    };
+    let metal = audio8_resource_plan(BackendKind::Metal, half_memory, 0).unwrap();
+    assert_eq!(
+        known(metal.load_authorization.unified_bytes),
+        half_memory.metal_device_load_peak_bytes
+    );
+    assert_eq!(
+        metal.host_staging_bytes,
+        half_memory.load_peak_bytes - half_memory.metal_device_load_peak_bytes
+    );
+    assert_eq!(
+        known(metal.load_authorization.host_bytes),
+        AUDIO8_REFERENCE_CACHE_BYTES
+    );
+    assert!(
+        known(metal.resident_authorization.unified_bytes) as f64
+            <= f64::from(variant.memory_required_gb_on(BackendKind::Metal)) * GIB
+    );
+
+    let graphs = crate::models::architectures::audio8::audio8_fast_graph_device_bytes(
+        BackendKind::Cuda,
+    );
+    let cuda = audio8_resource_plan(BackendKind::Cuda, half_memory, graphs).unwrap();
+    assert_eq!(
+        known(cuda.resident_authorization.device_bytes),
+        half_memory.resident_bytes + graphs
+    );
+    assert_eq!(
+        known(cuda.load_authorization.host_bytes),
+        half_memory.cuda_host_load_peak_bytes + AUDIO8_REFERENCE_CACHE_BYTES
+    );
+    assert!(
+        known(cuda.load_authorization.device_bytes) as f64
+            <= f64::from(variant.memory_required_gb_on(BackendKind::Cuda)) * GIB
+    );
 }
 
 /// The fast AR's CUDA graphs are device memory in the load and resident

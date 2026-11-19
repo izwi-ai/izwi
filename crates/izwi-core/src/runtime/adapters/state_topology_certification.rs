@@ -229,6 +229,7 @@ fn certified_topology(
         (VoxtralTts, Tts) => RetainedPagedAndInvocationScratch,
         (VibeVoiceTts, Tts) => RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
         (FishS2Tts, Tts | StreamingTts) => RetainedPagedAndInvocationPaged,
+        (Audio8Tts, Tts | StreamingTts) => RetainedPagedAndInvocationPaged,
         // Fish Audio Drama 3 retains the trunk's and the tower's pages (the
         // tower one row behind) with the DeltaNet's recurrent and conv
         // tensors in one transaction; its stages lease scratch only.

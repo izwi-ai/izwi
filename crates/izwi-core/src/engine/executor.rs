@@ -13,8 +13,11 @@ mod audio;
 mod fish_drama3_pending;
 #[path = "executor/fish_pending.rs"]
 mod fish_pending;
+#[path = "executor/audio8_pending.rs"]
+mod audio8_pending;
 use fish_drama3_pending::{FishDrama3CodecCommit, FishDrama3StateCoordinator};
 use fish_pending::{FishCodecCommit, FishStateCoordinator};
+use audio8_pending::{Audio8CodecCommit, Audio8StateCoordinator};
 #[path = "executor/dispatch.rs"]
 mod dispatch;
 #[path = "executor/handler_asr.rs"]
@@ -23,6 +26,7 @@ mod handler_asr;
 mod handler_audio_chat;
 #[path = "executor/handler_chat.rs"]
 mod handler_chat;
+mod handler_audio8;
 mod handler_chatterbox;
 mod handler_fish_drama3;
 mod handler_lfm3_audio_rows;
@@ -115,8 +119,8 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 use state::{
-    ActiveAsrDecode, ActiveChatDecode, ActiveChatterboxTtsDecode, ActiveFishDrama3TtsDecode,
-    ActiveFishS2TtsDecode, ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode,
+    ActiveAsrDecode, ActiveAudio8TtsDecode, ActiveChatDecode, ActiveChatterboxTtsDecode,
+    ActiveFishDrama3TtsDecode, ActiveFishS2TtsDecode, ActiveLfm25AsrDecode, ActiveLfm25TtsDecode, ActiveLfm3AudioDecode,
     ActiveLfm3AudioRealtime, ActiveMaya1TtsDecode, ActiveMaya2TtsDecode, ActiveNemotronAsrDecode,
     ActiveNemotronTranscribeDecode, ActiveParakeetAsrDecode, ActiveQwenTtsDecode,
     ActiveVibeVoiceTtsDecode, ActiveVoxtralRealtime, ActiveVoxtralTtsDecode,
@@ -1181,7 +1185,10 @@ impl WorkerConfig {
 fn stage_sets_batch_rows(family: crate::catalog::ModelFamily) -> bool {
     use crate::catalog::ModelFamily;
     let cuda = crate::backends::BackendKind::Cuda;
-    matches!(family, ModelFamily::FishS2Tts | ModelFamily::FishDrama3Tts)
+    matches!(
+        family,
+        ModelFamily::FishS2Tts | ModelFamily::FishDrama3Tts | ModelFamily::Audio8Tts
+    )
         || crate::catalog::certified_decode_width(family, cuda) > crate::catalog::CUDA_DEFAULT_WIDTH
         // TTS decodes certified past the engine rows: their loaded decode
         // stage carries the width (the engine rows off CUDA).
@@ -2676,6 +2683,7 @@ impl<Q: PendingRealtimeQuantum> PendingQuantumFinalizer for RealtimeStateCoordin
 
 struct RealtimePendingQuantumFinalizer {
     fish: Arc<FishStateCoordinator>,
+    audio8: Arc<Audio8StateCoordinator>,
     fish_drama3: Arc<FishDrama3StateCoordinator>,
     voxtral: Arc<VoxtralRealtimeStateCoordinator>,
     lfm3_audio: Arc<Lfm3AudioRealtimeStateCoordinator>,
@@ -2685,6 +2693,7 @@ struct RealtimePendingQuantumFinalizer {
 impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     fn contains(&self, plan_id: PlanId, session: &SessionKey) -> bool {
         self.fish.contains(plan_id, session)
+            || self.audio8.contains(plan_id, session)
             || self.fish_drama3.contains(plan_id, session)
             || self.voxtral.contains(plan_id, session)
             || self.lfm3_audio.contains(plan_id, session)
@@ -2698,6 +2707,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     ) -> Result<PendingQuantumFinalizeStatus> {
         if self.fish.contains(plan_id, session) {
             self.fish.prepare(plan_id, session, decision)
+        } else if self.audio8.contains(plan_id, session) {
+            self.audio8.prepare(plan_id, session, decision)
         } else if self.fish_drama3.contains(plan_id, session) {
             self.fish_drama3.prepare(plan_id, session, decision)
         } else if self.long_form.contains(plan_id, session) {
@@ -2715,6 +2726,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     ) -> Result<PendingQuantumFinalizeStatus> {
         if self.fish.has_prepared(plan_id) {
             self.fish.publish(plan_id, session)
+        } else if self.audio8.has_prepared(plan_id) {
+            self.audio8.publish(plan_id, session)
         } else if self.fish_drama3.has_prepared(plan_id) {
             self.fish_drama3.publish(plan_id, session)
         } else if self.long_form.has_prepared(plan_id) {
@@ -2728,6 +2741,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
     fn discard(&self, plan_id: PlanId, session: &SessionKey) {
         if self.fish.has_prepared(plan_id) {
             self.fish.discard(plan_id, session);
+        } else if self.audio8.has_prepared(plan_id) {
+            self.audio8.discard(plan_id, session);
         } else if self.fish_drama3.has_prepared(plan_id) {
             self.fish_drama3.discard(plan_id, session);
         } else if self.long_form.has_prepared(plan_id) {
@@ -2813,6 +2828,8 @@ pub struct NativeExecutor {
     vibevoice_tts_decode_states: ExecutorStateStore<ActiveVibeVoiceTtsDecode>,
     fish_s2_tts_decode_states: Arc<ExecutorStateStore<ActiveFishS2TtsDecode>>,
     fish_s2_pending: Arc<FishStateCoordinator>,
+    audio8_tts_decode_states: Arc<ExecutorStateStore<ActiveAudio8TtsDecode>>,
+    audio8_pending: Arc<Audio8StateCoordinator>,
     fish_drama3_tts_decode_states: Arc<ExecutorStateStore<ActiveFishDrama3TtsDecode>>,
     fish_drama3_pending: Arc<FishDrama3StateCoordinator>,
     voxtral_tts_decode_states: ExecutorStateStore<ActiveVoxtralTtsDecode>,
@@ -2898,6 +2915,7 @@ impl NativeExecutor {
             Arc::new(VoxtralRealtimeStateCoordinator::new()),
             Arc::new(Lfm3AudioRealtimeStateCoordinator::new()),
             Arc::new(FishStateCoordinator::new()),
+            Arc::new(Audio8StateCoordinator::new()),
             Arc::new(FishDrama3StateCoordinator::new()),
             Arc::default(),
         )
@@ -2908,6 +2926,7 @@ impl NativeExecutor {
         voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
         lfm3_audio_realtime: Arc<Lfm3AudioRealtimeStateCoordinator>,
         fish_s2_pending: Arc<FishStateCoordinator>,
+        audio8_pending: Arc<Audio8StateCoordinator>,
         fish_drama3_pending: Arc<FishDrama3StateCoordinator>,
         long_form_asr: Arc<long_form::LongFormAsrRuns>,
     ) -> Self {
@@ -2925,6 +2944,8 @@ impl NativeExecutor {
             vibevoice_tts_decode_states: Mutex::new(HashMap::new()),
             fish_s2_tts_decode_states: fish_s2_pending.states.clone(),
             fish_s2_pending,
+            audio8_tts_decode_states: audio8_pending.states.clone(),
+            audio8_pending,
             fish_drama3_tts_decode_states: fish_drama3_pending.states.clone(),
             fish_drama3_pending,
             voxtral_tts_decode_states: Mutex::new(HashMap::new()),
@@ -3169,6 +3190,9 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
             if request
                 .prepared_fish_s2_tts_model_lease_for_executor()
                 .is_ok_and(|model| model.is_some())
+                || request
+                    .prepared_audio8_tts_model_lease_for_executor()
+                    .is_ok_and(|model| model.is_some())
                 || request
                     .prepared_chatterbox_tts_model_lease_for_executor()
                     .is_ok_and(|model| model.is_some())
@@ -3419,6 +3443,9 @@ impl ModelExecutor for NativeExecutor {
                         .prepared_fish_s2_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || request
+                        .prepared_audio8_tts_model_lease_for_executor()
+                        .is_ok_and(|model| model.is_some())
+                    || request
                         .prepared_fish_drama3_tts_model_lease_for_executor()
                         .is_ok_and(|model| model.is_some())
                     || request
@@ -3449,6 +3476,7 @@ impl ModelExecutor for NativeExecutor {
                         | crate::catalog::ModelFamily::Lfm25Audio
                         | crate::catalog::ModelFamily::VibeVoiceTts
                         | crate::catalog::ModelFamily::FishS2Tts
+                        | crate::catalog::ModelFamily::Audio8Tts
                         | crate::catalog::ModelFamily::FishDrama3Tts
                         | crate::catalog::ModelFamily::ChatterboxTts
                         | crate::catalog::ModelFamily::Maya1Tts
@@ -3498,6 +3526,7 @@ impl ModelExecutor for NativeExecutor {
                             | crate::catalog::ModelFamily::Lfm25Audio
                             | crate::catalog::ModelFamily::VibeVoiceTts
                             | crate::catalog::ModelFamily::FishS2Tts
+                            | crate::catalog::ModelFamily::Audio8Tts
                             | crate::catalog::ModelFamily::FishDrama3Tts
                             | crate::catalog::ModelFamily::ChatterboxTts
                             | crate::catalog::ModelFamily::Maya1Tts
@@ -3557,6 +3586,13 @@ impl ModelExecutor for NativeExecutor {
                 .or_else(|| {
                     request
                         .prepared_fish_s2_tts_model_lease_for_executor()
+                        .ok()
+                        .flatten()
+                        .map(|_| true)
+                })
+                .or_else(|| {
+                    request
+                        .prepared_audio8_tts_model_lease_for_executor()
                         .ok()
                         .flatten()
                         .map(|_| true)
@@ -4176,6 +4212,23 @@ impl ModelExecutor for NativeExecutor {
                     ..
                 } if execution.requests.iter().all(|request| {
                     request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Audio8Tts
+                    })
+                }) =>
+                {
+                    self.execute_static_audio8_codec_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequenceAudioDecode,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
                         variant.family() == crate::catalog::ModelFamily::FishDrama3Tts
                     })
                 }) =>
@@ -4232,6 +4285,23 @@ impl ModelExecutor for NativeExecutor {
                 }) =>
                 {
                     self.execute_static_fish_s2_tts_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::TTS,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.requests.iter().all(|request| {
+                    request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Audio8Tts
+                    })
+                }) =>
+                {
+                    self.execute_static_audio8_tts_prefill_requests_with_rows(
                         execution.requests,
                         execution.scheduled,
                         Some(&execution.batch.rows),
@@ -4428,6 +4498,7 @@ impl ModelExecutor for NativeExecutor {
     fn shutdown(&mut self) -> Result<()> {
         info!("Shutting down native executor");
         self.fish_s2_pending.abort_matching(|_| true)?;
+        self.audio8_pending.abort_matching(|_| true)?;
         self.fish_drama3_pending.abort_matching(|_| true)?;
         let mut chat = self
             .chat_decode_states
@@ -4454,6 +4525,9 @@ impl ModelExecutor for NativeExecutor {
         })?;
         let mut fish_s2_tts = self.fish_s2_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("Fish S2 TTS decode state mutex poisoned".to_string())
+        })?;
+        let mut audio8_tts = self.audio8_tts_decode_states.lock().map_err(|_| {
+            Error::InferenceError("Audio8 TTS decode state mutex poisoned".to_string())
         })?;
         let mut fish_drama3_tts = self.fish_drama3_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("Fish Audio Drama 3 decode state mutex poisoned".to_string())
@@ -4515,6 +4589,7 @@ impl ModelExecutor for NativeExecutor {
         lfm25_tts.clear();
         vibevoice_tts.clear();
         fish_s2_tts.clear();
+        audio8_tts.clear();
         fish_drama3_tts.clear();
         voxtral_tts.clear();
         chatterbox_tts.clear();
@@ -4534,6 +4609,7 @@ impl ModelExecutor for NativeExecutor {
             lfm25_tts,
             vibevoice_tts,
             fish_s2_tts,
+            audio8_tts,
             fish_drama3_tts,
             voxtral_tts,
             chatterbox_tts,
@@ -4555,6 +4631,10 @@ impl ModelExecutor for NativeExecutor {
             .fish_s2_pending
             .abort_matching(|session| session.request_id == request_id)
             .is_err()
+            || self
+                .audio8_pending
+                .abort_matching(|session| session.request_id == request_id)
+                .is_err()
             || self
                 .fish_drama3_pending
                 .abort_matching(|session| session.request_id == request_id)
@@ -4587,6 +4667,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
             Ok(mut fish_s2_tts),
+            Ok(mut audio8_tts),
             Ok(mut fish_drama3_tts),
             Ok(mut voxtral_tts),
             Ok(mut chatterbox_tts),
@@ -4606,6 +4687,7 @@ impl ModelExecutor for NativeExecutor {
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
             self.fish_s2_tts_decode_states.lock(),
+            self.audio8_tts_decode_states.lock(),
             self.fish_drama3_tts_decode_states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
@@ -4629,6 +4711,7 @@ impl ModelExecutor for NativeExecutor {
         let lfm25_tts = cleanup_request_states_locked(&mut lfm25_tts, request_id);
         let vibevoice_tts = cleanup_request_states_locked(&mut vibevoice_tts, request_id);
         let fish_s2_tts = cleanup_request_states_locked(&mut fish_s2_tts, request_id);
+        let audio8_tts = cleanup_request_states_locked(&mut audio8_tts, request_id);
         let fish_drama3_tts = cleanup_request_states_locked(&mut fish_drama3_tts, request_id);
         let voxtral_tts = cleanup_request_states_locked(&mut voxtral_tts, request_id);
         let chatterbox_tts = cleanup_request_states_locked(&mut chatterbox_tts, request_id);
@@ -4647,6 +4730,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
                 .combine(fish_s2_tts)
+                .combine(audio8_tts)
                 .combine(fish_drama3_tts)
                 .combine(voxtral_tts)
                 .combine(chatterbox_tts)
@@ -4670,6 +4754,10 @@ impl ModelExecutor for NativeExecutor {
             .fish_s2_pending
             .abort_matching(|pending| pending == session)
             .is_err()
+            || self
+                .audio8_pending
+                .abort_matching(|pending| pending == session)
+                .is_err()
             || self
                 .fish_drama3_pending
                 .abort_matching(|pending| pending == session)
@@ -4697,6 +4785,7 @@ impl ModelExecutor for NativeExecutor {
             Ok(mut lfm25_tts),
             Ok(mut vibevoice_tts),
             Ok(mut fish_s2_tts),
+            Ok(mut audio8_tts),
             Ok(mut fish_drama3_tts),
             Ok(mut voxtral_tts),
             Ok(mut chatterbox_tts),
@@ -4716,6 +4805,7 @@ impl ModelExecutor for NativeExecutor {
             self.lfm25_tts_decode_states.lock(),
             self.vibevoice_tts_decode_states.lock(),
             self.fish_s2_tts_decode_states.lock(),
+            self.audio8_tts_decode_states.lock(),
             self.fish_drama3_tts_decode_states.lock(),
             self.voxtral_tts_decode_states.lock(),
             self.chatterbox_tts_decode_states.lock(),
@@ -4743,6 +4833,7 @@ impl ModelExecutor for NativeExecutor {
         let lfm25_tts = cleanup_session_state_locked(&mut lfm25_tts, session);
         let vibevoice_tts = cleanup_session_state_locked(&mut vibevoice_tts, session);
         let fish_s2_tts = cleanup_session_state_locked(&mut fish_s2_tts, session);
+        let audio8_tts = cleanup_session_state_locked(&mut audio8_tts, session);
         let fish_drama3_tts = cleanup_session_state_locked(&mut fish_drama3_tts, session);
         let voxtral_tts = cleanup_session_state_locked(&mut voxtral_tts, session);
         let chatterbox_tts = cleanup_session_state_locked(&mut chatterbox_tts, session);
@@ -4761,6 +4852,7 @@ impl ModelExecutor for NativeExecutor {
                 .combine(lfm25_tts)
                 .combine(vibevoice_tts)
                 .combine(fish_s2_tts)
+                .combine(audio8_tts)
                 .combine(fish_drama3_tts)
                 .combine(voxtral_tts)
                 .combine(chatterbox_tts)
@@ -4909,6 +5001,7 @@ impl UnifiedExecutor {
         let voxtral_realtime = Arc::new(VoxtralRealtimeStateCoordinator::new());
         let lfm3_audio_realtime = Arc::new(Lfm3AudioRealtimeStateCoordinator::new());
         let fish_s2_pending = Arc::new(FishStateCoordinator::new());
+        let audio8_pending = Arc::new(Audio8StateCoordinator::new());
         let fish_drama3_pending = Arc::new(FishDrama3StateCoordinator::new());
         let long_form_asr = Arc::new(long_form::LongFormAsrRuns::default());
         let device = match DeviceThread::for_device(&config.backend_context.device.device) {
@@ -4927,6 +5020,7 @@ impl UnifiedExecutor {
                     voxtral_realtime.clone(),
                     lfm3_audio_realtime.clone(),
                     fish_s2_pending.clone(),
+                    audio8_pending.clone(),
                     fish_drama3_pending.clone(),
                     long_form_asr.clone(),
                 ),
@@ -4935,6 +5029,7 @@ impl UnifiedExecutor {
             physical_execution_admission,
             pending_quantum_finalizer: Some(Arc::new(RealtimePendingQuantumFinalizer {
                 fish: fish_s2_pending,
+                audio8: audio8_pending,
                 fish_drama3: fish_drama3_pending,
                 voxtral: voxtral_realtime,
                 lfm3_audio: lfm3_audio_realtime,
@@ -5839,6 +5934,7 @@ mod tests {
         use crate::catalog::ModelFamily;
         for family in [
             ModelFamily::FishS2Tts,
+            ModelFamily::Audio8Tts,
             ModelFamily::FishDrama3Tts,
             ModelFamily::Qwen35Chat,
             ModelFamily::Qwen35MoeChat,

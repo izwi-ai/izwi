@@ -70,6 +70,7 @@ use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
 use crate::models::architectures::chatterbox::{ChatterboxGenerationParams, T3SamplingParams};
 use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2Reference};
+use crate::models::architectures::audio8::{Audio8GenerationParams, Audio8Reference};
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAudioFeatures, GraniteSpeechFeatureRow, GraniteSpeechPreparedGeometry,
     GraniteSpeechPreparedPromptArtifact,
@@ -198,7 +199,7 @@ use observability::{
 };
 #[cfg(test)]
 use tts_preparation::{
-    fish_s2_request_params, kokoro_synthesis_resources, lfm25_audio_tts_preparation_workspace,
+    audio8_request_params, fish_s2_request_params, kokoro_synthesis_resources, lfm25_audio_tts_preparation_workspace,
     retained_lfm25_audio_tts_artifact_host_bytes, vibevoice_tts_request_params,
     voxtral_tts_request_params,
 };
@@ -776,8 +777,26 @@ pub(super) fn fish_s2_preparation_resources(
         .ok_or_else(|| Error::Overloaded("Fish S2 preparation host reservation overflow".into()))?;
     retained_artifact_resources(backend, host_bytes, 0)
 }
+/// Fish's request lease owns host preparation buffers and the eventual artifact.
+/// Codec tensor workspace is leased separately by the physical batch runner.
+pub(super) fn audio8_preparation_resources(
+    backend: BackendKind,
+    request_bytes: u64,
+    preparation_host_bytes: u64,
+) -> Result<ResourceVector> {
+    let host_bytes = request_bytes
+        .checked_add(preparation_host_bytes)
+        .ok_or_else(|| Error::Overloaded("Audio8 preparation host reservation overflow".into()))?;
+    retained_artifact_resources(backend, host_bytes, 0)
+}
 
 pub(super) fn fish_s2_artifact_resources(
+    backend: BackendKind,
+    artifact_bytes: u64,
+) -> Result<ResourceVector> {
+    retained_artifact_resources(backend, artifact_bytes, 0)
+}
+pub(super) fn audio8_artifact_resources(
     backend: BackendKind,
     artifact_bytes: u64,
 ) -> Result<ResourceVector> {
@@ -797,6 +816,23 @@ pub(super) fn add_fish_s2_artifact_to_admission(
         .host_bytes
         .checked_add(artifact_bytes)
         .ok_or_else(|| Error::Overloaded("Fish S2 execution host observation overflow".into()))?;
+    spec.resources = resources;
+    observation.host_bytes = host_bytes;
+    Ok(())
+}
+pub(super) fn add_audio8_artifact_to_admission(
+    backend: BackendKind,
+    spec: &mut JobSpec,
+    observation: &mut JobResourceObservation,
+    artifact_bytes: u64,
+) -> Result<()> {
+    let resources = spec
+        .resources
+        .checked_add(audio8_artifact_resources(backend, artifact_bytes)?)?;
+    let host_bytes = observation
+        .host_bytes
+        .checked_add(artifact_bytes)
+        .ok_or_else(|| Error::Overloaded("Audio8 execution host observation overflow".into()))?;
     spec.resources = resources;
     observation.host_bytes = host_bytes;
     Ok(())

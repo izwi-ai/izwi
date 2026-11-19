@@ -126,6 +126,10 @@ pub(in crate::runtime::lifecycle) async fn load_into_registry(
             registry.load_fish_s2_tts(variant, model_path).await?;
             InstantiatedPayload::None
         }
+        ModelFamily::Audio8Tts => {
+            registry.load_audio8_tts(variant, model_path).await?;
+            InstantiatedPayload::None
+        }
         ModelFamily::ChatterboxTts => {
             registry.load_chatterbox_tts(variant, model_path).await?;
             InstantiatedPayload::None

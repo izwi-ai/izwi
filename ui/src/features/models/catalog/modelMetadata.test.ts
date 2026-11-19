@@ -55,6 +55,25 @@ describe("model display metadata", () => {
     expect(getModelProviderLabel("LFM3-1.7B-GGUF")).toBe("Liquid AI");
   });
 
+  it("lists Audio8 TTS Realistic Air under Edge0", () => {
+    const detail = resolveModelDetail({
+      variant: "Audio8-TTS-Realistic-Air",
+      task: "tts",
+    });
+    expect(detail.fullName).toBe("Audio8 TTS Realistic Air");
+    expect(detail.shortName).toBe("Audio8 Realistic Air");
+    expect(detail.category).toBe("tts");
+    expect(detail.size).toBe("2.57 GB");
+    expect(detail.capabilities).toEqual(
+      expect.arrayContaining(["Text to Speech", "Voice Cloning", "44.1 kHz"]),
+    );
+    expect(detail.description).toContain("23 languages");
+    expect(getModelProviderLabel("Audio8-TTS-Realistic-Air")).toBe("Edge0");
+    expect(getModelProviderLabel("Edge0/Audio8-TTS-Realistic-Air")).toBe(
+      "Edge0",
+    );
+  });
+
   it("lists Fish Audio Drama 3 as its own Fish Audio model", () => {
     const detail = resolveModelDetail({
       variant: "FishAudio-Drama-3",

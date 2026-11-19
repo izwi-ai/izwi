@@ -21,6 +21,7 @@ Those endpoints only show variants that are enabled for download/use.
 | VibeVoice TTS | `VibeVoice-1.5B` |
 | Fish Audio S2 Pro (reference voice only) | `FishAudio-S2-Pro` |
 | Fish Audio Drama 3 (seeded or reference voice; performance tags; reads the language from the text) | `FishAudio-Drama-3` |
+| Audio8 TTS Realistic Air (23 languages; seeded or reference voice) | `Audio8-TTS-Realistic-Air` |
 | Chatterbox (English; reference-voice cloning) | `Chatterbox-500M` |
 | Chatterbox Multilingual (22 languages; reference-voice cloning) | `Chatterbox-Multilingual-500M` |
 | Maya1 (voice design from a description; emotion tags) | `Maya1-3B` |
@@ -64,6 +65,19 @@ Those endpoints only show variants that are enabled for download/use.
 > server; that needs a license from Fish Audio. `izwi pull` prints these terms
 > before it downloads, and `GET /v1/admin/models` reports them in `license`
 > and `license_notice`. Built with Fish Audio.
+
+> `Audio8-TTS-Realistic-Air` is Edge0's Audio8 TTS Realistic Air (Apache-2.0),
+> a 0.6B-parameter model with a 44.1 kHz codec. It speaks Arabic, Cantonese,
+> Chinese, Dutch, English, Finnish, French, German, Hindi, Indonesian, Italian,
+> Japanese, Korean, Malay, Norwegian, Polish, Portuguese, Russian, Spanish,
+> Swedish, Thai, Turkish and Vietnamese, reading the language from the text;
+> quality varies by language. Without a reference it speaks in a voice of its
+> own, which the sampling `seed` makes repeatable; with reference audio and its
+> transcript, or a saved voice that has one, it speaks in that voice. Audio
+> streams as it is generated, and long text is spoken in segments of about 300
+> characters in one voice. The download is about 2.6 GB (the repository's
+> separate `llama-cpp/` export is not downloaded), and it needs about 5.5 GB of
+> memory on CPU and 4 GB on Metal.
 
 > `Chatterbox-500M` is Resemble AI's English TTS model (MIT code and weights):
 > a 0.5B Llama speech-token model with classifier-free guidance, then S3Gen flow
@@ -285,6 +299,9 @@ izwi pull Maya2-Native-2.5B
 
 # Download Fish Audio Drama 3 (about 41.5 GB; needs about 40 GB of memory)
 izwi pull FishAudio-Drama-3
+
+# Download Edge0 Audio8 TTS Realistic Air (about 2.6 GB)
+izwi pull Audio8-TTS-Realistic-Air
 
 # Download Liquid AI LFM3 Audio (about 1.46 GB, or 2.20 GB with a Q8_0 language model)
 izwi pull LFM3-Audio-2B-GGUF
