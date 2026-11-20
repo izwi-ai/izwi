@@ -35,6 +35,9 @@ use crate::backends::BackendKind;
 /// The width every family has been served at on CPU and Metal.
 pub(crate) const PORTABLE_BASELINE_WIDTH: usize = 2;
 
+/// Ming 3.0 TTS's decode width on Metal (see [`tts_decode_width`]).
+pub(crate) const MING_TTS_METAL_WIDTH: usize = 8;
+
 /// The CUDA ceiling: a policy constant, not a kernel or metadata limit and
 /// not a measured width.
 pub(crate) const CUDA_MAX_WIDTH: usize = 32;
@@ -140,6 +143,23 @@ pub(crate) const fn asr_engine_width(
     }
 }
 
+/// The engine width TTS decode clamps to its family's certified width
+/// ([`tts_decode_width`]): ASR's on CUDA and the CPU; on Metal the engine's
+/// tensor width, so a family certified past the non-chat rows there (Ming
+/// 3.0 TTS) can use it, while every other family clamps back to the
+/// non-chat rows.
+pub(crate) const fn tts_engine_width(
+    backend: BackendKind,
+    non_chat_width: usize,
+    tensor_width: usize,
+    automatic: bool,
+) -> usize {
+    match backend {
+        BackendKind::Metal if tensor_width > non_chat_width => tensor_width,
+        _ => asr_engine_width(backend, non_chat_width, automatic),
+    }
+}
+
 /// The continuous decode width an ASR model of `family` loads with before
 /// its memory fit: the ASR engine width clamped to the family's certified
 /// width, never below the non-chat rows its encoder and prefill run at (an
@@ -174,6 +194,15 @@ pub(crate) const fn asr_decode_width(
 ///
 /// H100 (`e8f189691`): every Qwen3-TTS variant stayed at ~5 audio-s/s from 8
 /// to 64 streams, the width of eight; Maya 2 at ~5.2 from 16 streams.
+///
+/// Ming 3.0 TTS takes [`MING_TTS_METAL_WIDTH`] on Metal: its flow head and
+/// aggregator run every row of a step in one call, and a request gets the
+/// bits it gets alone at every count from two to eight
+/// (`requests_together_match_each_alone_on_the_checkpoint`, and byte parity
+/// at c2 to c8 through the server). On an M1 Pro the flow head costs 59 ms a
+/// latent alone and 11 ms a request at eight. Through the server, two rows
+/// stopped at 1.7 audio-s/s from two streams up; eight reach 2.8 at four
+/// streams and 3.1 at eight (1.1 at one).
 pub(crate) const fn tts_decode_width(
     family: ModelFamily,
     backend: BackendKind,
@@ -190,6 +219,7 @@ pub(crate) const fn tts_decode_width(
             | ModelFamily::ChatterboxTts
             | ModelFamily::VoxtralTts,
         ) => CUDA_MAX_WIDTH,
+        (BackendKind::Metal, ModelFamily::MingTts) => MING_TTS_METAL_WIDTH,
         _ => non_chat_width,
     };
     let widened = if tts_engine_width < certified {
@@ -278,6 +308,34 @@ mod tests {
                 .unwrap();
             assert_eq!(max_certified_decode_width(backend), widest, "{backend:?}");
         }
+    }
+
+    #[test]
+    fn the_tts_engine_width_is_the_tensor_width_on_metal_only() {
+        assert_eq!(tts_engine_width(BackendKind::Metal, 2, 8, true), 8);
+        assert_eq!(tts_engine_width(BackendKind::Metal, 2, 1, true), 2);
+        assert_eq!(tts_engine_width(BackendKind::Cpu, 2, 8, true), 2);
+        assert_eq!(
+            tts_engine_width(BackendKind::Cuda, 8, 8, true),
+            CUDA_MAX_WIDTH
+        );
+        assert_eq!(tts_engine_width(BackendKind::Cuda, 8, 8, false), 8);
+    }
+
+    #[test]
+    fn ming_tts_widens_on_metal_only() {
+        let width = |backend, engine| tts_decode_width(ModelFamily::MingTts, backend, 2, engine);
+        assert_eq!(width(BackendKind::Metal, 8), MING_TTS_METAL_WIDTH);
+        // An engine narrower than the certified width bounds it.
+        assert_eq!(width(BackendKind::Metal, 4), 4);
+        assert_eq!(width(BackendKind::Metal, 1), 2);
+        assert_eq!(width(BackendKind::Cpu, 8), 2);
+        assert_eq!(width(BackendKind::Cuda, 32), CUDA_MAX_WIDTH);
+        // Other TTS families keep the non-chat rows on Metal.
+        assert_eq!(
+            tts_decode_width(ModelFamily::Maya2Tts, BackendKind::Metal, 2, 8),
+            2
+        );
     }
 
     #[test]

@@ -253,8 +253,14 @@ impl RuntimeService {
                 automatic_tensor_width,
             ))
             .with_asr_tensor_batch_size(asr_row_width)
-            // TTS decode widens on the same terms as ASR decode.
-            .with_tts_tensor_batch_size(asr_row_width)
+            // TTS decode widens on the same terms as ASR decode, and on
+            // Metal to the tensor width for the families certified there.
+            .with_tts_tensor_batch_size(crate::catalog::tts_engine_width(
+                selected_backend_kind,
+                non_chat_row_width,
+                worker_config.max_tensor_batch_size,
+                automatic_tensor_width,
+            ))
             .with_explicit_tensor_width(explicit_tensor_width),
         );
         worker_config.static_tensor_batch_variants =
