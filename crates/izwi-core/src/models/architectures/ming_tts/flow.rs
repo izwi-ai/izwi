@@ -15,14 +15,15 @@
 //! rotary embedding (base 10,000, pairs interleaved), which is not the
 //! half-split form the Qwen2 stacks use.
 
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
 use super::config::{MingFlowConfig, FLOW_GRID_32, FLOW_STEPS, LATENT_DIM};
-use super::stack::rms_norm;
 use crate::error::{Error, Result};
+use crate::kernels::residual_norm;
+use crate::models::shared::attention::flash::try_fused_self_attention_preserve_dtype;
 
-const NORM_EPS: f64 = 1e-6;
+const NORM_EPS: f32 = 1e-6;
 /// Width of the sinusoidal time embedding.
 const TIME_EMBED_DIM: usize = 256;
 /// The reference scales time by 1,000 before the sinusoids.
@@ -64,6 +65,11 @@ impl Linear {
     }
 }
 
+/// An RMSNorm gain, kept in F32 for the fused norm (`residual_norm`).
+fn norm_gain(vb: VarBuilder, hidden: usize) -> Result<Tensor> {
+    Ok(vb.get(hidden, "weight")?.to_dtype(DType::F32)?)
+}
+
 struct FlowBlock {
     norm1: Tensor,
     to_q: Linear,
@@ -81,18 +87,25 @@ impl FlowBlock {
         let attn = vb.pp("attn");
         let ff = vb.pp("mlp").pp("ff");
         Ok(Self {
-            norm1: vb.pp("norm1").get(hidden, "weight")?,
+            norm1: norm_gain(vb.pp("norm1"), hidden)?,
             to_q: Linear::load(attn.pp("to_q"), hidden, hidden, true)?,
             to_k: Linear::load(attn.pp("to_k"), hidden, hidden, true)?,
             to_v: Linear::load(attn.pp("to_v"), hidden, hidden, true)?,
             to_out: Linear::load(attn.pp("to_out").pp("0"), hidden, hidden, true)?,
-            norm2: vb.pp("norm2").get(hidden, "weight")?,
+            norm2: norm_gain(vb.pp("norm2"), hidden)?,
             mlp_in: Linear::load(ff.pp("0").pp("0"), hidden, cfg.mlp_size, true)?,
             mlp_out: Linear::load(ff.pp("2"), cfg.mlp_size, hidden, true)?,
         })
     }
 
-    /// `x` [batch, positions, hidden]; `cos`/`sin` [positions, head_dim / 2].
+    /// `x` [batch, positions, hidden]; `cos`/`sin` [positions, head_dim / 2]
+    /// in `x`'s dtype.
+    ///
+    /// Each norm is one fused launch with F32 statistics, the second fused
+    /// with the attention's residual add; the rotation is Candle's fused
+    /// interleaved RoPE; attention over the few positions is the fused
+    /// kernel where the backend has one. Every op keeps a batch row's
+    /// values independent of the rows beside it.
     fn forward(
         &self,
         x: &Tensor,
@@ -102,26 +115,26 @@ impl FlowBlock {
     ) -> Result<Tensor> {
         let (batch, positions, hidden) = x.dims3()?;
         let dtype = x.dtype();
-        let normed = rms_norm(x, &self.norm1, NORM_EPS)?;
+        let normed = residual_norm::rms_norm(x, &self.norm1, NORM_EPS, dtype)?;
         let heads = |t: Tensor| -> Result<Tensor> {
             Ok(t.reshape((batch, positions, cfg.num_heads, cfg.head_dim))?
                 .transpose(1, 2)?
                 .contiguous()?)
         };
-        let q = rotate_pairs(&heads(self.to_q.forward(&normed)?)?, cos, sin)?;
-        let k = rotate_pairs(&heads(self.to_k.forward(&normed)?)?, cos, sin)?;
+        let q = candle_nn::rotary_emb::rope_i(&heads(self.to_q.forward(&normed)?)?, cos, sin)?;
+        let k = candle_nn::rotary_emb::rope_i(&heads(self.to_k.forward(&normed)?)?, cos, sin)?;
         let v = heads(self.to_v.forward(&normed)?)?;
-        let scale = 1.0 / (cfg.head_dim as f64).sqrt();
-        let scores =
-            (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?.to_dtype(DType::F32)?;
-        let weights = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(dtype)?;
-        let attn = weights
-            .matmul(&v)?
+        let attn = attend(&q, &k, &v, cfg.head_dim)?
             .transpose(1, 2)?
             .contiguous()?
             .reshape((batch, positions, hidden))?;
-        let x = x.add(&self.to_out.forward(&attn)?)?;
-        let normed = rms_norm(&x, &self.norm2, NORM_EPS)?;
+        let (x, normed) = residual_norm::add_rms_norm(
+            x,
+            &self.to_out.forward(&attn)?,
+            &self.norm2,
+            NORM_EPS,
+            dtype,
+        )?;
         let mlp = self
             .mlp_out
             .forward(&self.mlp_in.forward(&normed)?.gelu()?)?;
@@ -129,18 +142,17 @@ impl FlowBlock {
     }
 }
 
-/// x_transformers' rotation of `x` [batch, heads, positions, dim]: pairs
-/// (2i, 2i + 1) turned by `cos`/`sin` [positions, dim / 2].
-fn rotate_pairs(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (batch, heads, positions, dim) = x.dims4()?;
-    let pairs = x.reshape((batch, heads, positions, dim / 2, 2))?;
-    let even = pairs.narrow(D::Minus1, 0, 1)?.squeeze(D::Minus1)?;
-    let odd = pairs.narrow(D::Minus1, 1, 1)?.squeeze(D::Minus1)?;
-    let first = even.broadcast_mul(cos)?.sub(&odd.broadcast_mul(sin)?)?;
-    let second = odd.broadcast_mul(cos)?.add(&even.broadcast_mul(sin)?)?;
-    Ok(Tensor::stack(&[first, second], D::Minus1)?
-        .reshape((batch, heads, positions, dim))?
-        .contiguous()?)
+/// Bidirectional attention of `q`, `k`, `v` [batch, heads, positions, dim]:
+/// the backend's fused kernel when it has one for the shape (Metal SDPA,
+/// CUDA flash attention), else scores and softmax in F32.
+fn attend(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> Result<Tensor> {
+    if let Some(out) = try_fused_self_attention_preserve_dtype(q, k, v, None, head_dim, false)? {
+        return Ok(out);
+    }
+    let scale = 1.0 / (head_dim as f64).sqrt();
+    let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?.to_dtype(DType::F32)?;
+    let weights = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(q.dtype())?;
+    Ok(weights.matmul(v)?)
 }
 
 /// cos/sin of `positions` positions, [positions, head_dim / 2], built on
@@ -187,7 +199,7 @@ impl FlowTransformer {
         let last = vb.pp("final_layer");
         let (cos, sin) = rotary_table(positions, cfg.head_dim, vb.dtype(), vb.device())?;
         Ok(Self {
-            final_norm: last.pp("norm_final").get(cfg.hidden_size, "weight")?,
+            final_norm: norm_gain(last.pp("norm_final"), cfg.hidden_size)?,
             final_linear: Linear::load(last.pp("linear"), cfg.hidden_size, output, true)?,
             blocks,
             cos,
@@ -202,8 +214,12 @@ impl FlowTransformer {
         for block in &self.blocks {
             x = block.forward(&x, &self.cos, &self.sin, &self.cfg)?;
         }
-        self.final_linear
-            .forward(&rms_norm(&x, &self.final_norm, NORM_EPS)?)
+        self.final_linear.forward(&residual_norm::rms_norm(
+            &x,
+            &self.final_norm,
+            NORM_EPS,
+            x.dtype(),
+        )?)
     }
 }
 
@@ -251,12 +267,12 @@ impl MingAggregator {
 /// `flowloss.cfm.model`: the velocity field and its sampler.
 pub struct MingFlowHead {
     body: FlowTransformer,
-    time_in: Linear,
-    time_out: Linear,
     cond: Linear,
     x_embedder: Linear,
-    /// The time embedding's sinusoids for each sampler step, [steps, 256].
-    time_features: Tensor,
+    /// The time embedding at each sampler step, [steps, hidden] in the
+    /// model dtype: the time MLP over the step's sinusoids, run once at
+    /// load (the steps' times are fixed).
+    time_table: Tensor,
     /// Each step's `dt` on the sway-warped grid.
     dts: [f64; FLOW_STEPS],
     dtype: DType,
@@ -291,9 +307,13 @@ impl MingFlowHead {
         for (step, dt) in dts.iter_mut().enumerate() {
             *dt = times[step + 1] - times[step];
         }
+        let time_in = Linear::load(time.pp("0"), TIME_EMBED_DIM, hidden, true)?;
+        let time_out = Linear::load(time.pp("2"), hidden, hidden, true)?;
+        let features = Tensor::from_vec(features, (FLOW_STEPS, TIME_EMBED_DIM), &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(&device)?;
+        let time_table = time_out.forward(&candle_nn::ops::silu(&time_in.forward(&features)?)?)?;
         Ok(Self {
-            time_in: Linear::load(time.pp("0"), TIME_EMBED_DIM, hidden, true)?,
-            time_out: Linear::load(time.pp("2"), hidden, hidden, true)?,
             cond: Linear::load(
                 vb.pp("c_embedder").pp("cond_embedder"),
                 llm_hidden,
@@ -301,9 +321,7 @@ impl MingFlowHead {
                 true,
             )?,
             x_embedder: Linear::load(vb.pp("x_embedder"), LATENT_DIM, hidden, true)?,
-            time_features: Tensor::from_vec(features, (FLOW_STEPS, TIME_EMBED_DIM), &Device::Cpu)?
-                .to_dtype(dtype)?
-                .to_device(&device)?,
+            time_table,
             dts,
             dtype,
             device,
@@ -315,26 +333,8 @@ impl MingFlowHead {
         self.dtype
     }
 
-    /// The velocity at sampler step `step`: `x`, `history` [batch, 64] and
-    /// `cond` [batch, llm_hidden], all in the model dtype → [batch, 64].
-    fn velocity(&self, step: usize, x: &Tensor, history: &Tensor, cond: &Tensor) -> Result<Tensor> {
-        let batch = x.dim(0)?;
-        let time = self.time_out.forward(&candle_nn::ops::silu(
-            &self
-                .time_in
-                .forward(&self.time_features.narrow(0, step, 1)?)?,
-        )?)?;
-        let first = self.cond.forward(cond)?.broadcast_add(&time)?;
-        let sequence = Tensor::stack(
-            &[
-                first,
-                self.x_embedder.forward(history)?,
-                self.x_embedder.forward(x)?,
-            ],
-            1,
-        )?;
-        debug_assert_eq!(sequence.dim(0)?, batch);
-        Ok(self.body.forward(&sequence)?.narrow(1, 2, 1)?.squeeze(1)?)
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// One latent for one request: `hidden` [896] is the language model's
@@ -352,33 +352,72 @@ impl MingFlowHead {
                 "Ming flow sampling needs 64-wide history and noise".into(),
             ));
         }
-        let host = |values: &[f32], width: usize| -> Result<Tensor> {
-            Ok(Tensor::from_vec(values.to_vec(), (1, width), &self.device)?)
+        let host = |values: &[f32]| -> Result<Tensor> {
+            Ok(Tensor::from_vec(
+                values.to_vec(),
+                (1, values.len()),
+                &self.device,
+            )?)
         };
-        // Conditional row, then the unconditional one (a zero condition).
-        let hidden = host(hidden, hidden.len())?;
-        let cond = Tensor::cat(&[&hidden, &hidden.zeros_like()?], 0)?.to_dtype(self.dtype)?;
-        let history = host(history, LATENT_DIM)?
-            .broadcast_as((2, LATENT_DIM))?
-            .to_dtype(self.dtype)?
-            .contiguous()?;
-        let mut y = host(noise, LATENT_DIM)?;
+        let latent = self.sample_batch(&host(hidden)?, &host(history)?, &host(noise)?, guidance)?;
+        Ok(latent.flatten_all()?.to_vec1::<f32>()?)
+    }
+
+    /// One latent for each of `rows` requests: `hidden` [rows, 896] (the
+    /// language model's states), `history` [rows, 64] (each request's
+    /// previous latent) and `noise` [rows, 64] (each one's start), any
+    /// float dtype on the device. Returns [rows, 64] F32.
+    ///
+    /// Ten Euler steps on the reference's time grid. Each step runs every
+    /// request's conditional row and its unconditional one (a zero
+    /// condition) through the velocity field in one batch: the first
+    /// `rows` rows conditional, the next `rows` unconditional. No op mixes
+    /// rows, so a request's latent depends on its own inputs and the batch's
+    /// shape, never on the other requests' values.
+    pub fn sample_batch(
+        &self,
+        hidden: &Tensor,
+        history: &Tensor,
+        noise: &Tensor,
+        guidance: f32,
+    ) -> Result<Tensor> {
+        let rows = hidden.dim(0)?;
+        if rows == 0 || history.dims() != [rows, LATENT_DIM] || noise.dims() != [rows, LATENT_DIM] {
+            return Err(Error::InvalidInput(format!(
+                "Ming flow sampling needs [rows, 64] history and noise for {rows} rows, got {:?} and {:?}",
+                history.dims(),
+                noise.dims()
+            )));
+        }
+        let twice =
+            |t: &Tensor| -> Result<Tensor> { Ok(Tensor::cat(&[t, t], 0)?.to_dtype(self.dtype)?) };
+        let hidden = hidden.to_dtype(self.dtype)?;
+        // The condition and the previous latent are the same at every step.
+        let cond = self
+            .cond
+            .forward(&Tensor::cat(&[&hidden, &hidden.zeros_like()?], 0)?)?;
+        let history = self.x_embedder.forward(&twice(history)?)?;
+        let mut y = noise.to_dtype(DType::F32)?;
         let guidance = f64::from(guidance);
         for (step, &dt) in self.dts.iter().enumerate() {
-            let x = y
-                .broadcast_as((2, LATENT_DIM))?
-                .to_dtype(self.dtype)?
-                .contiguous()?;
+            let first = cond.broadcast_add(&self.time_table.narrow(0, step, 1)?)?;
+            let sequence = Tensor::stack(
+                &[&first, &history, &self.x_embedder.forward(&twice(&y)?)?],
+                1,
+            )?;
             let both = self
-                .velocity(step, &x, &history, &cond)?
+                .body
+                .forward(&sequence)?
+                .narrow(1, 2, 1)?
+                .squeeze(1)?
                 .to_dtype(DType::F32)?;
-            let pred = both.narrow(0, 0, 1)?;
-            let null = both.narrow(0, 1, 1)?;
+            let pred = both.narrow(0, 0, rows)?;
+            let null = both.narrow(0, rows, rows)?;
             // pred + (pred - null) * guidance.
             let velocity = (&pred + ((&pred - &null)? * guidance)?)?;
             y = (y + (velocity * dt)?)?;
         }
-        Ok(y.flatten_all()?.to_vec1::<f32>()?)
+        Ok(y)
     }
 }
 
@@ -507,9 +546,10 @@ pub(crate) mod tests {
 
     #[test]
     fn pair_rotation_matches_complex_multiplication() {
+        // x_transformers turns pairs (2i, 2i + 1); Candle's `rope_i` is that.
         let x = random(&mut SplitMix64::new(5), &[1, 2, 3, 8], 1.0);
         let (cos, sin) = rotary_table(3, 8, DType::F32, &Device::Cpu).unwrap();
-        let rotated = rotate_pairs(&x, &cos, &sin).unwrap();
+        let rotated = candle_nn::rotary_emb::rope_i(&x, &cos, &sin).unwrap();
         let x = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let rotated = rotated.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         for head in 0..2 {
