@@ -226,10 +226,27 @@ request brings no reference, the first segment's audio and text become the
 reference of the rest (`SegmentVoiceAnchor`, `FirstSegmentVoice` in
 `api/tts_long_form.rs`): later segments clone it with its latents in the
 prompt, keep any single control (an emotion, say) and drop a description.
-Segments then measure 0.85-0.92 to the first. The speaker embedding alone,
-without the transcript, held the voice no better than before. A first
-segment under 1 s or over 20 s is not used, and the next one is. Later
-segments wait for the first and still run side by side with each other.
+The speaker embedding alone, without the transcript, held the voice no
+better than before.
+
+The anchor is short: the first segment of an anchored text is its first
+sentence or sentences, 20 to 90 weighted characters (about 1.3 s to 6 s;
+`ming_tts_anchor_lead_end`), in the shared splitter and the durable plan
+alike. An 11 s anchor made the model drop words at the ends of later
+segments with 灵语汐 (11 of 198 words over six seeds, none without the
+anchor); a 3 s sentence dropped none and held the voice as well (0.89-0.92
+between later segments). An anchor under 1 s or over 8 s is not used, and
+the next segment is tried. On the reported script, four runs per voice and
+route kept every word and raised the mean similarity between stretches from
+0.72-0.77 to 0.80-0.86. Later segments wait for the first and still run side
+by side with each other.
+
+English text is normalized before it reaches the model
+(`models/shared/text_normalize.rs`, on by default for Ming): numbers,
+currency with its magnitude (`$10m` as "ten million dollars"), dates, times
+and units. Ming's voices are named, not tagged by language, so a text is
+English when its language says so or, without one, when it holds no CJK
+character; the reference transcript follows the same rule.
 `voice_identity_across_stretches` (an ignored reference test) prints CAM++
 similarities between stretches of WAV files.
 

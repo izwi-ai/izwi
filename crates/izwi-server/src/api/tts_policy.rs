@@ -379,6 +379,51 @@ pub(crate) fn ming_tts_weighted_chars(text: &str) -> usize {
     text.trim().chars().map(ming_tts_char_weight).sum()
 }
 
+/// Fewest and most weighted characters of a Ming anchor lead (about 1.3 s
+/// and 6 s of speech; see [`ming_tts_anchor_lead_end`]).
+pub(crate) const MING_TTS_ANCHOR_LEAD_MIN_CHARS: usize = 20;
+pub(crate) const MING_TTS_ANCHOR_LEAD_MAX_CHARS: usize = 90;
+
+/// Where the short first segment of an anchored Ming text ends (a byte
+/// offset), or `None` when the text is that short already.
+///
+/// Later segments clone the first one with its latents in the prompt. A
+/// first segment of 11 s made the model drop words at the ends of later
+/// segments with 灵语汐 (11 of 198 words over six seeds; none without the
+/// anchor), a sentence of 3 s none, holding the voice as well (0.89-0.92
+/// between later segments). The lead is the first sentence(s) between
+/// [`MING_TTS_ANCHOR_LEAD_MIN_CHARS`] and [`MING_TTS_ANCHOR_LEAD_MAX_CHARS`]
+/// weighted characters, else the last clause or word boundary before the
+/// most.
+pub(crate) fn ming_tts_anchor_lead_end(text: &str) -> Option<usize> {
+    if ming_tts_weighted_chars(text) <= MING_TTS_ANCHOR_LEAD_MAX_CHARS {
+        return None;
+    }
+    let (mut weight, mut clause, mut word) = (0usize, None, None);
+    let mut chars = text.char_indices().peekable();
+    while let Some((offset, ch)) = chars.next() {
+        weight += ming_tts_char_weight(ch);
+        if weight > MING_TTS_ANCHOR_LEAD_MAX_CHARS {
+            break;
+        }
+        let end = offset + ch.len_utf8();
+        let next_blank = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        let sentence = matches!(ch, '\n' | '。' | '！' | '？')
+            || (matches!(ch, '.' | '!' | '?') && next_blank);
+        if weight >= MING_TTS_ANCHOR_LEAD_MIN_CHARS && !text[..end].trim().is_empty() {
+            if sentence {
+                return Some(end);
+            }
+            if matches!(ch, ',' | '，' | ';' | '；' | '、' | ':' | '：') {
+                clause = Some(end);
+            } else if ch.is_whitespace() || ming_tts_char_weight(ch) > 1 {
+                word = Some(end);
+            }
+        }
+    }
+    clause.or(word)
+}
+
 /// One character's weight for [`MING_TTS_SEGMENT_MAX_CHARS`].
 pub(crate) fn ming_tts_char_weight(c: char) -> usize {
     match c {
@@ -1059,6 +1104,41 @@ mod tests {
 
     /// Ming 3.0 TTS takes named deliveries; every other model refuses them.
     /// It speaks seven languages and splits long text by spoken length.
+    #[test]
+    fn a_ming_anchor_lead_is_a_short_first_sentence() {
+        fn lead(text: &str) -> Option<&str> {
+            ming_tts_anchor_lead_end(text).map(|end| &text[..end])
+        }
+        let script = "anthropic has about 5,300 employees\n\nafter today's ipo, roughly 2,800 \
+            of them are worth over $10m. about 600 are worth over $100m";
+        assert_eq!(lead(script), Some("anthropic has about 5,300 employees\n"));
+        // A sentence under the fewest joins the next one.
+        assert_eq!(
+            lead(
+                "Hi. Welcome back to the show, everyone. It is good to see you all again \
+                tonight, here in the studio with us."
+            ),
+            Some("Hi. Welcome back to the show, everyone.")
+        );
+        // A first sentence past the most cuts at its last clause or word.
+        let long = "This sentence keeps going and going, well beyond what a short opening \
+            line should ever hold before it finally ends somewhere.";
+        let cut = lead(long).unwrap();
+        assert!(
+            ming_tts_weighted_chars(cut) <= MING_TTS_ANCHOR_LEAD_MAX_CHARS,
+            "{cut:?}"
+        );
+        assert!(cut.ends_with(',') || cut.ends_with(' '), "{cut:?}");
+        // Chinese: the first full stop, three weights a character.
+        let chinese = "傍晚的风从山口吹过来，远处的云慢慢染成了金色。".repeat(4);
+        assert_eq!(
+            lead(&chinese),
+            Some("傍晚的风从山口吹过来，远处的云慢慢染成了金色。")
+        );
+        // Short text is its own lead.
+        assert_eq!(ming_tts_anchor_lead_end("A short line."), None);
+    }
+
     #[test]
     fn ming_tts_takes_named_deliveries_languages_and_short_segments() {
         let ming = ModelVariant::Ming30Tts05B;

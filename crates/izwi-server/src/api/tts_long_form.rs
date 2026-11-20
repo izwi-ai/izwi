@@ -535,6 +535,18 @@ impl SpeechTextPlan {
         } else if let Some(last) = segments.last_mut() {
             last.end = text.len();
         }
+        // A Ming plan carries no reference (the durable route takes text
+        // only), so its later segments clone the first: a short first
+        // segment makes the anchor (`ming_tts_anchor_lead_end`).
+        if ming && segments.len() > 1 {
+            let first = segments[0].clone();
+            if let Some(end) =
+                crate::api::tts_policy::ming_tts_anchor_lead_end(&text[first.clone()])
+            {
+                segments[0] = first.start..first.start + end;
+                segments.insert(1, first.start + end..first.end);
+            }
+        }
         // Blank layout alone is not an inference segment. Byte ranges still
         // identify original content for durable progress and recovery.
         segments.retain(|range| !text[range.clone()].trim().is_empty());
@@ -792,11 +804,25 @@ pub fn expand_generation_requests_for_long_form(
 ) -> Vec<GenerationRequest> {
     let requested = base_request.config.options.max_tokens;
     let automatic = requested == 0 && !variant.plans_own_speech_segments();
-    let chunks = if automatic && !splits_into_segments(variant, &base_request.text) {
+    let mut chunks = if automatic && !splits_into_segments(variant, &base_request.text) {
         vec![base_request.text.trim().to_string()]
     } else {
         split_tts_text_for_long_form(variant, requested, base_request.text.as_str())
     };
+    // Ming's later segments clone the first one (`FirstSegmentVoice`): a
+    // short first segment makes the anchor (`ming_tts_anchor_lead_end`).
+    if chunks.len() > 1
+        && variant.family() == izwi_core::ModelFamily::MingTts
+        && SegmentVoiceAnchor::for_request(variant, base_request).collecting()
+    {
+        if let Some(end) = crate::api::tts_policy::ming_tts_anchor_lead_end(&chunks[0]) {
+            let rest = chunks[0][end..].trim().to_string();
+            chunks[0] = chunks[0][..end].trim().to_string();
+            if !rest.is_empty() {
+                chunks.insert(1, rest);
+            }
+        }
+    }
     let budget_for = |request: &mut GenerationRequest| {
         if variant.plans_own_speech_segments() || automatic {
             if let Some(frames) =
@@ -1593,11 +1619,13 @@ impl SegmentVoiceAnchor {
                 max_secs: Self::MAX_SECS as f32,
                 clears_description: false,
             },
-            // Ming takes a clip of 1 s to 20 s with its transcript, and a
-            // reference or a description, not both.
+            // Ming takes a clip of 1 s or more with its transcript, and a
+            // reference or a description, not both. An anchor past about 8 s
+            // made it drop words at the ends of later segments (see
+            // `ming_tts_anchor_lead_end`): none is better than a long one.
             izwi_core::ModelFamily::MingTts => AnchorLimits {
                 min_secs: 1.0,
-                max_secs: 20.0,
+                max_secs: 8.0,
                 clears_description: true,
             },
             _ => return Self::Off,
@@ -1804,6 +1832,25 @@ mod tests {
             watching my team put their heart into their work and get paid well for it";
         let plan = SpeechTextPlan::for_variant(ming, script, 0).unwrap();
         assert!(plan.segments.len() >= 3, "{:?}", plan.segments);
+        // The first segment is a short lead, the anchor of the rest.
+        assert_eq!(
+            script[plan.segments[0].clone()].trim(),
+            "anthropic has about 5,300 employees"
+        );
+        // The shared splitter cuts the same lead, for a request with no
+        // reference only.
+        let base = GenerationRequest::new(script).with_model_variant(ming);
+        let chunks = expand_generation_requests_for_long_form(&base, ming);
+        assert_eq!(chunks[0].text, "anthropic has about 5,300 employees");
+        assert!(
+            chunks[1].text.starts_with("after today's ipo"),
+            "{:?}",
+            chunks[1].text
+        );
+        let mut cloned = base.clone();
+        cloned.reference_audio = Some("AAAA".into());
+        let chunks = expand_generation_requests_for_long_form(&cloned, ming);
+        assert!(chunks[0].text.len() > 40, "{:?}", chunks[0].text);
         for range in &plan.segments {
             let segment = &script[range.clone()];
             assert!(
@@ -1833,8 +1880,8 @@ mod tests {
         anchor.collect(&[0.25; 22_050], 44_100);
         anchor.finish_segment("Hi.").unwrap();
         assert!(anchor.collecting());
-        // Past 20 s neither.
-        anchor.collect(&vec![0.25; 21 * 8_000], 8_000);
+        // Past 8 s neither.
+        anchor.collect(&vec![0.25; 9 * 8_000], 8_000);
         anchor.finish_segment("Too long.").unwrap();
         assert!(anchor.collecting());
 
