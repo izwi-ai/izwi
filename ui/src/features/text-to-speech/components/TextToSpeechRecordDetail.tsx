@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import {
   AlertTriangle,
@@ -21,6 +21,7 @@ import { api, type SpeechHistoryRecord } from "@/api";
 import { RecordAudioPlayer } from "@/components/audio/RecordAudioPlayer";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Waveform } from "@/components/ui/Waveform";
 import {
   Dialog,
   DialogContent,
@@ -119,6 +120,9 @@ interface TextToSpeechRecordDetailProps {
   } | null;
   /** The list this record belongs to, for the breadcrumb trail. */
   parentCrumb: Breadcrumb;
+  /** Live generation status (streaming playback, progress, stop), shown
+   * below the header in place of the in-progress notice. */
+  live?: ReactNode;
   /** Route actions for the header menu (Models). */
   extraMenuItems?: RowMenuItem[];
 }
@@ -140,6 +144,7 @@ export function TextToSpeechRecordDetail({
   editedFrom = null,
   parentCrumb,
   extraMenuItems = [],
+  live = null,
 }: TextToSpeechRecordDetailProps) {
   const [copied, setCopied] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -180,6 +185,11 @@ export function TextToSpeechRecordDetail({
     }
   }, [processingStatus, record?.processing_error, retrying, truncated]);
   const statusIsError = processingStatus === "failed" && !retrying;
+  // The live panel already says the take is generating.
+  const showStatus =
+    statusMessage !== null &&
+    !(live && (processingStatus === "pending" || processingStatus === "processing"));
+  const rendering = canCancel || Boolean(live);
 
   async function handleCopyInput(): Promise<void> {
     if (!record?.input_text) {
@@ -344,7 +354,9 @@ export function TextToSpeechRecordDetail({
         </Card>
       ) : null}
 
-      {statusMessage ? (
+      {live}
+
+      {showStatus ? (
         <Card
           role={statusIsError ? "alert" : "status"}
           aria-live={statusIsError ? "assertive" : "polite"}
@@ -366,9 +378,9 @@ export function TextToSpeechRecordDetail({
         </Card>
       ) : null}
 
-            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_280px]">
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_280px]">
         <div className="space-y-5">
-    <Card className="rounded-[14px] border-(--border-subtle) bg-(--surface-panel) p-4">
+          <Card className="rounded-[14px] border-(--border-subtle) bg-(--surface-panel) p-4">
             <h3 className="text-sm font-semibold text-(--text-primary)">
               Audio
             </h3>
@@ -386,6 +398,15 @@ export function TextToSpeechRecordDetail({
                 durationHint={record?.audio_duration_secs}
                 className="mt-3"
               />
+            ) : rendering ? (
+              <div className="mt-3 flex flex-col items-center gap-2 rounded-xl border border-dashed border-(--border-muted) bg-(--bg-surface-1) px-4 py-5">
+                <Waveform isGenerating className="h-10" />
+                <p className="text-[13px] text-(--text-muted)">
+                  {processingStatus === "pending"
+                    ? "Queued. The player appears here once the take is saved."
+                    : "Generating. The player appears here once the take is saved."}
+                </p>
+              </div>
             ) : (
               <p className="mt-3 text-sm text-(--text-muted)">
                 Audio is not available yet.
@@ -401,8 +422,6 @@ export function TextToSpeechRecordDetail({
               {record?.input_text || "No input text available."}
             </p>
           </Card>
-
-      
         </div>
         <FactsList
           label="Generation"

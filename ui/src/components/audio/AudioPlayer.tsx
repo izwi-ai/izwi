@@ -107,7 +107,7 @@ export function AudioPlayer({
           {showSkip ? skipButton(10) : null}
         </div>
 
-        <div className="font-mono text-[13px] font-medium tabular-nums tracking-tight text-(--text-primary)">
+        <div className="shrink-0 whitespace-nowrap font-mono text-[13px] font-medium tabular-nums tracking-tight text-(--text-primary)">
           {formatClockTime(currentTime)}{" "}
           <span className="font-normal text-(--text-muted)">
             / {formatClockDuration(duration)}
