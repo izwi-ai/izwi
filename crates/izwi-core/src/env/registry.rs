@@ -46,7 +46,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Flag,
         "true",
         Once,
-        "Transcribes a long file's chunks as concurrent requests (up to the ASR row width at once, committed in order) on Qwen3-ASR, Whisper, Nemotron ASR and Voxtral, so one file batches with itself and others wait at most one chunk; false runs each file's chunks one after another in one request.",
+        "Transcribes a long file's chunks as concurrent requests (up to the ASR row width at once, committed in order) on Qwen3-ASR, Whisper, Nemotron ASR, Voxtral and Rumble, so one file batches with itself and others wait at most one chunk; false runs each file's chunks one after another in one request.",
     ),
     CoreEnvVar::new(
         "IZWI_ASR_PHASE_SYNC",
