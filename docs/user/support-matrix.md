@@ -97,6 +97,26 @@ and realtime route families. Detailed preview behavior is documented in the
 - `Audio8-TTS-Realistic-Air` builds for CUDA but is compile-checked only: it has not yet run on an NVIDIA GPU. Its two transformers run in BF16 on CUDA devices with compute capability 8.0 or newer (F32 otherwise), F16 on Metal and F32 on CPU, behind a load-time self-check that falls back to F32; its codec runs in F32 everywhere. It is verified end to end on real weights on CPU and Metal.
 - `FishAudio-Drama-3` needs compute capability 8.0 or newer on CUDA; an older GPU is refused before any weights are read. See [Fish Audio Drama 3](#fish-audio-drama-3).
 
+- `SOV-Transcribe-1` runs on CUDA only, and builds for CUDA but is compile-checked only: it has not run on an NVIDIA GPU. See [SOV-Transcribe-1](#sov-transcribe-1).
+
+### SOV-Transcribe-1
+
+`SOV-Transcribe-1` runs on CUDA only. CPU and Metal servers list it, marked
+"CUDA only", and refuse to load or run it with a message that says so; the
+app does not offer to download it there, and `izwi pull` still can, for
+copying the files to a GPU server.
+
+| Backend | Resident weights | Activations |
+|---|---|---|
+| CPU | Not supported | — |
+| Metal | Not supported | — |
+| CUDA | About 48.3 GiB of BF16; the MoE routers and norm gains in F32 | BF16 |
+
+It needs about 52 GiB of free GPU memory to load and serve: an 80 GB card
+such as an H100 or A100 80GB, or a 96 GB RTX PRO 6000. Each request holds
+about 220 KiB of attention KV per token, about 190 MiB for a 30-second
+request.
+
 ### Nemotron 3.5 Transcribe
 
 `Nemotron-3.5-Transcribe-30B-A4B-FP8` runs on CPU, Metal and CUDA.

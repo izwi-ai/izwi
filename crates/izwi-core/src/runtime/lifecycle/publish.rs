@@ -36,6 +36,7 @@ impl ModelLifecycleController {
             | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::RumbleAsr
             | ModelFamily::NemotronTranscribeAsr
+            | ModelFamily::SovTranscribeAsr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Lfm3Audio
             | ModelFamily::Qwen3Tts

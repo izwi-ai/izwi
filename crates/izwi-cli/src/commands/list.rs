@@ -18,6 +18,22 @@ struct ModelRecord {
     local_path: Option<PathBuf>,
     size_bytes: Option<u64>,
     download_progress: Option<f32>,
+    /// `unsupported_backend` for a model this server's backend cannot run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_fit: Option<String>,
+    /// The one backend such a model runs on (`cuda`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    required_backend: Option<String>,
+}
+
+impl ModelRecord {
+    /// "cuda only" for a model this server cannot run, else the status.
+    fn status_label(&self) -> String {
+        match (self.device_fit.as_deref(), self.required_backend.as_deref()) {
+            (Some("unsupported_backend"), Some(backend)) => format!("{backend} only"),
+            _ => self.status.clone(),
+        }
+    }
 }
 
 pub async fn execute(
@@ -87,7 +103,7 @@ fn print_models_table(models: &[ModelRecord], detailed: bool) {
                 .unwrap_or_else(|| "-".to_string());
             table.add_row(vec![
                 Cell::new(&model.variant).fg(Color::Cyan),
-                status_cell(&model.status),
+                status_cell(&model.status_label()),
                 Cell::new(size).set_alignment(CellAlignment::Right),
                 Cell::new(progress).set_alignment(CellAlignment::Right),
                 Cell::new(path),
@@ -95,7 +111,7 @@ fn print_models_table(models: &[ModelRecord], detailed: bool) {
         } else {
             table.add_row(vec![
                 Cell::new(&model.variant).fg(Color::Cyan),
-                status_cell(&model.status),
+                status_cell(&model.status_label()),
                 Cell::new(size).set_alignment(CellAlignment::Right),
             ]);
         }
@@ -120,4 +136,35 @@ fn status_cell(status: &str) -> Cell {
         _ => Color::DarkGrey,
     };
     Cell::new(status).fg(color)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_model_this_server_cannot_run_lists_as_backend_only() {
+        let record: ModelRecord = serde_json::from_value(serde_json::json!({
+            "variant": "SOV-Transcribe-1",
+            "status": "not_downloaded",
+            "local_path": null,
+            "size_bytes": null,
+            "download_progress": null,
+            "device_fit": "unsupported_backend",
+            "required_backend": "cuda"
+        }))
+        .unwrap();
+        assert_eq!(record.status_label(), "cuda only");
+        let runs_here: ModelRecord = serde_json::from_value(serde_json::json!({
+            "variant": "SOV-Transcribe-1",
+            "status": "not_downloaded",
+            "local_path": null,
+            "size_bytes": null,
+            "download_progress": null,
+            "device_fit": "fits",
+            "required_backend": "cuda"
+        }))
+        .unwrap();
+        assert_eq!(runs_here.status_label(), "not_downloaded");
+    }
 }

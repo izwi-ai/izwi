@@ -163,6 +163,15 @@ function isNemotronTranscribeVariant(variant: string): boolean {
   );
 }
 
+/** SOV-Transcribe-1: offline only, CUDA only (the catalog marks it so elsewhere). */
+function isSovTranscribeVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "sov-transcribe-1" ||
+    normalized === "salesforce-sovereign-intelligence/sov-transcribe-1"
+  );
+}
+
 function isGraniteSpeechAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -288,7 +297,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "transcription",
     label: "Transcription",
     description:
-      "Speech-to-text with Qwen3-ASR, Rumble, Granite Speech, Nemotron ASR, Nemotron 3.5 Transcribe, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, and LFM3 Audio models",
+      "Speech-to-text with Qwen3-ASR, Rumble, Granite Speech, Nemotron ASR, Nemotron 3.5 Transcribe, SOV-Transcribe-1, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, and LFM3 Audio models",
     icon: "FileText",
     modelFilter: (variant) =>
       isQwenAsrVariant(variant) ||
@@ -297,6 +306,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isGraniteSpeech5AsrVariant(variant) ||
       isNemotronAsrVariant(variant) ||
       isNemotronTranscribeVariant(variant) ||
+      isSovTranscribeVariant(variant) ||
       isVibeVoiceAsrVariant(variant) ||
       variant.includes("Whisper-Large-v3-Turbo") ||
       variant.includes("Parakeet-TDT") ||
@@ -305,7 +315,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isLfm3AudioVariant(variant),
     emptyStateTitle: "No ASR Model Loaded",
     emptyStateDescription:
-      "Download and load a Qwen3-ASR, Rumble, Granite Speech, Nemotron ASR, Nemotron 3.5 Transcribe, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, or LFM3 Audio model for speech transcription",
+      "Download and load a Qwen3-ASR, Rumble, Granite Speech, Nemotron ASR, Nemotron 3.5 Transcribe, SOV-Transcribe-1, VibeVoice-ASR, Whisper, Parakeet-TDT, Voxtral, LFM2.5 Audio, or LFM3 Audio model for speech transcription",
   },
   chat: {
     id: "chat",

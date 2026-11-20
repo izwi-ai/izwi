@@ -1431,6 +1431,101 @@ impl ModelLifecycleController {
         Ok(())
     }
 
+    /// SOV-Transcribe's retained rows: one managed paged-attention domain
+    /// over the decoder's 30 layers (two key geometries), sized for the ASR
+    /// rows; every stage leases its activations as per-row scratch.
+    pub(super) async fn allocate_sov_transcribe_state(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        backend: BackendKind,
+        state_fit_reserve: StateFitReserve,
+        bundle_draft: &LoadedModelBundleDraft,
+        state_publications: &mut HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> Result<()> {
+        use crate::models::architectures::sov_transcribe::decoder::state as sov_state;
+        if variant.family() != crate::catalog::ModelFamily::SovTranscribeAsr {
+            return Ok(());
+        }
+        if !managed_kv_backend_compiled(backend) {
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {variant} requires managed paged state, but the {backend:?} build has no direct paged-attention runtime"
+            )));
+        }
+        let model = self
+            .model_registry
+            .get_loading_asr(variant)
+            .await
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "loaded SOV-Transcribe model {variant} is missing from the registry"
+                ))
+            })?;
+        let sov = model.sov_transcribe()?;
+        let contract = sov_state::decoder_state_contract(
+            sov.decoder().config(),
+            sov_state::kv_state_dtype(backend),
+            crate::models::shared::attention::paged::default_kv_page_size(),
+        )?;
+        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+        let stage_graphs = contracts
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let descriptor = sov_state::retained_state_descriptor(&contract, &stage_graphs)?;
+        let context = self
+            .config
+            .max_sequence_length
+            .explicit_tokens()
+            .unwrap_or(sov.max_context_tokens())
+            .min(sov.max_context_tokens());
+        // The one context is the pool every row's 30 s request claims from
+        // (about 850 tokens each: 60 fit), so it loads as given rather than
+        // pooled again per row.
+        let retained = self
+            .core_engine
+            .load_pooled_managed_model_state_with_rows(
+                model_instance_id,
+                &contract,
+                context,
+                self.asr_state_rows(bundle_draft)?,
+                asr_minimum_tokens(variant),
+                state_fit_reserve,
+            )
+            .await?;
+        self.model_registry.publish_effective_context(
+            variant,
+            retained.maximum_sequence_tokens().min(context as u64),
+        )?;
+        self.model_registry.publish_kv_storage(variant, &retained);
+        crate::runtime::rollout::validate_managed_state_plan_eligibility(
+            variant,
+            CapabilityKind::Asr,
+            retained.state_plan_v2(),
+        )?;
+        let retained_uses = contracts
+            .iter()
+            .map(|contract| {
+                let retained_use = match contract.execution_profile.mode {
+                    crate::engine::ExecutionMode::Sequence => RetainedStateUseV2::ExternalPaged,
+                    _ => return Err(Error::ModelLoadError(
+                        "SOV-Transcribe graph has an incompatible retained-state profile"
+                            .into(),
+                    )),
+                };
+                Ok((stage_graph_fingerprint(&contract.stages)?, retained_use))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let publication = self.load_scratch_only_workspace_publication(
+            &contracts,
+            descriptor,
+            Some(retained.into()),
+            retained_uses,
+        )?;
+        state_publications.insert(CapabilityKind::Asr, publication);
+        Ok(())
+    }
+
     pub(super) async fn allocate_lfm3_audio_state(
         &self,
         variant: ModelVariant,

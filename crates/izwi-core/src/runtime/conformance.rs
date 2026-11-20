@@ -13,9 +13,9 @@ use crate::backends::BackendKind;
 use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 59;
+pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 60;
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 88;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 89;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformanceExecutionClass {
@@ -284,8 +284,11 @@ fn backend_expectations(
         };
     }
 
+    // A model that runs on one backend only (`required_backend`) is a
+    // product refusal everywhere else, whatever its adapter row could bind
+    // (the CPU runs such a family's synthetic checkpoint in tests).
     let served = |backend: BackendKind| {
-        if row_backends.contains(&backend) {
+        if row_backends.contains(&backend) && variant.runs_on_backend(backend) {
             Expectation::RequiredWhenCompiled
         } else {
             Expectation::Unsupported
@@ -419,6 +422,10 @@ mod tests {
                 assert_eq!(case.backends.cpu, Backend::NotApplicable);
                 assert_eq!(case.backends.metal, Backend::NotApplicable);
                 assert_eq!(case.backends.cuda, Backend::NotApplicable);
+            } else if case.variant.required_backend() == Some(BackendKind::Cuda) {
+                assert_eq!(case.backends.cpu, Backend::Unsupported);
+                assert_eq!(case.backends.metal, Backend::Unsupported);
+                assert_eq!(case.backends.cuda, Backend::RequiredWhenCompiled);
             } else {
                 assert_eq!(case.backends.cpu, Backend::RequiredWhenCompiled);
                 assert_eq!(case.backends.metal, Backend::RequiredWhenCompiled);
@@ -442,7 +449,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            79
+            80
         );
         assert_eq!(
             manifest
@@ -485,6 +492,13 @@ mod tests {
             .retained_state,
             Managed
         );
+        // SOV-Transcribe-1 keeps its decoder's pages in the managed arena
+        // between quanta, and is served on CUDA only.
+        let sov = manifest_case(&manifest, ModelVariant::SovTranscribe1, CapabilityKind::Asr);
+        assert_eq!(sov.retained_state, Managed);
+        assert_eq!(sov.backends.cpu, Backend::Unsupported);
+        assert_eq!(sov.backends.metal, Backend::Unsupported);
+        assert_eq!(sov.backends.cuda, Backend::RequiredWhenCompiled);
         // Nemotron 3.5 Transcribe keeps its decoder's pages and Mamba state
         // in the managed arena between quanta.
         assert_eq!(

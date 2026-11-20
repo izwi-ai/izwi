@@ -60,6 +60,8 @@ pub(crate) fn chunk_row_permit_count(row_width: usize, max_queued_requests: usiz
 /// - Nemotron ASR: a batched encoder and batched RNNT rows;
 /// - Voxtral: a chunk within the realtime session ceiling encoded once, then
 ///   a retained row whose frames decode batched across rows;
+/// - SOV-Transcribe-1: a retained row of one 30 s window, its encoder and
+///   prefill packed with the other rows';
 /// - Rumble: a batched encoder, then a retained decode row where its retained
 ///   route is on (CUDA by default); elsewhere one atomic invocation, the call
 ///   its sequential chunk route makes per chunk.
@@ -75,6 +77,7 @@ fn chunk_rows_family(family: ModelFamily) -> bool {
             | ModelFamily::WhisperAsr
             | ModelFamily::NemotronAsr
             | ModelFamily::Voxtral
+            | ModelFamily::SovTranscribeAsr
             | ModelFamily::RumbleAsr
     )
 }

@@ -1313,7 +1313,11 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                         && variant.family() == crate::catalog::ModelFamily::Voxtral;
                     let nemotron_transcribe_asr = execution.metadata().capability
                         == CapabilityKind::Asr
-                        && variant.family() == crate::catalog::ModelFamily::NemotronTranscribeAsr;
+                        && matches!(
+                            variant.family(),
+                            crate::catalog::ModelFamily::NemotronTranscribeAsr
+                                | crate::catalog::ModelFamily::SovTranscribeAsr
+                        );
                     let nemotron_realtime = execution.metadata().capability
                         == CapabilityKind::RealtimeAsr
                         && variant.family() == crate::catalog::ModelFamily::NemotronAsr;

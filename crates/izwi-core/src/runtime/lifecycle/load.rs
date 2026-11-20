@@ -142,6 +142,8 @@ enum LoadedAsrStatePublicationRoute {
     Rumble,
     /// Allocated by `allocate_nemotron_transcribe_state` (retained rows).
     NemotronTranscribe,
+    /// Allocated by `allocate_sov_transcribe_state` (retained rows).
+    SovTranscribe,
     LegacyCache,
 }
 
@@ -158,6 +160,9 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
         crate::catalog::ModelFamily::RumbleAsr => LoadedAsrStatePublicationRoute::Rumble,
         crate::catalog::ModelFamily::NemotronTranscribeAsr => {
             LoadedAsrStatePublicationRoute::NemotronTranscribe
+        }
+        crate::catalog::ModelFamily::SovTranscribeAsr => {
+            LoadedAsrStatePublicationRoute::SovTranscribe
         }
         _ => LoadedAsrStatePublicationRoute::LegacyCache,
     }
@@ -213,6 +218,7 @@ fn uses_asr_model_registry(variant: ModelVariant) -> bool {
             | crate::catalog::ModelFamily::GraniteSpeech5Asr
             | crate::catalog::ModelFamily::RumbleAsr
             | crate::catalog::ModelFamily::NemotronTranscribeAsr
+            | crate::catalog::ModelFamily::SovTranscribeAsr
             | crate::catalog::ModelFamily::Qwen3ForcedAligner
     )
 }
@@ -1351,6 +1357,15 @@ impl ModelLifecycleController {
                 &mut state_publications,
             )
             .await?;
+            self.allocate_sov_transcribe_state(
+                variant,
+                model_instance_id,
+                backend,
+                state_fit_reserve,
+                &bundle_draft,
+                &mut state_publications,
+            )
+            .await?;
             self.allocate_qwen_tts_state(
                 variant,
                 model_instance_id,
@@ -1637,10 +1652,36 @@ impl ModelLifecycleController {
 }
 
 impl RuntimeService {
+    /// Refuses a model this server's backend cannot run at all
+    /// ([`ModelVariant::required_backend`]), before anything is queued,
+    /// downloaded or read: a CUDA-only model on a CPU or Metal server is a
+    /// request this server can never serve, not a load failure.
+    pub fn ensure_model_runs_on_this_backend(&self, variant: ModelVariant) -> Result<()> {
+        let backend = self.backend_context().backend_kind;
+        let Some(message) = variant.unsupported_backend_message(backend) else {
+            return Ok(());
+        };
+        // Tests run a tiny synthetic checkpoint of a CUDA-only family on the
+        // CPU, through the real runtime.
+        #[cfg(test)]
+        if self
+            .model_manager
+            .downloaded_model_path(variant)
+            .is_some_and(|path| {
+                path.join(crate::models::architectures::sov_transcribe::precision::SYNTHETIC_MARKER)
+                    .is_file()
+            })
+        {
+            return Ok(());
+        }
+        Err(Error::InvalidInput(message))
+    }
+
     pub(crate) async fn load_model_for_inference(
         &self,
         variant: ModelVariant,
     ) -> Result<crate::model::ModelResidencyLease> {
+        self.ensure_model_runs_on_this_backend(variant)?;
         loop {
             if let Some(lease) = self.model_lifecycle.try_acquire_ready_lease(variant) {
                 self.model_lifecycle.touch_model_usage(variant).await;

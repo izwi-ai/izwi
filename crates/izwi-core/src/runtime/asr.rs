@@ -468,6 +468,17 @@ pub fn validate_asr_language(variant: ModelVariant, language: Option<&str>) -> R
         ModelFamily::GraniteSpeech5Asr => {
             resolve_granite_speech5_source_language(language).map(|_| ())
         }
+        // Seven languages; `auto` and none let the model pick.
+        ModelFamily::SovTranscribeAsr => {
+            use crate::models::architectures::sov_transcribe::prompt::{
+                render_instruction, SovPromptOptions,
+            };
+            render_instruction(&SovPromptOptions {
+                language: language.map(str::to_string),
+                ..Default::default()
+            })
+            .map(|_| ())
+        }
         // The card's support matrix: 40 languages transcribe (Norwegian
         // is listed without ASR); `auto` and none let the model pick.
         ModelFamily::NemotronTranscribeAsr => match language
@@ -530,6 +541,14 @@ pub fn validate_asr_task(
                 translate_to: task.translate_to.clone(),
                 keywords: task.keywords.clone(),
             })
+        }
+        // The instruction the request would render: the language, the
+        // keywords and a custom instruction are checked before admission.
+        ModelFamily::SovTranscribeAsr => {
+            crate::models::architectures::sov_transcribe::prompt::render_instruction(
+                &sov_transcribe_prompt_options(language, prompt, task),
+            )
+            .map(|_| ())
         }
         ModelFamily::RumbleAsr => crate::models::architectures::rumble::validate_rumble_request(
             &crate::models::architectures::rumble::RumbleRequestOptions {
@@ -722,6 +741,7 @@ fn apply_asr_max_tokens(
     if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant)
         .or_else(|| vibevoice_auto_asr_token_ceiling(variant))
         .or_else(|| nemotron_transcribe_auto_asr_token_ceiling(variant))
+        .or_else(|| sov_transcribe_auto_asr_token_ceiling(variant))
     {
         request.params.max_tokens = auto_max_tokens;
     }
@@ -733,6 +753,53 @@ fn apply_asr_max_tokens(
 fn nemotron_transcribe_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
     (variant.family() == ModelFamily::NemotronTranscribeAsr)
         .then_some(crate::models::architectures::nemotron_transcribe::MAX_NEW_TOKENS)
+}
+
+/// SOV-Transcribe-1's automatic budget is admitted at the card's 8,192
+/// completion tokens and narrowed by preparation to the decode the audio's
+/// duration plans ([`sov_transcribe_asr_planned_max_tokens`]).
+fn sov_transcribe_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
+    (variant.family() == ModelFamily::SovTranscribeAsr)
+        .then_some(crate::models::architectures::sov_transcribe::MAX_NEW_TOKENS)
+}
+
+/// The prompt a SOV-Transcribe-1 request renders: the API's `prompt` is the
+/// instruction the model follows, `language` a hint and `keywords` the
+/// terms the audio may contain.
+pub(crate) fn sov_transcribe_prompt_options(
+    language: Option<&str>,
+    prompt: Option<&str>,
+    task: &AsrTaskOptions,
+) -> crate::models::architectures::sov_transcribe::SovPromptOptions {
+    crate::models::architectures::sov_transcribe::SovPromptOptions {
+        instruction: prompt
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        language: language
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
+            .map(str::to_string),
+        keywords: task.keywords.clone(),
+    }
+}
+
+/// Decode budget a SOV-Transcribe-1 row of `audio_seconds` runs with: the
+/// planned decode (12 tokens a second and 64 more, at most the card's
+/// 8,192) under the request ceiling when the caller omitted `max_tokens`,
+/// otherwise the caller's own budget. Admission claims a row's KV for its
+/// prompt and this budget in full.
+pub(crate) fn sov_transcribe_asr_planned_max_tokens(
+    request: &EngineCoreRequest,
+    audio_seconds: f32,
+) -> usize {
+    use crate::models::architectures::sov_transcribe::planned_decode_tokens;
+    let ceiling = request.params.max_tokens.max(1);
+    if request.asr_auto_max_tokens {
+        planned_decode_tokens(audio_seconds).min(ceiling)
+    } else {
+        ceiling
+    }
 }
 
 /// VibeVoice-ASR's automatic budget is admitted at the reference ceiling and

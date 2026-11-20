@@ -324,6 +324,16 @@ pub(super) struct ActiveNemotronTranscribeDecode {
     pub(super) stream_sequence: usize,
 }
 
+/// One SOV-Transcribe row between quanta: its retained state (audio
+/// embeddings, decode loop) and stream position.
+pub(super) struct ActiveSovTranscribeDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: AsrModelLease,
+    pub(super) state: crate::models::architectures::sov_transcribe::SovRetainedState,
+    /// A streamed request's next chunk sequence.
+    pub(super) stream_sequence: usize,
+}
+
 /// One LFM3-Audio LiveASR session between quanta: its segment's host
 /// state, the language model's ShortConv ring (kept here, never in the
 /// arena) and the paged-KV authority, and what the next quantum feeds.

@@ -58,6 +58,7 @@ pub(crate) const CUDA_DEFAULT_WIDTH: usize = 8;
 /// | Whisper (decode only) | 2 | 2 | 32 | Unmeasured. Its ~316 MB decoder was launch-bound at one row per step; rows now share each launch, one flash-attention call per layer for cross attention, and a row decodes the same alone as beside others (CPU tiny-model parity test) |
 /// | Granite Speech 4.1 (decode only) | 2 | 2 | 32 | Unmeasured past one row. Each request held the device for its whole decode; retained rows now step together (one token upload, one RoPE gather, one paged append and attention per layer, one argmax readback for every row), and the real 2B Plus checkpoint emits the atomic route's tokens through spans, scalar steps and a two-row batch on CPU and Metal (`granite_speech_retained_decode_matches_atomic_on_*`) |
 /// | Granite Speech 5.0 (decode only) | 2 | 2 | 32 | Unmeasured past one row. Each request held the device for its whole decode on a 16k-token KV lease; retained rows now step together (one token upload, one RoPE gather, one paged append and attention per layer, one argmax readback for every row), a row decodes bit-identically alone and beside others on the CPU, and the real GGUF checkpoint emits the atomic route's tokens through spans, scalar steps and a three-row batch on Metal (`granite_speech5_retained_decode_matches_atomic_on_metal`) |
+/// | SOV-Transcribe-1 (CUDA only) | — | — | 32 | Unmeasured. Decode reads about 4.8 GB of dense weights per step plus the routed experts; the fused expert kernels read each used expert once for every row of a step and sum each row in a fixed order, so wider steps share the reads and a row decodes the same alone as beside others (CPU synthetic test, every expert path). A 30 s row holds about 190 MiB of KV, so 32 rows fit in the 32,768-token pool |
 /// | Rumble (decode only) | 2 | 2 | 32 | Unmeasured on CUDA. Retained rows step together through the Qwen3 core's batched decode (the step Qwen3-ASR's rows take), a row decodes the same alone and beside others on the CPU, and the published checkpoint emits the atomic route's tokens through spans, scalar steps and a four-row batch on CPU and Metal (`the_retained_route_matches_the_atomic_route_on_*`) |
 /// | Voxtral (offline decode only) | 2 | 2 | 32 | Unmeasured past one row. H100: an offline request held the device for its whole decode (about 6.3 ms a frame), 9.6 audio-s/s flat from 1 to 32 streams; offline rows now step together (one token upload, LM forward and argmax readback for every row), and a row emits the same alone as beside others (CPU tiny-model test) |
 ///
@@ -84,6 +85,7 @@ pub(crate) const fn certified_decode_width(family: ModelFamily, backend: Backend
             | ModelFamily::Voxtral
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
+            | ModelFamily::SovTranscribeAsr
             | ModelFamily::RumbleAsr,
         ) => CUDA_MAX_WIDTH,
         (BackendKind::Cuda, _) => CUDA_DEFAULT_WIDTH,
@@ -335,12 +337,12 @@ mod tests {
         assert_eq!(chat_engine_width(BackendKind::Cpu, 8, true), 8);
     }
 
-    /// The nine ASR families whose decode steps every row per launch take
+    /// The ten ASR families whose decode steps every row per launch take
     /// the CUDA ceiling; every other speech family keeps the engine rows, and
     /// none changes on CPU or Metal.
     #[test]
     fn batched_asr_decode_families_take_the_cuda_ceiling() {
-        const WIDE: [ModelFamily; 9] = [
+        const WIDE: [ModelFamily; 10] = [
             ModelFamily::Qwen3Asr,
             ModelFamily::VibeVoiceAsr,
             ModelFamily::ParakeetAsr,
@@ -349,6 +351,7 @@ mod tests {
             ModelFamily::Voxtral,
             ModelFamily::GraniteSpeechAsr,
             ModelFamily::GraniteSpeech5Asr,
+            ModelFamily::SovTranscribeAsr,
             ModelFamily::RumbleAsr,
         ];
         for family in WIDE {

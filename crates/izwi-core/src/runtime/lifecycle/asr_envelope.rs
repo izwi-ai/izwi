@@ -395,6 +395,12 @@ pub(crate) fn minimum_sequence_tokens(variant: ModelVariant) -> Option<u64> {
     if variant.family() == ModelFamily::NemotronTranscribeAsr {
         return Some(crate::models::architectures::nemotron_transcribe::MAX_CONTEXT_TOKENS as u64);
     }
+    // One row of a 30 s window: its 375 audio tokens, the chat turn and
+    // instruction around them, and the planned decode. 220 KiB of BF16 KV
+    // per token, so the floor is about 200 MiB beside 48 GiB of weights.
+    if variant.family() == ModelFamily::SovTranscribeAsr {
+        return Some(1_024);
+    }
     let geometry = envelope_geometry(variant)?;
     let rate = geometry.audio_tokens_per_sec;
     let tokens = match variant {

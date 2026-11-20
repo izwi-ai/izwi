@@ -1,0 +1,16 @@
+{
+  "downsample_factor": 4,
+  "audio_token": "<|audio|>",
+  "audio_begin_token": "<|audio>",
+  "audio_end_token": "<audio|>",
+  "assistant_end_token": "<turn|>",
+  "generation_eos_token_ids": [
+    1,
+    106,
+    50
+  ],
+  "processor_class": "SovereignAITranscribeProcessor",
+  "auto_map": {
+    "AutoProcessor": "processing_sovereignai_transcribe.SovereignAITranscribeProcessor"
+  }
+}

@@ -4054,6 +4054,26 @@ async fn admin_models_report_fit_disk_and_storage() {
         kokoro["device_fit"].as_str(),
         Some("fits" | "too_large" | "unknown")
     ));
+    assert!(kokoro["required_backend"].is_null());
+    // A CUDA-only model is listed on this (non-CUDA) test server, marked,
+    // with what it needs where it does run.
+    let sov = find("SOV-Transcribe-1");
+    assert_eq!(sov["required_backend"].as_str(), Some("cuda"));
+    assert_eq!(sov["device_fit"].as_str(), Some("unsupported_backend"));
+    assert_eq!(sov["enabled"].as_bool(), Some(true));
+    assert_eq!(sov["estimated_memory_bytes"].as_u64(), Some(52 * (1 << 30)));
+    // Loading it is refused as a bad request, not a server error.
+    let response = send_request(
+        app.clone(),
+        build_request(Method::POST, "/v1/admin/models/SOV-Transcribe-1/load", None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = read_json(response).await;
+    assert!(
+        error.to_string().contains("needs an NVIDIA GPU (CUDA)"),
+        "{error}"
+    );
     assert_eq!(
         kokoro["disk_required_bytes"].as_u64(),
         kokoro["size_bytes"].as_u64(),

@@ -171,6 +171,7 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | `VibeVoice-ASR` | Microsoft long-form ASR checkpoint |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | NVIDIA multilingual FastConformer-RNNT `.nemo`; native artifact/config/tokenizer and streaming-state support |
 | `Nemotron-3.5-Transcribe-30B-A4B-FP8` | NVIDIA's 30B speech language model in FP8: one pass of up to 60 minutes in 40 languages, translation to or from English, context terms, speaker labels and its own word timestamps; offline only; needs about 32 GiB of memory |
+| `SOV-Transcribe-1` | Salesforce's speech language model (Whisper large-v3 encoder, Gemma 4 26B-A4B decoder): punctuated transcripts in seven languages (en, fr, de, es, it, pt, nl) that follow a written instruction, with keyword biasing; offline only; **CUDA only**, needs about 52 GiB of GPU memory |
 | `Granite-Speech-4.1-2B` | IBM Granite Speech ASR with punctuated, capitalized transcripts (en, fr, de, es, pt, ja); the default Granite Speech model |
 | `Granite-Speech-4.1-2B-Plus` | IBM Granite Speech rich transcription model with speaker-attributed output and native word timestamps; unpunctuated by design (en, fr, de, es, pt) |
 | `Granite-Speech-5.0-2B` | IBM Granite Speech 5.0: punctuated transcripts (en, fr, de, es, pt, ja), speech translation to and from English (plus English to Italian and Mandarin), and keyword lists of up to 2,000 terms; the recommended Granite Speech model |
@@ -270,6 +271,9 @@ izwi pull Nemotron-3.5-ASR-Streaming-0.6B
 
 # Download NVIDIA Nemotron 3.5 Transcribe (34.7 GB; needs about 32 GiB of memory)
 izwi pull Nemotron-3.5-Transcribe-30B-A4B-FP8
+
+# Download Salesforce SOV-Transcribe-1 (53.3 GB; CUDA only, needs about 52 GiB of GPU memory)
+izwi pull SOV-Transcribe-1
 
 # Download Reson8 Rumble 2 Flash (compact multilingual ASR, 1.0 GB)
 izwi pull Rumble-2-Flash

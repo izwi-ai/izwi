@@ -264,6 +264,10 @@ impl ModelFamily {
             Self::NemotronTranscribeAsr => excluded(
                 "Nemotron 3.5 Transcribe rows share no useful prefix; its state contract declares every domain private",
             ),
+            // Prompts share about 20 tokens before the audio.
+            Self::SovTranscribeAsr => excluded(
+                "SOV-Transcribe-1 rows share no useful prefix; its state contract declares its domain private",
+            ),
             Self::Tokenizer => excluded("tokenizer artifacts carry no inference state"),
         }
     }

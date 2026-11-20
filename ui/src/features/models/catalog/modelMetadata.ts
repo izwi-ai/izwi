@@ -14,6 +14,7 @@ export const PROVIDER_ORDER = [
   "Fish Audio",
   "Resemble AI",
   "Maya Research",
+  "Salesforce",
   "Other",
 ] as const;
 
@@ -93,6 +94,12 @@ export function getModelProviderLabel(variant: string): string {
     variant.startsWith("maya-research/")
   ) {
     return "Maya Research";
+  }
+  if (
+    variant.startsWith("SOV-Transcribe-") ||
+    variant.startsWith("salesforce-sovereign-intelligence/")
+  ) {
+    return "Salesforce";
   }
   return "Other";
 }
@@ -571,6 +578,23 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "FP8",
     ],
     size: "34.7 GB",
+  },
+  "SOV-Transcribe-1": {
+    shortName: "SOV-Transcribe-1",
+    fullName: "Salesforce SOV-Transcribe-1",
+    description:
+      "Large offline Salesforce ASR for NVIDIA GPUs (CUDA) only, needing about 52 GB of GPU memory: punctuated transcripts in seven European languages that follow written instructions on style and formatting, with keyword biasing for names and terms",
+    category: "asr",
+    capabilities: [
+      "Transcription",
+      "Instructions",
+      "Keyword biasing",
+      "7 languages",
+      "Offline",
+      "MoE",
+      "CUDA only",
+    ],
+    size: "53.3 GB",
   },
   "Granite-Speech-4.1-2B": {
     shortName: "Granite Speech 4.1",

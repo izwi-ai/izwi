@@ -289,6 +289,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         for (stage, cost) in stage_costs {
@@ -356,6 +357,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -414,6 +416,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -471,6 +474,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -522,6 +526,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -573,6 +578,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -624,6 +630,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -677,6 +684,7 @@ impl EngineCoreRequest {
             maya2_tts_params: Some(params),
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -737,6 +745,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -906,6 +915,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: artifact,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         Ok(())
@@ -968,6 +978,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: Some(artifact),
         });
         if let Some((stage, cost)) = prepared_stage_cost {
@@ -1085,6 +1096,7 @@ impl EngineCoreRequest {
             maya2_tts_params: None,
             lfm3_audio: None,
             nemotron_transcribe: None,
+            sov_transcribe: None,
             kokoro_tts: None,
         });
         if let Some((stage_id, cost)) = prepared_continuous_cost {

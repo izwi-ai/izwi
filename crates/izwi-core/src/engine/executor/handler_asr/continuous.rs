@@ -200,6 +200,15 @@ impl NativeExecutor {
             );
         }
         if Self::resolve_variant(ordered_requests[live_indices[0]])?.family()
+            == ModelFamily::SovTranscribeAsr
+        {
+            return self.sov_transcribe_batch_with_managed(
+                &ordered_requests,
+                scheduled,
+                managed_caches,
+            );
+        }
+        if Self::resolve_variant(ordered_requests[live_indices[0]])?.family()
             == ModelFamily::NemotronTranscribeAsr
         {
             return self.nemotron_transcribe_batch_with_managed(

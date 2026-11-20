@@ -338,6 +338,11 @@ impl ModelVariant {
                 Provider::IzwiCudaEligible,
                 "Fish Audio Drama 3's Gated DeltaNet causal convolutions run on Izwi's CUDA causal-convolution provider with a Candle fallback; the Fish DAC codec's convolutions are Candle tensor operators; evidence for this family is collected at its certification, not inherited",
             ),
+            ModelFamily::SovTranscribeAsr => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::CandleTensor,
+                "SOV-Transcribe-1's two Whisper stem convolutions run in F32 on Candle tensor operators before the encoder's BF16 blocks",
+            ),
             ModelFamily::NemotronTranscribeAsr => CudaOperatorCapability::source_reviewed(
                 Operator::Convolution,
                 Provider::CandleTensor,
@@ -400,6 +405,7 @@ impl ModelVariant {
             | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::RumbleAsr
             | ModelFamily::NemotronTranscribeAsr
+            | ModelFamily::SovTranscribeAsr
             | ModelFamily::Lfm25Audio
             | ModelFamily::Lfm3Audio
             | ModelFamily::Voxtral => Provider::IzwiCudaEligible,
@@ -547,6 +553,10 @@ impl ModelVariant {
             ModelFamily::NemotronTranscribeAsr => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
                 "Nemotron 3.5 Transcribe runs on Candle CUDA tensor kernels: its ModelOpt FP8 projections stay resident as raw E4M3 on the compact FP8 kernels (BF16 activations, W8A16, SM80+), runs the Mamba2 selective scan in an Izwi CUDA kernel with F32 state, routes the sigmoid MoE in F32 on the host and attends over paged KV; the mel front end, window plan and Sortformer cache bookkeeping run on the host; source review is not runtime validation",
+            ),
+            ModelFamily::SovTranscribeAsr => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "SOV-Transcribe-1 runs on CUDA only, in the checkpoint's BF16 on Candle CUDA tensor kernels: the Whisper large-v3 encoder batches 30 s windows across requests, the Gemma 4 decoder attends over paged KV with two key geometries and a sliding window, norms and the expert routers compute in F32, and the 128 experts of each layer are routed on the host; source review is not runtime validation",
             ),
             ModelFamily::FishDrama3Tts => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,

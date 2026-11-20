@@ -204,6 +204,7 @@ pub(super) fn is_asr_variant(variant: ModelVariant) -> bool {
             | ModelFamily::GraniteSpeech5Asr
             | ModelFamily::RumbleAsr
             | ModelFamily::NemotronTranscribeAsr
+            | ModelFamily::SovTranscribeAsr
     )
 }
 
@@ -292,6 +293,9 @@ pub(super) fn residency_plan(
         }
         _ if variant.family() == ModelFamily::NemotronTranscribeAsr => {
             nemotron_transcribe_plan(model_path, backend)
+        }
+        _ if variant.family() == ModelFamily::SovTranscribeAsr => {
+            sov_transcribe_plan(model_path, backend)
         }
         _ if variant.family() == ModelFamily::RumbleAsr => {
             // The decoder's CUDA graphs allocate their memory on first use;
@@ -2673,6 +2677,41 @@ fn nemotron_transcribe_plan(
         load_peak_bytes: sum(&[resident, priced.largest_tensor_bytes])?,
         host_staging_bytes: host_staging,
         deferred_device_bytes: 0,
+    }))
+}
+
+/// SOV-Transcribe-1, priced from its config's census before a weight is
+/// read (`sov_transcribe::residency`): 48.3 GiB of BF16 on CUDA, the only
+/// backend it loads on. A load uploads one tensor at a time from the mapped
+/// shards (the embedding table is the largest, 1.4 GiB). The CPU figure
+/// prices the F32 test reference; nothing serves from it.
+fn sov_transcribe_plan(model_path: &Path, backend: BackendKind) -> Result<Option<AsrResidencyPlan>> {
+    use crate::models::architectures::sov_transcribe::config::SovTranscribeConfig;
+    use crate::models::architectures::sov_transcribe::residency::residency;
+    let Ok(config) = SovTranscribeConfig::load(model_path) else {
+        return Ok(None);
+    };
+    let compute_bytes = match backend {
+        BackendKind::Cuda => 2,
+        BackendKind::Cpu | BackendKind::Metal => 4,
+    };
+    let priced = residency(&config, compute_bytes);
+    let resident = priced.device_bytes;
+    Ok(Some(AsrResidencyPlan {
+        backend,
+        logical_resident_bytes: resident,
+        resident_bytes: resident,
+        memo_bytes: 0,
+        load_peak_bytes: sum(&[resident, priced.largest_tensor_bytes])?,
+        host_staging_bytes: match backend {
+            BackendKind::Cuda => priced.largest_tensor_bytes,
+            BackendKind::Cpu | BackendKind::Metal => 0,
+        },
+        // The encoder's CUDA graphs allocate on their first batches.
+        deferred_device_bytes:
+            crate::models::architectures::sov_transcribe::graphs::encoder_graph_device_bytes(
+                backend,
+            ),
     }))
 }
 
