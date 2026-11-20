@@ -52,6 +52,8 @@ pub struct MingTtsDiagnostics {
     /// Keys a VAE frame attends to, itself included.
     pub vae_window_keys: usize,
     pub voice_cloning: bool,
+    /// The flow path's CUDA graphs: why they are off, or their counters.
+    pub flow_graphs: serde_json::Value,
 }
 
 /// What one audio-window quantum did.
@@ -113,7 +115,8 @@ impl MingTtsModel {
             drop(runtime);
             device.device.synchronize()?;
         }
-        let (runtime, precision, report) = loaded.expect("the ladder ends in F32");
+        let (mut runtime, precision, report) = loaded.expect("the ladder ends in F32");
+        runtime.resolve_flow_graphs();
         tracing::info!(
             "Ming TTS on {:?}: language model {:?}, flow path {:?}, VAE {:?} ({}; {}); {} keys per VAE frame",
             BackendKind::from(device.kind),
@@ -168,6 +171,7 @@ impl MingTtsModel {
             max_new_tokens: MAX_NEW_LATENTS,
             vae_window_keys: self.runtime.decoder().window_keys(),
             voice_cloning: self.runtime.can_clone_voices(),
+            flow_graphs: self.runtime.flow_graphs_diagnostics(),
         }
     }
 

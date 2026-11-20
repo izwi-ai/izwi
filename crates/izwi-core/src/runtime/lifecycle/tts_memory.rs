@@ -52,7 +52,7 @@ use crate::models::architectures::maya2::{
     maya2_mimi_bf16_device_bytes, maya2_reloads_in_f32,
 };
 use crate::models::architectures::ming_tts::{
-    ming_lm_precision, ming_reloads_in_f32, unused_tensors as ming_unused_tensors, MingPrecision,
+    ming_tts_flow_graph_device_bytes,     ming_lm_precision, ming_reloads_in_f32, unused_tensors as ming_unused_tensors, MingPrecision,
     MingTtsConfig,
     WEIGHTS_FILE as MING_TTS_WEIGHTS_FILE,
 };
@@ -557,13 +557,16 @@ fn ming_tts_plan(
         .map(|(name, _)| name)
         .collect::<Vec<_>>();
     let dtype = ming_lm_precision(device).dtype;
+    // The flow path's CUDA graphs allocate at the load's self-check.
+    let graphs = ming_tts_flow_graph_device_bytes(backend);
     let plan = price_ming_tts(
         &files,
         backend,
         dtype,
         MingPrecision::flow_dtype_for(dtype),
         &unused,
-    )?;
+    )?
+    .with_deferred_device_bytes(graphs);
     if ming_reloads_in_f32(device, dtype) {
         // A model that fails its load-time probe reloads in F32.
         let dense = price_ming_tts(&files, backend, DType::F32, DType::F32, &unused)?;

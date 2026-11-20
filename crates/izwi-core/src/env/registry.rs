@@ -1566,6 +1566,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Allows Metal SDPA for masked attention when the mask shape is supported.",
     ),
     CoreEnvVar::new(
+        "IZWI_MING_TTS_FLOW_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Ming-3.0-tts runs its flow head (all ten Euler steps of both guidance branches) and its aggregator for each decode step as CUDA graphs, at the 32 padded requests every CUDA call has, spare rows zero. A load-time self-check captures both over xorshift inputs and compares replays with the eager runs bit for bit; a mismatch, a CUDA error or a graph pool past its budget keeps them eager. Loads price 200 MiB for the graphs. Any false value turns them off; `flow_graphs` in the model diagnostics reports why they are off, captures, replays and graphed and eager calls.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MING_TTS_MODEL_DIR",
         Path,
         "unset (test skipped)",

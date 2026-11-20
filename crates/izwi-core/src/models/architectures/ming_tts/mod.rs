@@ -22,6 +22,7 @@
 
 pub mod config;
 pub mod flow;
+mod graphs;
 mod model;
 mod physical;
 pub mod prompt;
@@ -66,6 +67,8 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::noise::SplitMix64;
 use config::{STOP_THRESHOLD, TOKENIZER_FILE};
 use flow::{MingAggregator, MingFlowHead};
+pub(crate) use graphs::ming_tts_flow_graph_device_bytes;
+use graphs::{MingFlowGraphs, MingGraphKey};
 use prompt::MingTokenizer;
 use speaker::{sinc_resample, CampPlus, SPEAKER_EMBEDDING_DIM};
 use stack::{MingForwardRow, MingTrunk};
@@ -270,6 +273,8 @@ pub struct MingRuntime {
     decoder: MingVaeDecoder,
     encoder: MingVaeEncoder,
     speaker: Option<CampPlus>,
+    /// The flow path's CUDA graphs (off until [`MingRuntime::resolve_flow_graphs`]).
+    graphs: MingFlowGraphs,
     device: Device,
 }
 
@@ -417,8 +422,103 @@ impl MingRuntime {
             speaker,
             tokenizer,
             cfg,
+            graphs: MingFlowGraphs::off("not resolved"),
             device: device.clone(),
         })
+    }
+
+    /// On CUDA, the flow path's graphs ([`graphs`]): resolved once the
+    /// load's range probe has passed, and checked through capture and
+    /// verification on xorshift inputs before the model serves. A failure
+    /// leaves the flow path eager, with the reason in the diagnostics.
+    pub(crate) fn resolve_flow_graphs(&mut self) {
+        let mut graphs = MingFlowGraphs::resolve(&self.device);
+        if graphs.is_on() {
+            match self.self_check_flow_graphs(&graphs) {
+                Ok(()) if graphs.is_on() => {}
+                Ok(()) => {
+                    let reason = graphs.diagnostics()["off"].to_string();
+                    graphs.turn_off(format!("self-check failed: {reason}"));
+                }
+                Err(error) => graphs.turn_off(format!("self-check failed: {error}")),
+            }
+            if graphs.is_on() {
+                tracing::info!(
+                    requests = FLOW_GROUP_CUDA,
+                    "Ming TTS flow head and aggregator run as CUDA graphs"
+                );
+            } else {
+                tracing::warn!(
+                    reason = %graphs.diagnostics()["off"],
+                    "Ming TTS flow head and aggregator run eagerly"
+                );
+            }
+        }
+        self.graphs = graphs;
+    }
+
+    /// Two sampler and two aggregator calls at the padded group through
+    /// `graphs`: the first captures each graph and checks a replay against
+    /// the eager run, the second checks a replay over new inputs.
+    fn self_check_flow_graphs(&self, graphs: &MingFlowGraphs) -> Result<()> {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        let rows = FLOW_GROUP_CUDA;
+        let hidden = self.cfg.llm.hidden_size;
+        for seed in [0x31A6_F10Au64, 0x31A6_F10B] {
+            let inputs = [
+                xorshift_tensor(&[rows, hidden], seed, 4.0, &self.device)?,
+                xorshift_tensor(&[rows, LATENT_DIM], seed ^ 0x1, 1.0, &self.device)?,
+                xorshift_tensor(&[rows, LATENT_DIM], seed ^ 0x2, 1.0, &self.device)?,
+                Tensor::full(DEFAULT_GUIDANCE, (rows, 1), &self.device)?,
+            ];
+            self.run_sampler(graphs, &inputs)?;
+            let latents = xorshift_tensor(&[rows, LATENT_DIM], seed ^ 0x3, 1.0, &self.device)?;
+            self.run_aggregator(graphs, &latents)?;
+        }
+        Ok(())
+    }
+
+    /// The flow head over one group's `inputs` (hidden, history, noise,
+    /// guidance), through its graph at the padded CUDA group.
+    fn run_sampler(&self, graphs: &MingFlowGraphs, inputs: &[Tensor; 4]) -> Result<Tensor> {
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let [hidden, history, noise, guidance] = inputs else {
+                return Err(Error::InferenceError(format!(
+                    "Ming flow graph received {} inputs, expected 4",
+                    inputs.len()
+                )));
+            };
+            Ok(vec![self
+                .flow
+                .sample_batch(hidden, history, noise, guidance)?])
+        };
+        if graphs.takes(inputs[0].dim(0)?) {
+            graphs.run(MingGraphKey::Sampler(self.flow.dtype()), inputs, &body)
+        } else {
+            Ok(body(inputs)?.pop().expect("one output"))
+        }
+    }
+
+    /// The aggregator over one group's `latents`, through its graph at the
+    /// padded CUDA group.
+    fn run_aggregator(&self, graphs: &MingFlowGraphs, latents: &Tensor) -> Result<Tensor> {
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            Ok(vec![self.aggregator.forward(&inputs[0])?])
+        };
+        if graphs.takes(latents.dim(0)?) {
+            graphs.run(
+                MingGraphKey::Aggregator(self.flow.dtype()),
+                std::slice::from_ref(latents),
+                &body,
+            )
+        } else {
+            self.aggregator.forward(latents)
+        }
+    }
+
+    /// The flow path's CUDA graphs: their state and counters.
+    pub fn flow_graphs_diagnostics(&self) -> serde_json::Value {
+        self.graphs.diagnostics()
     }
 
     pub fn model_dir(&self) -> &Path {
@@ -687,14 +787,14 @@ impl MingRuntime {
             let device = |values: Vec<f32>, cols: usize| -> Result<Tensor> {
                 Ok(Tensor::from_vec(values, (width, cols), &self.device)?)
             };
+            let inputs = [
+                device(hidden, hidden_size)?,
+                device(history, LATENT_DIM)?,
+                device(noise, LATENT_DIM)?,
+                device(guidance, 1)?,
+            ];
             let latents = self
-                .flow
-                .sample_batch(
-                    &device(hidden, hidden_size)?,
-                    &device(history, LATENT_DIM)?,
-                    &device(noise, LATENT_DIM)?,
-                    &device(guidance, 1)?,
-                )?
+                .run_sampler(&self.graphs, &inputs)?
                 .narrow(0, 0, chunk.len())?
                 .to_device(&Device::Cpu)?
                 .to_vec2::<f32>()?;
@@ -729,7 +829,10 @@ impl MingRuntime {
             let mut padded = chunk.to_vec();
             padded.resize(width * LATENT_DIM, 0.0);
             let padded = Tensor::from_vec(padded, (width, LATENT_DIM), &self.device)?;
-            parts.push(self.aggregator.forward(&padded)?.narrow(0, 0, count)?);
+            parts.push(
+                self.run_aggregator(&self.graphs, &padded)?
+                    .narrow(0, 0, count)?,
+            );
         }
         Ok(if parts.len() == 1 {
             parts.pop().expect("one group")
