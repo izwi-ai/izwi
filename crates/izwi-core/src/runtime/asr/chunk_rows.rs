@@ -61,7 +61,10 @@ pub(crate) fn chunk_row_permit_count(row_width: usize, max_queued_requests: usiz
 /// - Voxtral: a chunk within the realtime session ceiling encoded once, then
 ///   a retained row whose frames decode batched across rows;
 /// - SOV-Transcribe-1: a retained row of one 30 s window, its encoder and
-///   prefill packed with the other rows'.
+///   prefill packed with the other rows';
+/// - Rumble: a batched encoder, then a retained decode row where its retained
+///   route is on (CUDA by default); elsewhere one atomic invocation, the call
+///   its sequential chunk route makes per chunk.
 ///
 /// Not the others: Parakeet, VibeVoice and Nemotron 3.5 Transcribe cover a
 /// long file in one pass; Granite 4.1 can replay earlier text into a chunk
@@ -75,6 +78,7 @@ fn chunk_rows_family(family: ModelFamily) -> bool {
             | ModelFamily::NemotronAsr
             | ModelFamily::Voxtral
             | ModelFamily::SovTranscribeAsr
+            | ModelFamily::RumbleAsr
     )
 }
 

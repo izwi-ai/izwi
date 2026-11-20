@@ -1355,7 +1355,9 @@ fn a_chunked_transcript_reports_the_language_its_chunks_named() {
     let chunk = |language: Option<&str>| {
         serde_json::json!({ "index": 0, "model_diagnostics": { "language": language } })
     };
-    let language = |chunks: &[serde_json::Value]| NativeExecutor::chunked_asr_language(chunks);
+    let language = |chunks: &[serde_json::Value]| {
+        crate::engine::executor::audio::chunk_transcriptions_language(chunks)
+    };
     assert_eq!(language(&[]), None);
     assert_eq!(language(&[chunk(None), serde_json::json!({})]), None);
     assert_eq!(
@@ -1387,4 +1389,9 @@ fn a_chunked_transcript_reports_the_language_its_chunks_named() {
     );
     assert_eq!(text, "hallo");
     assert_eq!(diagnostics.unwrap()["language"], "German");
+    // Chunk rows report through the plan's diagnostics, so they name it too.
+    let rows = plan.diagnostics_with_chunk_transcriptions(vec![chunk(Some("German"))]);
+    assert_eq!(rows["language"], "German");
+    let silent = plan.diagnostics_with_chunk_transcriptions(vec![chunk(None)]);
+    assert!(silent.get("language").is_none());
 }

@@ -185,22 +185,60 @@ impl PlannedAsrChunks {
         })
     }
 
+    /// The plan's diagnostics with each chunk's transcription record, and
+    /// the transcript's `language` when its chunks named one. The sequential
+    /// chunk route and chunk rows both report through here.
     pub(crate) fn diagnostics_with_chunk_transcriptions(
         &self,
         chunk_transcriptions: Vec<serde_json::Value>,
     ) -> serde_json::Value {
         let mut diagnostics = self.diagnostics();
-        if let Some(chunking) = diagnostics
-            .get_mut("chunking")
-            .and_then(|value| value.as_object_mut())
-        {
-            chunking.insert(
-                "chunk_transcriptions".to_string(),
-                serde_json::Value::Array(chunk_transcriptions),
-            );
+        let language = chunk_transcriptions_language(&chunk_transcriptions);
+        if let Some(root) = diagnostics.as_object_mut() {
+            if let Some(chunking) = root
+                .get_mut("chunking")
+                .and_then(|value| value.as_object_mut())
+            {
+                chunking.insert(
+                    "chunk_transcriptions".to_string(),
+                    serde_json::Value::Array(chunk_transcriptions),
+                );
+            }
+            if let Some(language) = language {
+                root.insert("language".to_string(), json!(language));
+            }
         }
         diagnostics
     }
+}
+
+/// The language of a chunked transcript: the one most of its chunks
+/// reported as `language` in their model diagnostics, the earliest of them
+/// on a tie. `None` when no chunk named one.
+pub(crate) fn chunk_transcriptions_language(
+    chunk_transcriptions: &[serde_json::Value],
+) -> Option<String> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for language in chunk_transcriptions
+        .iter()
+        .filter_map(|chunk| {
+            chunk
+                .get("model_diagnostics")
+                .and_then(|model| model.get("language"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|language| !language.trim().is_empty())
+    {
+        match counts.iter_mut().find(|(seen, _)| *seen == language) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((language, 1)),
+        }
+    }
+    let most = counts.iter().map(|(_, count)| *count).max()?;
+    counts
+        .into_iter()
+        .find(|(_, count)| *count == most)
+        .map(|(language, _)| language.to_string())
 }
 
 /// What the ASR route planner knows about a loaded model. The route plan is a

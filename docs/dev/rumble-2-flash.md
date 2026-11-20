@@ -144,9 +144,18 @@ budget is 512 tokens by default; any budget is narrowed to the room the
 sequence leaves after the prompt. A row decodes the same tokens alone and in
 a batch, and the same tokens as an atomic invocation.
 
-**Atomic invocations** take longer audio, and every request on a load
-without the retained route: each chunk is one invocation on a
-lifecycle-owned paged KV lease of 1,536 tokens (the prompt's markers and
+**Long files** run as chunk rows (`runtime/asr/chunk_rows.rs`,
+`IZWI_ASR_LONG_FORM_FANOUT`): the runtime plans the file once and submits
+each 28.5 s chunk as its own single-pass request, up to the ASR row width at
+once, and commits the texts in plan order. On a load with the retained route
+the chunks of one file encode and decode as a batch, beside other users'
+requests; without it each chunk is one atomic invocation, so other requests
+wait at most one chunk. Before chunk rows, a long file ran its chunks one
+after another in one dispatch (see the H100 run under What is verified).
+
+**Atomic invocations** take long files when chunk rows are off, and every
+request on a load without the retained route: each chunk is one invocation
+on a lifecycle-owned paged KV lease of 1,536 tokens (the prompt's markers and
 context, at most 256 tokens; one window of audio tokens, 390; and the decode
 budget), chunked inside the dispatch. An atomic invocation holds the device
 for its whole decode. A chunked transcript reports the language most of its
@@ -258,10 +267,33 @@ census (`tests/fixtures/asr_residency/rumble_2_flash.json`):
   its solo run, and the engine's metrics showed two-row decode steps. On
   Metal the realtime WebSocket, a transcription job with a style option and
   a diarization job were rerun on the retained route.
+- On an H100 (80 GB HBM3, BF16 decoder, build 65070de7b, before chunk
+  rows), the ASR serving matrix with the client on the same host:
+  - Clips of 5–15 s: 110 audio s/s for one stream (p50 0.10 s), 497 for
+    32 streams.
+  - 30 s clips: 91 audio s/s for one stream, 662 for 32 streams.
+  - The decode graphs captured and replayed, and decode steps reached 32
+    rows.
+  - At 32 streams of 30 s clips, the GPU time split 45% decode, 35%
+    encoder (two rows a pass on average) and 20% prefill.
+  - Transcripts under load matched their solo runs, except for four
+    punctuation, case or one-word differences in 32 compared.
+  - 600 s files ran their 29 chunks serially in one dispatch: 69 audio s/s
+    for one file and 77 for four. Chunk rows were added for this.
+- Chunk rows, live on Metal (M1 Pro, two rows in flight) with a 150 s and a
+  600 s interview recording:
+  - Transcripts and detected language were identical with chunk rows on and
+    off, on the retained route and on the default atomic route.
+  - Three concurrent 150 s files each matched their solo run.
+  - With the retained route forced on, the 600 s file took 39.6 s against
+    57.6 s without chunk rows.
+  - On the default route it took 49.1 s against 55.6 s, and three
+    concurrent 150 s files took 33.3 s against 41.3 s.
 
 Not verified:
 
 - Parity against transformers. `scripts/fixtures/generate_rumble_reference.py`
   writes the fixture the ignored parity tests read; it has not been run.
-- Anything on CUDA beyond compilation.
+- Long files as chunk rows on CUDA (only on Metal so far), and the decode
+  graphs' gain over the standard decode (the A/B was cut short when the spot VM was preempted).
 - Languages other than English, and accuracy on a benchmark set.

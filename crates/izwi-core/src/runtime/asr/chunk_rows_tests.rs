@@ -171,6 +171,7 @@ fn only_plain_transcriptions_of_opted_in_families_run_as_rows() {
         ModelVariant::Qwen3Asr17BGguf,
         ModelVariant::WhisperLargeV3Turbo,
         ModelVariant::VoxtralMini4BRealtime2602,
+        ModelVariant::Rumble2Flash,
     ] {
         assert!(chunk_rows_apply(variant, &plain, true), "{variant}");
         // The switch off keeps every file on the request route.
