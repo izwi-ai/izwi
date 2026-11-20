@@ -139,10 +139,28 @@ most `512 - prompt positions` latents. A request whose prompt leaves no room
 is refused with a message; a budget that ends before the stop head fires is
 reported as `LatentBudget`.
 
-Rows from several requests share language-model calls. Projections run row
-by row on the CPU and Metal and at a fixed 32-row shape on CUDA, so a row
-gets the bits it gets alone. The flow head and the aggregator run one
-request at a time.
+Rows from several requests share every call of a decode step, and a
+request still gets the bits it gets alone:
+
+| | Language model | Flow head, aggregator |
+|---|---|---|
+| CPU | projections row by row | one request a call |
+| Metal | projections row by row | the step's requests in one call (up to 32) |
+| CUDA | one 32-row shape, padded | one 32-request shape, padded |
+
+Each request draws its noise from its own seeded stream, and every op on
+the flow path keeps rows apart; only a matmul's kernel depends on the call's
+shape. Metal's matmul rounds a row the same for every row count from two up,
+but runs a single row as a GEMV that rounds some values differently. Every
+flow-head matmul has at least two rows; an aggregator call, whose first
+matmul has one row a request, is padded to two. So Metal shares calls
+without padding them to a group (padding a lone request to eight would cost
+it 60%). The CPU matmul's rounding changes with the row count, so the CPU
+runs requests apart. `requests_sampled_together_match_each_alone_*` (every
+count from two to eleven) and `rows_decoded_together_match_each_alone`
+check it bit for bit, `requests_together_match_each_alone_on_the_checkpoint`
+on the published weights (two to eight), and `run-tts-concurrency.py report
+--require-parity` through the server.
 
 ## Audio
 
@@ -192,6 +210,54 @@ diagnostics report the result (`dtype`, `flow_dtype`, `vae_dtype`).
 `trace_language_model_magnitudes` (an ignored test) prints each layer's
 largest values on the test device. RMSNorm statistics are F32 everywhere:
 `eps` 1e-6 is below F16's smallest normal number.
+
+## Kernels and CUDA graphs
+
+- Norms are `kernels::residual_norm` (one launch, F32 statistics, an F32
+  gain), the post-attention norm fused with the residual add. In the
+  language model they normalize at F32 and cast after.
+- Rotations are Candle's fused `rope_i` (the flow transformers'
+  interleaved pairs) and `rope_thd` (the Qwen2 stacks' half split).
+- The flow transformers' attention over two or three positions is the
+  fused kernel where the backend has one (Metal SDPA, CUDA flash
+  attention), in the input's dtype. The gated product of the Qwen2 stacks
+  is the fused SiLU-multiply.
+- The flow head's time MLP runs once at load, for the ten fixed steps; the
+  condition projection and the previous latent's embedding once a latent.
+
+On CUDA two sets of graphs cut launch overhead (`graphs.rs`):
+
+| Graphs | What | Switch | Diagnostics |
+|---|---|---|---|
+| Flow path (`ShapeGraphs`) | the whole ten-step sampler, and the aggregator, at 32 padded requests | `IZWI_MING_TTS_FLOW_GRAPHS` | `flow_graphs` |
+| Decode step (`StretchGraphs`) | the work between two layers' paged attention, at 1 to 4 or 8 decode rows | `IZWI_MING_TTS_DECODE_GRAPHS`, `cuda.decode_graphs` | `decode_graphs` |
+
+Both are on by default. A graph is captured, checked against the eager run
+bit for bit, verified once more on new inputs, then replayed, and any
+failure turns its set off with the reason in the diagnostics. The flow-path
+graphs are self-checked at load (after the range probe) and priced at
+200 MiB. Not yet run on a GPU.
+
+## Performance
+
+`ming_tts::reference_tests::bench_components` (ignored, the published
+checkpoint; `IZWI_MING_TTS_TEST_DEVICE`, `IZWI_MING_TTS_BENCH_CALLS`) times
+each stage of a latent with the device drained around every call. M1 Pro,
+2026-11-20, per latent (80 ms of audio):
+
+| Stage | Metal F16 before | Metal F16 now | CPU F32 before | CPU F32 now |
+|---|---:|---:|---:|---:|
+| Flow head, one request | 96.6 ms | 58.6 ms | 254 ms | 234 ms |
+| Flow head, 8 requests together | 8 x 96.6 | 91.1 ms (11.4 a request) | n/a | n/a |
+| Language-model step, 1 / 4 rows | 12.7 / 35.0 ms | 9.6 / 21.0 ms | 42 / 163 ms | 41 / 160 ms |
+| Aggregator | 7.7 ms | 5.6 ms | 19 ms | 19 ms |
+| Prefill, 160 positions | 84 ms | 55 ms | 447 ms | 342 ms |
+| A sentence end to end, RTF | 1.57 | 0.96 | 4.31 | 4.10 |
+
+The flow head is most of a latent everywhere. On Metal its matmuls at a few
+rows run as GEMMs well below the memory bandwidth (about 40 of its 59 ms); a
+skinny-GEMM kernel is the next lever there. On the CPU the flow head is
+bound by its matmuls, and requests do not share calls (see Generation).
 
 ## Checks
 
