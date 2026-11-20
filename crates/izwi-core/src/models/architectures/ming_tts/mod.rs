@@ -313,8 +313,10 @@ pub(crate) struct FlowGroup {
     /// Whether a call is padded to `requests` with zero rows.
     pub(crate) padded: bool,
     /// Fewest rows an aggregator call has, zero-padded: its first matmul
-    /// takes one row a request, and Metal runs one row as a GEMV that
-    /// rounds differently from the GEMM of two or more.
+    /// takes one row a request, and Candle's Metal matmul runs one row as a
+    /// GEMV that rounds differently from the GEMM of two or more. (The flow
+    /// path's own Metal kernel rounds a row the same at any count; the pad
+    /// keeps that true with it switched off.)
     pub(crate) min_aggregator_rows: usize,
 }
 

@@ -1580,6 +1580,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "On CUDA, Ming-3.0-tts runs its flow head (all ten Euler steps of both guidance branches) and its aggregator for each decode step as CUDA graphs, at the 32 padded requests every CUDA call has, spare rows zero. A load-time self-check captures both over xorshift inputs and compares replays with the eager runs bit for bit; a mismatch, a CUDA error or a graph pool past its budget keeps them eager. Loads price 200 MiB for the graphs. Any false value turns them off; `flow_graphs` in the model diagnostics reports why they are off, captures, replays and graphed and eager calls.",
     ),
     CoreEnvVar::new(
+        "IZWI_MING_TTS_METAL_MATVEC",
+        Flag,
+        "true",
+        Once,
+        "On Metal, Ming-3.0-tts's flow head and aggregator run their linear layers on Izwi's multi-row mat-vec kernel: the weight is read once for up to 16 rows, accumulation is F32 with the bias added before one rounding, and a row sums in the same order however many rows share the call. Any false value runs them on Candle's matmul.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MING_TTS_MODEL_DIR",
         Path,
         "unset (test skipped)",

@@ -247,12 +247,12 @@ each stage of a latent with the device drained around every call. M1 Pro,
 
 | Stage | Metal F16 before | Metal F16 now | CPU F32 before | CPU F32 now |
 |---|---:|---:|---:|---:|
-| Flow head, one request | 96.6 ms | 58.6 ms | 254 ms | 234 ms |
-| Flow head, 8 requests together | 8 x 96.6 | 91.1 ms (11.4 a request) | n/a | n/a |
-| Language-model step, 1 / 4 rows | 12.7 / 35.0 ms | 9.6 / 21.0 ms | 42 / 163 ms | 41 / 160 ms |
-| Aggregator | 7.7 ms | 5.6 ms | 19 ms | 19 ms |
+| Flow head, one request | 96.6 ms | 26.5 ms | 254 ms | 234 ms |
+| Flow head, 8 requests together | 8 x 96.6 | 93.6 ms (11.7 a request) | n/a | n/a |
+| Language-model step, 1 / 4 rows | 12.7 / 35.0 ms | 9.9 / 21.8 ms | 42 / 163 ms | 41 / 160 ms |
+| Aggregator | 7.7 ms | 3.0 ms | 19 ms | 19 ms |
 | Prefill, 160 positions | 84 ms | 55 ms | 447 ms | 342 ms |
-| A sentence end to end, RTF | 1.57 | 0.96 | 4.31 | 4.10 |
+| A sentence end to end, RTF | 1.57 | 0.54 | 4.31 | 4.10 |
 
 Through the server on Metal (`run-tts-concurrency.py`, buffered requests of
 about 8 s of audio, byte parity with one stream at every level):
@@ -260,15 +260,19 @@ about 8 s of audio, byte parity with one stream at every level):
 | Streams | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
 | Before, audio-s/s | 0.65 | 0.66 | 0.67 | 0.66 |
-| Now, audio-s/s | 1.10 | 1.75 | 2.77 | 3.10 |
+| Now, audio-s/s | 1.90 | 2.44 | 3.05 | 3.18 |
 
 Ming decodes eight rows on Metal (`catalog::tts_decode_width`), two on the
 CPU and 32 on CUDA.
 
-The flow head is most of a latent everywhere. On Metal its matmuls at a few
-rows run as GEMMs well below the memory bandwidth (about 40 of its 59 ms); a
-skinny-GEMM kernel is the next lever there. On the CPU the flow head is
-bound by its matmuls, and requests do not share calls (see Generation).
+The flow head is most of a latent everywhere. On Metal its linear layers run
+on Izwi's multi-row mat-vec (`kernels::metal_dense_mv`, switch
+`IZWI_MING_TTS_METAL_MATVEC`): Candle's GEMM read a few rows' weights well
+below the memory bandwidth (about 40 of the flow head's 59 ms). The kernel
+sums a row the same at any row count, so sharing stays bit-exact. From about
+eight requests (48 rows) Candle's tiled GEMM would be as fast. On the CPU the
+flow head is bound by its matmuls, and requests do not share calls (see
+Generation).
 
 ## Checks
 

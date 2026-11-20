@@ -199,10 +199,10 @@ pub(crate) const fn asr_decode_width(
 /// aggregator run every row of a step in one call, and a request gets the
 /// bits it gets alone at every count from two to eight
 /// (`requests_together_match_each_alone_on_the_checkpoint`, and byte parity
-/// at c2 to c8 through the server). On an M1 Pro the flow head costs 59 ms a
-/// latent alone and 11 ms a request at eight. Through the server, two rows
-/// stopped at 1.7 audio-s/s from two streams up; eight reach 2.8 at four
-/// streams and 3.1 at eight (1.1 at one).
+/// at c2 to c8 through the server). On an M1 Pro the flow head costs 27 ms a
+/// latent alone and 12 ms a request at eight. Through the server, two rows
+/// stopped at 1.7 audio-s/s from two streams up; eight reach 3.05 at four
+/// streams and 3.2 at eight (1.9 at one).
 pub(crate) const fn tts_decode_width(
     family: ModelFamily,
     backend: BackendKind,

@@ -31,8 +31,26 @@ const TIME_SCALE: f64 = 1_000.0;
 /// x_transformers' `RotaryEmbedding` base.
 const ROTARY_BASE: f64 = 10_000.0;
 
+/// Kill switch for the flow path's Metal mat-vec kernel (a boolean; on when
+/// unset): off, its linear layers take Candle's matmul.
+#[cfg(feature = "metal")]
+pub(crate) const MING_TTS_METAL_MATVEC_ENV: &str = "IZWI_MING_TTS_METAL_MATVEC";
+
+#[cfg(feature = "metal")]
+fn metal_matvec_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(MING_TTS_METAL_MATVEC_ENV, true));
+    ON.get()
+}
+
 /// A linear layer with its weight as stored, [out, in]: transposed as a
 /// view at each call, so no transposed copy is written on the device.
+///
+/// On Metal it runs on `kernels::metal_dense_mv`, which reads the weight
+/// once for up to 16 rows at memory speed (the flow path's calls have 2 to
+/// 192 rows) and sums a row in an order that does not depend on how many
+/// rows share the call. Elsewhere, and for shapes the kernel does not take,
+/// Candle's matmul.
 struct Linear {
     weight: Tensor,
     bias: Option<Tensor>,
@@ -52,6 +70,18 @@ impl Linear {
 
     /// `x` [..., in] → [..., out].
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if let Some(bias) = &self.bias {
+            if metal_matvec_requested()
+                && crate::kernels::metal_dense_mv::serves(x, &self.weight, bias)
+            {
+                return Ok(crate::kernels::metal_dense_mv::linear(
+                    x,
+                    &self.weight,
+                    bias,
+                )?);
+            }
+        }
         let dims = x.dims().to_vec();
         let input = *dims.last().expect("a linear input has a last dim");
         let rows = dims[..dims.len() - 1].iter().product::<usize>();
