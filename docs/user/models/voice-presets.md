@@ -1,6 +1,6 @@
 ---
 title: "Voice Presets"
-description: "Reference built-in voice and speaker IDs for Qwen3 CustomVoice, Kokoro, Voxtral TTS, LFM2.5 Audio, LFM3 Audio, Chatterbox, Maya1, and Maya 2 Native."
+description: "Reference built-in voice and speaker IDs for Qwen3 CustomVoice, Kokoro, Voxtral TTS, LFM2.5 Audio, LFM3 Audio, Chatterbox, Maya1, Maya 2 Native, and Ming 3.0 TTS."
 sidebarTitle: "Voice Presets"
 icon: "audio-lines"
 ---
@@ -28,6 +28,7 @@ Voice Studio saved voice library instead of these built-in speaker IDs.
 | Chatterbox-500M, Chatterbox-Multilingual-500M | One built-in voice (`default`), or a reference or saved voice (no transcript needed) |
 | Maya1-3B | Nine described voices, or a description of your own in `instructions` |
 | Maya2-Native-2.5B | 20 named voices, or a reference or saved voice (transcript needed) |
+| Ming-3.0-tts-0.5B | 85 named voices (many with emotion variants), a reference or saved voice (transcript optional), or a description in `instructions` |
 | Qwen3 Base | Reference voice or saved voice only |
 | Qwen3 VoiceDesign | Prompt instructions, then optional saved voice reuse |
 
@@ -243,3 +244,130 @@ izwi tts "வணக்கம், எப்படி இருக்கிறீ�
 
 To speak in a voice of your own instead, clone one from reference audio and
 its transcript (see [Voice Cloning](/features/voice-cloning)).
+
+## Ming 3.0 TTS
+
+`Ming-3.0-tts-0.5B` has 85 built-in voices: three English ones and 82 Chinese
+ones. Any voice can be asked to speak any of the model's languages; each was
+recorded in the one its table names. A request without a voice uses `US_Emma`
+for English text and `灵小柔` for Chinese text. OpenAI's voice names map to
+the English voices (`alloy`, `marin`, `nova` and `shimmer` to `US_Emma`;
+`coral`, `fable` and `sage` to `UK_Charlotte`; the others to `UK_George`).
+
+Many Chinese voices were recorded only in a set of emotions. Ask for one with
+`emotion` (`--emotion` in the CLI); without it the voice speaks its neutral
+delivery, or its first one when it has no neutral. A voice with one delivery
+takes no `emotion`. A cloned voice takes any of the seven emotions.
+
+### English voices
+
+| Voice | Gender | Accent and use |
+|-------|--------|----------------|
+| `US_Emma` (default for English) | female | American; assistants, narration, conversational product voice |
+| `UK_George` | male | British; audiobooks, formal announcements |
+| `UK_Charlotte` | female | British; audiobooks, measured narration |
+
+### Chinese voices
+
+| Voice | Gender | Description | Emotions |
+|-------|--------|-------------|----------|
+| `灵小安` | female | Sweet, crisp and energetic, with an approachable, cute anime-style delivery. | — |
+| `灵语汐` | female | Clear, bright and youthful, with a sunny, energetic delivery. | — |
+| `灵小萌` | female | Bright, crisp and brisk, with an energetic yet dependable delivery. | — |
+| `灵小柔` | female | Clear, sweet and articulate, with polite, patient and professional intonation. | — |
+| `灵小雅` | female | Sweet, bright and youthful, with an energetic delivery. | — |
+| `花小呗` | female | Crisp and sweet, with a distinctly childlike, lively delivery. | — |
+| `灵韵` | female | Bright and crisp, with brisk, dependable delivery. | — |
+| `妩媚妲己` | female | Sweet and crisp, with light, rising intonation and an alluring delivery. | — |
+| `灵婉` | female | Clear and sweet, with a youthful, intimate and soothing delivery. | — |
+| `灵小月` | female | Sweet, clear and energetic, with cheerful, welcoming intonation. | — |
+| `灵朵儿` | female | Warm, thoughtful and approachable, with an unhurried, soothing storytelling style. | — |
+| `灵小锋` | male | Warm and resonant, with natural confidence and a balance of friendliness and maturity. | — |
+| `灵小川` | male | Warm, mellow and resonant, with sensitive, expressive delivery. | — |
+| `灵小甄` | female | Bright, crisp and lively, with a friendly, persuasive recommendation style. | — |
+| `灵小知` | female | Bright and confident, with strong, articulate and persuasive delivery. | — |
+| `灵小惠` | female | Very fast and penetrating, conveying urgency, enthusiasm and professional confidence. | — |
+| `灵小晴` | female | Very fast yet clear, with a powerful, bright delivery that conveys urgency. | — |
+| `灵小琪` | male | Sunny, friendly and natural, with an enthusiastic recommendation style. | — |
+| `灵梦` | female | Very sweet and youthful, with playful, affectionate delivery. | — |
+| `灵恬` | female | Honey-sweet, with a gently playful yet assured romantic delivery. | — |
+| `灵小汐` | female | Clear and sweet, with relaxed, natural and endearingly innocent delivery. | — |
+| `灵小棠` | female | Clear and warm, with calm pacing and a gentle, experienced storytelling style. | — |
+| `灵小梨` | female | Sweet and clear, combining youthful playfulness with gentle, expressive narration. | — |
+| `灵小芸` | female | Warm and thoughtful, with sincere, calm and sensitive delivery. | — |
+| `灵空` | male | Low and resonant, with close, breathy delivery that conveys affection and reassurance. | — |
+| `灵宇` | male | Youthful and resonant, with a confident smile and gentle teasing. | — |
+| `灵朗` | male | Low and resonant, combining confident warmth with affectionate reassurance. | — |
+| `灵楷` | male | Warm and resonant, with slow, soothing late-night-radio narration. | — |
+| `灵旭` | male | Clear, youthful and scholarly, with calm, gentle storytelling. | — |
+| `灵江` | male | Warm and resonant, with relaxed, heartfelt reflections on youth and enthusiasm. | — |
+| `悲伤女声` | female | Gentle yet determined, with a thoughtful, intimate storytelling style. | — |
+| `皮六` | male | Bright, youthful and confident, with strong contrast and dramatic emphasis. | — |
+| `悟空` | male | Highly expressive and theatrical, with vivid but measured exaggeration. | — |
+| `灵晓声` | male | Youthful and resonant, with calm confidence and an assertive, charismatic delivery. | neutral, happy, sad, disgusted, surprised |
+| `灵风信` | female | Sweet and clear, with warm, concerned and reassuring delivery. | neutral, happy, sad, angry, disgusted |
+| `灵惜梦` | female | Bright and crisp, combining approachable warmth with independence and decisiveness. | neutral, happy, sad, angry, fearful, disgusted, surprised |
+| `灵逸风` | male | Fresh and youthful, with relaxed, casual and slightly evasive delivery. | neutral, happy, sad, fearful, surprised |
+| `灵悦澜` | female | Sweet and crisp, with a smiling, approachable and lively delivery. | neutral, happy, sad, angry, fearful, disgusted |
+| `灵御心` | female | Bright, crisp and direct, with efficient, youthful energy. | neutral, happy, angry |
+| `灵语恬` | female | Clear and gentle, with attentive, earnest delivery. | neutral, happy, sad, angry, fearful, surprised |
+| `灵心恬` | female | Crisp and composed, with objective delivery and vivid storytelling. | neutral, happy, sad, angry, fearful, disgusted, surprised |
+| `灵亦尘` | male | Warm and resonant, with natural, gentle concern and reassuring delivery. | neutral, fearful |
+| `灵语尘` | male | Low, husky and world-weary, conveying helplessness and resignation. | neutral, happy, sad, fearful, disgusted, surprised |
+| `灵悦兮` | female | Bright and crisp, with lively, confident and action-oriented delivery. | neutral, happy, sad, angry, fearful, disgusted, surprised |
+| `灵若虚` | female | Clean and efficient, with thoughtful, objective yet warm delivery. | neutral, happy, sad, angry, disgusted, surprised |
+| `灵未央` | female | Sweet and crisp, with playful, rising intonation and confident explanations. | neutral, happy, sad, angry, fearful, surprised |
+| `灵梦瑶` | female | Soft and sweet, with a friendly, earnest and soothing explanatory style. | neutral, happy, sad, angry, surprised |
+| `灵妙声` | male | Sweet and crisp, with standard pronunciation and a fresh, approachable, professional delivery. | neutral, sad |
+| `灵言澈` | male | Warm, resonant and reassuring, with gentle, affectionate concern. | neutral, happy |
+| `灵嘉肴` | male | Bright and energetic, with precise articulation and rational, approachable confidence. | neutral, fearful |
+| `灵孤影` | male | Warm and resonant, with composed, sincere appreciation and natural satisfaction. | neutral |
+| `灵雨汐` | female | Soft and sweet, with natural breathiness and an affectionate, relaxed youthful delivery. | neutral, happy, sad, fearful, surprised |
+| `灵信远` | male | Clear and warm, with a slight smile and audible breath, balancing youthful freshness and mature affection. | happy, sad, angry, fearful, surprised |
+| `灵思齐` | male | Sunny, bright and engaging, with sincere praise and approachable warmth. | happy, sad, fearful, disgusted, surprised |
+| `灵叙柔` | female | Composed and dignified, with clear articulation and a balance of authority and gentle narration. | happy, surprised |
+| `灵绮木` | female | Professional yet approachable, with gentle, assured delivery. | happy, angry, disgusted |
+| `灵渊霆` | male | Youthful, natural and relaxed, like a familiar friend making a casual invitation. | happy, sad, angry, fearful, disgusted, surprised |
+| `灵素心` | female | Sweet, crisp and energetic, with lively, curious intonation. | sad, disgusted |
+| `灵采薇` | female | Warm and thoughtful, with clear articulation and calm, trustworthy delivery. | happy, angry, disgusted |
+| `灵卓然` | male | Full and resonant, with precise pronunciation and calm, objective delivery. | sad, fearful |
+| `灵浅忧` | male | Bright and crisp, with precise articulation and professional, objective confidence. | happy, sad, fearful, disgusted |
+| `灵昭野` | male | Clear and youthful, with sincere admiration and a warm, captivated delivery. | happy, sad, disgusted |
+| `灵心澜` | female | Mature and composed, with assured, discerning and dignified delivery. | happy, sad |
+| `灵犀言` | male | Deep and full, with mature composure, firm articulation and an authoritative delivery. | sad, angry |
+| `灵语冰` | female | Thoughtful and efficient, with precise articulation and objective, trustworthy delivery. | happy, sad, surprised |
+| `灵惊鸿` | male | Brisk and direct, with natural, easygoing business confidence. | happy, sad, angry, disgusted, surprised |
+| `灵惜蕊` | female | Clear and pleasant, with standard pronunciation and patient, professional warmth. | happy, sad, angry, fearful, disgusted, surprised |
+| `灵语萱` | female | Clear and sweet, with gentle yet firm affection, trust and reassurance. | happy, sad, angry, fearful, disgusted |
+| `灵语烟` | female | Bright, crisp and lively, expressing surprise and everyday banter. | happy, sad, angry, fearful, disgusted |
+| `灵律雅` | female | Efficient and grounded in urban life, with restrained, authentic frustration. | happy, angry, fearful |
+| `灵惊涛` | male | Young male delivery with a distinctive Nanning accent, conveying humorous frustration at an overly cold internet cafe. | fearful |
+| `灵寒陌` | male | Clear and youthful, with urgent, innocent attempts to clear up a misunderstanding. | happy, disgusted |
+| `灵决冥` | male | Resonant and precise, with calm, objective and engaging documentary-style delivery. | angry, fearful, disgusted |
+| `灵慈萱` | female | Crisp, youthful and natural, with a familiar, slightly urgent delivery. | sad, angry, fearful |
+| `灵妙音` | female | Resonant and forceful, with efficient delivery and an unquestionable sense of authority. | happy, sad, fearful, disgusted, surprised |
+| `灵断尘` | male | Youthful and conversational, with light questions and decisive refusals. | happy, sad, fearful, disgusted, surprised |
+| `灵熙婉` | female | Sweet and clear, with a smiling, approachable and lively storytelling style. | happy, sad, fearful |
+| `灵旭扬` | male | Warm and resonant, with affectionate delivery and a hint of illness-related weakness and desire for attention. | happy, sad, angry, fearful, disgusted, surprised |
+| `灵阅川` | male | Deep and resonant, with experienced, composed and dignified storytelling. | happy, sad, angry, fearful, disgusted |
+| `灵妩月` | female | Gentle and thoughtful, combining caring, rational advice with quiet strength. | happy, sad, angry, fearful, disgusted, surprised |
+| `灵汐月` | female | Sweet and soothing, with relaxed, heartfelt delivery conveying intimacy and trust. | happy, sad |
+| `灵黛嗔` | female | Warm, thoughtful and engaging, with sincere, confident recommendations. | happy, disgusted |
+
+The model also knows eight voices named after film, television and cartoon
+characters. Izwi does not list them; a request can still name any voice the
+model knows.
+
+Example:
+
+```bash
+izwi tts "所有测试都顺利通过了，我们终于可以把这个好消息告诉大家！" \
+  --model Ming-3.0-tts-0.5B \
+  --speaker 灵风信 \
+  --emotion happy \
+  --output ming-happy.wav
+```
+
+To speak in a voice of your own instead, clone one from a reference clip (see
+[Voice Cloning](/features/voice-cloning)), or describe one with
+`--instructions`.

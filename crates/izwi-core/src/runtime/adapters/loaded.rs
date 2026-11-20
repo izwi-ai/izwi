@@ -64,10 +64,10 @@ use sequence_asr::{
 };
 use tts::{
     Audio8TtsExecutionAdapter, ChatterboxTtsExecutionAdapter, FishDrama3TtsExecutionAdapter,
-    FishS2TtsExecutionAdapter,
-    Lfm25AudioTtsExecutionAdapter, Lfm3AudioSpeechExecutionAdapter, Maya1TtsExecutionAdapter,
-    Maya2TtsExecutionAdapter, PhysicalQwenTtsExecutionAdapter, StaticTtsExecutionAdapter,
-    VibeVoiceTtsExecutionAdapter, VoxtralTtsExecutionAdapter,
+    FishS2TtsExecutionAdapter, Lfm25AudioTtsExecutionAdapter, Lfm3AudioSpeechExecutionAdapter,
+    Maya1TtsExecutionAdapter, Maya2TtsExecutionAdapter, MingTtsExecutionAdapter,
+    PhysicalQwenTtsExecutionAdapter, StaticTtsExecutionAdapter, VibeVoiceTtsExecutionAdapter,
+    VoxtralTtsExecutionAdapter,
 };
 
 const SCALAR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(11);
@@ -90,6 +90,7 @@ const FISH_DRAMA3_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(
 const VOXTRAL_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(28);
 const CHATTERBOX_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const MAYA1_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+const MING_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const MAYA2_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM3_AUDIO_TTS_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const LFM3_AUDIO_ASR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);

@@ -4512,6 +4512,10 @@ fn tts_state_floor_covers_one_full_request_per_family() {
                 crate::models::architectures::maya1::config::MAX_PROMPT_TOKENS
                     + ModelVariant::MAYA1_MAX_OUTPUT_FRAMES
             }
+            // The reference's 512-position context.
+            ModelFamily::MingTts => {
+                crate::models::architectures::ming_tts::config::STATE_CONTEXT_TOKENS
+            }
             // Upstream's per-seat capacity: prompt plus frames.
             ModelFamily::Maya2Tts => {
                 crate::models::architectures::maya2::config::STATE_CONTEXT_TOKENS
@@ -4710,6 +4714,7 @@ fn tts_staged_rows_cover_the_tts_decode_width() {
     let lifecycle = &wide.model_lifecycle;
     for variant in [
         ModelVariant::Maya13B,
+        ModelVariant::Ming30Tts05B,
         ModelVariant::Qwen3Tts12Hz06BCustomVoice,
         ModelVariant::Voxtral4BTts2603,
     ] {

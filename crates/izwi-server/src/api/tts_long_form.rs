@@ -122,12 +122,14 @@ fn segment_max_chars(variant: ModelVariant) -> usize {
         izwi_core::ModelFamily::Qwen3Tts => QWEN_SEGMENT_MAX_CHARS,
         izwi_core::ModelFamily::Maya1Tts => MAYA1_SEGMENT_MAX_CHARS,
         izwi_core::ModelFamily::Maya2Tts => MAYA2_SEGMENT_MAX_CHARS,
+        izwi_core::ModelFamily::MingTts => crate::api::tts_policy::MING_TTS_SEGMENT_MAX_CHARS,
         _ => DEFAULT_CHUNK_MAX_CHARS,
     })
 }
 
 /// Whether text under an automatic budget splits into long-form segments:
-/// when one request cannot speak it, or (Qwen3-TTS, Maya1, Maya 2 Native)
+/// when one request cannot speak it, or (Qwen3-TTS, Maya1, Maya 2 Native,
+/// Ming 3.0 TTS)
 /// when it is longer than one segment.
 fn splits_into_segments(variant: ModelVariant, text: &str) -> bool {
     crate::api::tts_policy::tts_text_exceeds_one_request(variant, text)
@@ -136,6 +138,7 @@ fn splits_into_segments(variant: ModelVariant, text: &str) -> bool {
             izwi_core::ModelFamily::Qwen3Tts
                 | izwi_core::ModelFamily::Maya1Tts
                 | izwi_core::ModelFamily::Maya2Tts
+                | izwi_core::ModelFamily::MingTts
         ) && text.trim().chars().count() > segment_max_chars(variant))
 }
 
@@ -461,7 +464,10 @@ impl SpeechTextPlan {
     /// where it can. Audio8's prompt, reference frames and output share
     /// 2,048 positions and one request speaks at most 1,024 frames (47 s),
     /// so its segments are shorter and a CJK character, which takes about as
-    /// long to say as a short word, counts as four.
+    /// long to say as a short word, counts as four. Ming 3.0 TTS's are the
+    /// shared splitter's (about 12 s, a CJK character counting three), so a
+    /// segment fits its 512 positions beside the first segment's voice; at
+    /// the plan's 480 characters a segment could outrun the context.
     fn segment_plan(
         variant: ModelVariant,
         text: &str,
@@ -470,9 +476,12 @@ impl SpeechTextPlan {
         use sha2::{Digest, Sha256};
         check_speech_text_bytes(text)?;
         let audio8 = variant.family() == izwi_core::ModelFamily::Audio8Tts;
+        let ming = variant.family() == izwi_core::ModelFamily::MingTts;
         let weight = |ch: char| -> usize {
             if audio8 && is_cjk_syllabic(ch) {
                 AUDIO8_CJK_CHAR_WEIGHT
+            } else if ming {
+                crate::api::tts_policy::ming_tts_char_weight(ch)
             } else {
                 1
             }
@@ -486,6 +495,8 @@ impl SpeechTextPlan {
         // output limits.
         let target = chunk_max_chars().min(if audio8 {
             AUDIO8_SEGMENT_MAX_CHARS
+        } else if ming {
+            crate::api::tts_policy::MING_TTS_SEGMENT_MAX_CHARS
         } else {
             480
         });
@@ -524,10 +535,28 @@ impl SpeechTextPlan {
         } else if let Some(last) = segments.last_mut() {
             last.end = text.len();
         }
+        // A Ming plan carries no reference (the durable route takes text
+        // only), so its later segments clone the first: a short first
+        // segment makes the anchor (`ming_tts_anchor_lead_end`).
+        if ming && segments.len() > 1 {
+            let first = segments[0].clone();
+            if let Some(end) =
+                crate::api::tts_policy::ming_tts_anchor_lead_end(&text[first.clone()])
+            {
+                segments[0] = first.start..first.start + end;
+                segments.insert(1, first.start + end..first.end);
+            }
+        }
         // Blank layout alone is not an inference segment. Byte ranges still
         // identify original content for durable progress and recovery.
         segments.retain(|range| !text[range.clone()].trim().is_empty());
-        if segments.len() > 1 && !audio8 && !crate::env_config::tuning().fish_long_form_enabled {
+        // Ming's segments are its shared splitter's, never gated by the Fish
+        // switch.
+        if segments.len() > 1
+            && !audio8
+            && !ming
+            && !crate::env_config::tuning().fish_long_form_enabled
+        {
             return Err(izwi_core::Error::InvalidInput(
                 "Fish long-form generation is disabled by this deployment".into(),
             ));
@@ -775,11 +804,25 @@ pub fn expand_generation_requests_for_long_form(
 ) -> Vec<GenerationRequest> {
     let requested = base_request.config.options.max_tokens;
     let automatic = requested == 0 && !variant.plans_own_speech_segments();
-    let chunks = if automatic && !splits_into_segments(variant, &base_request.text) {
+    let mut chunks = if automatic && !splits_into_segments(variant, &base_request.text) {
         vec![base_request.text.trim().to_string()]
     } else {
         split_tts_text_for_long_form(variant, requested, base_request.text.as_str())
     };
+    // Ming's later segments clone the first one (`FirstSegmentVoice`): a
+    // short first segment makes the anchor (`ming_tts_anchor_lead_end`).
+    if chunks.len() > 1
+        && variant.family() == izwi_core::ModelFamily::MingTts
+        && SegmentVoiceAnchor::for_request(variant, base_request).collecting()
+    {
+        if let Some(end) = crate::api::tts_policy::ming_tts_anchor_lead_end(&chunks[0]) {
+            let rest = chunks[0][end..].trim().to_string();
+            chunks[0] = chunks[0][..end].trim().to_string();
+            if !rest.is_empty() {
+                chunks.insert(1, rest);
+            }
+        }
+    }
     let budget_for = |request: &mut GenerationRequest| {
         if variant.plans_own_speech_segments() || automatic {
             if let Some(frames) =
@@ -846,12 +889,30 @@ pub async fn generate_long_form_tts(
 
     let started = std::time::Instant::now();
     let split_request_count = planned_requests.len();
+    let voice = FirstSegmentVoice::for_segments(variant, &request, &planned_requests);
     let outputs = generate_segments(
         planned_requests,
         long_form_segment_concurrency(runtime, variant, &request).await,
         retry_runaways,
         &request.id,
-        |segment| runtime.generate(segment),
+        |mut segment| {
+            let voice = voice.clone();
+            async move {
+                let Some(voice) = voice else {
+                    return runtime.generate(segment).await;
+                };
+                voice.prepare(&mut segment).await;
+                if !voice.is_first(&segment) {
+                    return runtime.generate(segment).await;
+                }
+                let output = runtime.generate(segment).await;
+                if let Ok(output) = &output {
+                    voice.collect(&output.samples, output.sample_rate);
+                }
+                voice.finish_first(output.is_ok())?;
+                output
+            }
+        },
     )
     .await?;
     let mut constituent_diagnostics = Vec::with_capacity(split_request_count);
@@ -934,15 +995,39 @@ pub(crate) async fn generate_long_form_stream(
     }
     let runtime = runtime.clone();
     let lookahead = long_form_segment_concurrency(&runtime, variant, &request).await;
+    let voice = FirstSegmentVoice::for_segments(variant, &request, &segments);
     stream_segments(
         segments,
         &request.id,
         fallback_sample_rate,
         lookahead,
         output,
-        move |segment, sender| {
+        move |mut segment, sender| {
             let runtime = runtime.clone();
-            async move { runtime.generate_streaming(segment, sender).await }
+            let voice = voice.clone();
+            async move {
+                let Some(voice) = voice else {
+                    return runtime.generate_streaming(segment, sender).await;
+                };
+                voice.prepare(&mut segment).await;
+                if !voice.is_first(&segment) {
+                    return runtime.generate_streaming(segment, sender).await;
+                }
+                // The first segment's audio goes out as it comes, and into
+                // the anchor.
+                let (tee, mut chunks) = tokio::sync::mpsc::channel::<izwi_core::AudioChunk>(32);
+                let relay = async {
+                    while let Some(chunk) = chunks.recv().await {
+                        voice.collect(&chunk.samples, chunk.sample_rate_or(fallback_sample_rate));
+                        if sender.send(chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                let (result, ()) = tokio::join!(runtime.generate_streaming(segment, tee), relay);
+                voice.finish_first(result.is_ok())?;
+                result
+            }
         },
     )
     .await
@@ -1480,21 +1565,46 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
 
 /// One voice through a segment plan that was given none.
 ///
-/// A model that speaks without a reference (Audio8) picks its voice anew in
-/// each request, so a long text would change speaker at every segment. The
-/// first segment's audio and text become the reference of the rest: the
-/// model clones the voice it chose. A request that brings its own
-/// reference, or a model that needs one, keeps what it was given.
+/// A model that speaks without a reference picks its voice anew in each
+/// request, so a long text would change speaker at every segment: Audio8
+/// from its seed, Ming 3.0 TTS from a built-in voice's or a description's
+/// caption (each request samples a voice that fits it; on 灵语汐 the second
+/// segment of a three-segment text measured 0.45-0.62 speaker similarity to
+/// the first, about what two different voices give). The first segment's
+/// audio and text become the reference of the rest: the model clones the
+/// voice it chose, with the clip's latents in the prompt (0.85-0.89 to the
+/// first segment; the speaker embedding alone held it no better than
+/// before). A request that brings its own reference, or a model that needs
+/// one, keeps what it was given.
 ///
 /// The anchor is not journaled: a plan recovered after a restart anchors on
 /// the first segment it speaks then.
-enum SegmentVoiceAnchor {
+pub(crate) enum SegmentVoiceAnchor {
     /// The request has a voice, or the model does not pick one.
     Off,
     /// Collecting the current segment's audio, at its sample rate.
-    Collecting { samples: Vec<f32>, sample_rate: u32 },
+    Collecting {
+        samples: Vec<f32>,
+        sample_rate: u32,
+        limits: AnchorLimits,
+    },
     /// The reference later segments speak with.
-    Set { audio: String, text: String },
+    Set {
+        audio: String,
+        text: String,
+        /// Drop a voice description from the later segments (Ming takes a
+        /// reference or a description, never both).
+        clears_description: bool,
+    },
+}
+
+/// What a model's anchor must be: how long the segment may be, in seconds,
+/// and whether later segments drop a voice description.
+#[derive(Clone, Copy)]
+pub(crate) struct AnchorLimits {
+    min_secs: f32,
+    max_secs: f32,
+    clears_description: bool,
 }
 
 impl SegmentVoiceAnchor {
@@ -1502,32 +1612,61 @@ impl SegmentVoiceAnchor {
     /// applies. A longer first segment is not used, and the next one is.
     const MAX_SECS: u64 = izwi_core::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS;
 
-    fn for_request(variant: ModelVariant, base: &GenerationRequest) -> Self {
-        let anchors = variant.family() == izwi_core::ModelFamily::Audio8Tts
-            && base.reference_audio.is_none()
-            && base.speaker_references.is_empty();
-        if anchors {
+    pub(crate) fn for_request(variant: ModelVariant, base: &GenerationRequest) -> Self {
+        let limits = match variant.family() {
+            izwi_core::ModelFamily::Audio8Tts => AnchorLimits {
+                min_secs: 0.0,
+                max_secs: Self::MAX_SECS as f32,
+                clears_description: false,
+            },
+            // Ming takes a clip of 1 s or more with its transcript, and a
+            // reference or a description, not both. An anchor past about 8 s
+            // made it drop words at the ends of later segments (see
+            // `ming_tts_anchor_lead_end`): none is better than a long one.
+            izwi_core::ModelFamily::MingTts => AnchorLimits {
+                min_secs: 1.0,
+                max_secs: 8.0,
+                clears_description: true,
+            },
+            _ => return Self::Off,
+        };
+        if base.reference_audio.is_none() && base.speaker_references.is_empty() {
             Self::Collecting {
                 samples: Vec::new(),
                 sample_rate: 0,
+                limits,
             }
         } else {
             Self::Off
         }
     }
 
+    /// Whether a segment's audio is still wanted as the anchor.
+    pub(crate) fn collecting(&self) -> bool {
+        matches!(self, Self::Collecting { .. })
+    }
+
     /// Give `request` the anchored voice, once there is one.
-    fn apply(&self, request: &mut GenerationRequest) {
-        if let Self::Set { audio, text } = self {
+    pub(crate) fn apply(&self, request: &mut GenerationRequest) {
+        if let Self::Set {
+            audio,
+            text,
+            clears_description,
+        } = self
+        {
             request.reference_audio = Some(audio.clone());
             request.reference_text = Some(text.clone());
+            if *clears_description {
+                request.voice_description = None;
+            }
         }
     }
 
-    fn collect(&mut self, chunk: &[f32], rate: u32) {
+    pub(crate) fn collect(&mut self, chunk: &[f32], rate: u32) {
         if let Self::Collecting {
             samples,
             sample_rate,
+            ..
         } = self
         {
             *sample_rate = rate;
@@ -1536,28 +1675,31 @@ impl SegmentVoiceAnchor {
     }
 
     /// Drop what a failed segment published; it is spoken again.
-    fn discard_segment(&mut self) {
+    pub(crate) fn discard_segment(&mut self) {
         if let Self::Collecting { samples, .. } = self {
             samples.clear();
         }
     }
 
     /// The segment that just finished spoke `text`: keep it as the voice of
-    /// the segments after it.
-    fn finish_segment(&mut self, text: &str) -> Result<(), izwi_core::Error> {
+    /// the segments after it, if it is long enough and not too long (else
+    /// the next segment is tried).
+    pub(crate) fn finish_segment(&mut self, text: &str) -> Result<(), izwi_core::Error> {
         let Self::Collecting {
             samples,
             sample_rate,
+            limits,
         } = self
         else {
             return Ok(());
         };
         let text = text.trim();
-        let limit = (*sample_rate as u64).saturating_mul(Self::MAX_SECS);
+        let secs = samples.len() as f32 / (*sample_rate).max(1) as f32;
         if samples.is_empty()
             || *sample_rate == 0
             || text.is_empty()
-            || samples.len() as u64 > limit
+            || secs < limits.min_secs
+            || secs > limits.max_secs
         {
             samples.clear();
             return Ok(());
@@ -1565,11 +1707,86 @@ impl SegmentVoiceAnchor {
         use base64::Engine as _;
         let wav = izwi_core::audio::AudioEncoder::new(*sample_rate, 1)
             .encode(samples, izwi_core::audio::AudioFormat::Wav)?;
+        tracing::debug!(
+            seconds = secs,
+            "Later long-form segments speak with this segment's voice"
+        );
         *self = Self::Set {
             audio: base64::engine::general_purpose::STANDARD.encode(wav),
             text: text.to_string(),
+            clears_description: limits.clears_description,
         };
         Ok(())
+    }
+}
+
+/// [`SegmentVoiceAnchor`] for the shared long-form splitter, whose segments
+/// run side by side: the first segment speaks as the request asked while its
+/// audio is kept, and each later segment waits for it, then speaks with its
+/// voice. The later segments still run side by side with each other.
+#[derive(Clone)]
+struct FirstSegmentVoice {
+    first_id: String,
+    first_text: String,
+    anchor: Arc<std::sync::Mutex<SegmentVoiceAnchor>>,
+    /// Set once the first segment is done (or failed).
+    ready: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl FirstSegmentVoice {
+    /// The anchor of `segments` (the plan of `base`), when the model picks
+    /// its own voice, the request names none, and there is a later segment.
+    fn for_segments(
+        variant: ModelVariant,
+        base: &GenerationRequest,
+        segments: &[GenerationRequest],
+    ) -> Option<Self> {
+        let anchor = SegmentVoiceAnchor::for_request(variant, base);
+        let first = segments.first()?;
+        (segments.len() > 1 && anchor.collecting()).then(|| Self {
+            first_id: first.id.clone(),
+            first_text: first.text.clone(),
+            anchor: Arc::new(std::sync::Mutex::new(anchor)),
+            ready: Arc::new(tokio::sync::watch::channel(false).0),
+        })
+    }
+
+    fn is_first(&self, request: &GenerationRequest) -> bool {
+        request.id == self.first_id
+    }
+
+    fn anchor(&self) -> std::sync::MutexGuard<'_, SegmentVoiceAnchor> {
+        self.anchor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A later segment waits for the first, then takes its voice.
+    async fn prepare(&self, request: &mut GenerationRequest) {
+        if self.is_first(request) {
+            return;
+        }
+        let mut ready = self.ready.subscribe();
+        // The first segment's end always sets it; were the sender gone, the
+        // segment speaks as the request asked.
+        let _ = ready.wait_for(|done| *done).await;
+        self.anchor().apply(request);
+    }
+
+    fn collect(&self, samples: &[f32], sample_rate: u32) {
+        self.anchor().collect(samples, sample_rate);
+    }
+
+    /// The first segment is done (`spoken`) or failed: the later segments
+    /// may start, with its voice when it makes an anchor.
+    fn finish_first(&self, spoken: bool) -> Result<(), izwi_core::Error> {
+        let result = if spoken {
+            self.anchor().finish_segment(&self.first_text)
+        } else {
+            Ok(())
+        };
+        self.ready.send_replace(true);
+        result
     }
 }
 
@@ -1603,6 +1820,137 @@ mod tests {
     /// With no reference, Audio8's first segment becomes the voice of the
     /// rest; a request with its own voice, another model, a failed segment
     /// and a segment too long to be a reference leave the request as it was.
+    /// A Ming plan (the durable route's) cuts as the shared splitter does:
+    /// whole sentences of at most 160 weighted characters, so no segment
+    /// outruns the 512-position context beside the first segment's voice.
+    #[test]
+    fn ming_plans_segments_that_fit_beside_the_anchor() {
+        let ming = ModelVariant::Ming30Tts05B;
+        let script = "anthropic has about 5,300 employees\n\nafter today's ipo, roughly 2,800 \
+            of them are worth over $10m. about 600 are worth over $100m\n\npeople keep calling \
+            it insane. honestly it inspires the hell out of me\n\nwhat makes me happiest is \
+            watching my team put their heart into their work and get paid well for it";
+        let plan = SpeechTextPlan::for_variant(ming, script, 0).unwrap();
+        assert!(plan.segments.len() >= 3, "{:?}", plan.segments);
+        // The first segment is a short lead, the anchor of the rest.
+        assert_eq!(
+            script[plan.segments[0].clone()].trim(),
+            "anthropic has about 5,300 employees"
+        );
+        // The shared splitter cuts the same lead, for a request with no
+        // reference only.
+        let base = GenerationRequest::new(script).with_model_variant(ming);
+        let chunks = expand_generation_requests_for_long_form(&base, ming);
+        assert_eq!(chunks[0].text, "anthropic has about 5,300 employees");
+        assert!(
+            chunks[1].text.starts_with("after today's ipo"),
+            "{:?}",
+            chunks[1].text
+        );
+        let mut cloned = base.clone();
+        cloned.reference_audio = Some("AAAA".into());
+        let chunks = expand_generation_requests_for_long_form(&cloned, ming);
+        assert!(chunks[0].text.len() > 40, "{:?}", chunks[0].text);
+        for range in &plan.segments {
+            let segment = &script[range.clone()];
+            assert!(
+                crate::api::tts_policy::ming_tts_weighted_chars(segment)
+                    <= crate::api::tts_policy::MING_TTS_SEGMENT_MAX_CHARS + 16,
+                "{segment:?}"
+            );
+        }
+        let chinese = "傍晚的风从山口吹过来，远处的云慢慢染成了金色。".repeat(6);
+        let plan = SpeechTextPlan::for_variant(ming, &chinese, 0).unwrap();
+        assert!(plan.segments.len() > 1);
+    }
+
+    /// Ming 3.0 TTS picks a voice anew for each request too (from a
+    /// built-in voice's or a description's caption): later segments clone
+    /// the first one's, with its transcript, and drop a description (Ming
+    /// takes a reference or a description, not both).
+    #[test]
+    fn ming_anchors_later_segments_on_the_first_ones_voice() {
+        let ming = ModelVariant::Ming30Tts05B;
+        let mut base = GenerationRequest::new("One. Two.").with_model_variant(ming);
+        base.voice_description = Some("A calm narrator.".into());
+        let mut anchor = SegmentVoiceAnchor::for_request(ming, &base);
+        assert!(anchor.collecting());
+
+        // Under a second is no reference for Ming: the next segment is tried.
+        anchor.collect(&[0.25; 22_050], 44_100);
+        anchor.finish_segment("Hi.").unwrap();
+        assert!(anchor.collecting());
+        // Past 8 s neither.
+        anchor.collect(&vec![0.25; 9 * 8_000], 8_000);
+        anchor.finish_segment("Too long.").unwrap();
+        assert!(anchor.collecting());
+
+        anchor.collect(&[0.25; 66_150], 44_100);
+        anchor.finish_segment(" One. ").unwrap();
+        let mut second = base.clone();
+        anchor.apply(&mut second);
+        assert!(second.reference_audio.is_some());
+        assert_eq!(second.reference_text.as_deref(), Some("One."));
+        assert_eq!(second.voice_description, None);
+
+        let mut voiced = base.clone();
+        voiced.reference_audio = Some("AAAA".into());
+        assert!(matches!(
+            SegmentVoiceAnchor::for_request(ming, &voiced),
+            SegmentVoiceAnchor::Off
+        ));
+    }
+
+    /// The shared splitter runs Ming's segments side by side: a later one
+    /// waits for the first, then speaks with its voice.
+    #[tokio::test]
+    async fn later_shared_segments_wait_for_the_first_ones_voice() {
+        let ming = ModelVariant::Ming30Tts05B;
+        let base = GenerationRequest::new("One. Two.").with_model_variant(ming);
+        let mut first = base.clone();
+        first.id = "take:0".into();
+        first.text = "One.".into();
+        let mut second = base.clone();
+        second.id = "take:1".into();
+        second.text = "Two.".into();
+        let voice =
+            FirstSegmentVoice::for_segments(ming, &base, &[first.clone(), second.clone()]).unwrap();
+        assert!(voice.is_first(&first) && !voice.is_first(&second));
+        assert!(
+            FirstSegmentVoice::for_segments(ming, &base, std::slice::from_ref(&first)).is_none()
+        );
+
+        let waiting = {
+            let voice = voice.clone();
+            tokio::spawn(async move {
+                voice.prepare(&mut second).await;
+                second
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "a later segment waits for the first"
+        );
+        let mut unchanged = first.clone();
+        voice.prepare(&mut unchanged).await;
+        assert!(unchanged.reference_audio.is_none());
+        voice.collect(&[0.25; 66_150], 44_100);
+        voice.finish_first(true).unwrap();
+        let second = waiting.await.unwrap();
+        assert_eq!(second.reference_text.as_deref(), Some("One."));
+        assert!(second.reference_audio.is_some());
+
+        // A first segment that fails releases the others as they were.
+        let voice =
+            FirstSegmentVoice::for_segments(ming, &base, &[first.clone(), base.clone()]).unwrap();
+        voice.finish_first(false).unwrap();
+        let mut later = base.clone();
+        later.id = "take:1".into();
+        voice.prepare(&mut later).await;
+        assert!(later.reference_audio.is_none());
+    }
+
     #[test]
     fn audio8_anchors_later_segments_on_the_first_ones_voice() {
         use base64::Engine as _;

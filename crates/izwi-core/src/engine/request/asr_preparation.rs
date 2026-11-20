@@ -45,6 +45,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -112,6 +114,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -248,6 +252,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -358,6 +364,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -1229,6 +1237,8 @@ impl EngineCoreRequest {
             chatterbox_tts_params: None,
             maya1_tts: None,
             maya1_tts_params: None,
+            ming_tts: None,
+            ming_tts_params: None,
             maya2_tts: None,
             maya2_tts_params: None,
             lfm3_audio: None,
@@ -1360,6 +1370,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
+                | PreparedIncrementalModel::MingTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
@@ -1384,6 +1395,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
+                | PreparedIncrementalModel::MingTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)
@@ -1424,6 +1436,7 @@ impl EngineCoreRequest {
                 | PreparedIncrementalModel::FishDrama3Tts(_)
                 | PreparedIncrementalModel::VoxtralTts(_)
                 | PreparedIncrementalModel::ChatterboxTts(_)
+                | PreparedIncrementalModel::MingTts(_)
                 | PreparedIncrementalModel::Maya1Tts(_)
                 | PreparedIncrementalModel::Maya2Tts(_)
                 | PreparedIncrementalModel::Lfm3Audio(_)

@@ -678,13 +678,16 @@ fn ensure_speech_audio(
 /// Speak numbers, currency, dates, times and units as words when the
 /// request asks for it, or leaves it unset for a family that normalizes by
 /// default (`batch.tts.normalize_text`, TPIPE-26). English text only, except
-/// Maya 2 Native, whose own normaliser covers its 12 languages.
+/// Maya 2 Native, whose own normaliser covers its 12 languages. Ming 3.0
+/// TTS's voices are named, not tagged by language (`UK_George`, `灵语汐`), so
+/// its text is English when the language says so or, without one, when it
+/// holds no CJK character; its reference transcript follows the same rule.
 fn normalize_speech_text(
     mut request: GenerationRequest,
     variant: ModelVariant,
 ) -> GenerationRequest {
     use crate::models::shared::text_normalize::{
-        family_normalizes_by_default, is_english, normalize_english,
+        family_normalizes_by_default, has_cjk, is_english, normalize_english,
     };
     let enabled = request
         .config
@@ -697,6 +700,28 @@ fn normalize_speech_text(
         // An unknown language is refused at preparation with its own error.
         if let Ok(language) = resolve_language(request.language.as_deref(), &request.text) {
             request.text = normalise_text(&request.text, language);
+        }
+        return request;
+    }
+    if enabled && variant.family() == crate::catalog::ModelFamily::MingTts {
+        let english = |text: &str| match request
+            .language
+            .as_deref()
+            .map(str::trim)
+            .filter(|language| !language.is_empty() && !language.eq_ignore_ascii_case("auto"))
+        {
+            Some(language) => {
+                crate::catalog::ming_tts_language(language).is_some_and(|l| l.code == "en")
+            }
+            None => !has_cjk(text),
+        };
+        if english(&request.text) {
+            request.text = normalize_english(&request.text);
+        }
+        if let Some(reference) = request.reference_text.as_deref() {
+            if english(reference) {
+                request.reference_text = Some(normalize_english(reference));
+            }
         }
         return request;
     }
@@ -1083,6 +1108,58 @@ mod tests {
         assert_eq!(result.rtf(), 0.0);
     }
 
+    /// Ming 3.0 TTS speaks English numbers as words by default, whatever
+    /// its voice is called: English text with a Chinese voice is
+    /// normalized, Chinese text or a non-English language is left to the
+    /// model, the reference transcript follows the text's rule, and a
+    /// request can turn it off.
+    #[test]
+    fn ming_normalizes_english_text_whatever_its_voice() {
+        let ming = ModelVariant::Ming30Tts05B;
+        let request = |text: &str, language: Option<&str>, normalize: Option<bool>| {
+            let mut request = GenerationRequest::new(text);
+            request.config.options.speaker = Some("灵语汐".into());
+            request.language = language.map(str::to_string);
+            request.config.options.speech.normalize_text = normalize;
+            request
+        };
+        let english = "about 600 are worth over $100m";
+        let spoken = "about six hundred are worth over one hundred million dollars";
+        assert_eq!(
+            normalize_speech_text(request(english, None, None), ming).text,
+            spoken
+        );
+        assert_eq!(
+            normalize_speech_text(request(english, Some("en"), None), ming).text,
+            spoken
+        );
+        assert_eq!(
+            normalize_speech_text(request(english, Some("auto"), None), ming).text,
+            spoken
+        );
+        assert_eq!(
+            normalize_speech_text(request(english, Some("de"), None), ming).text,
+            english
+        );
+        assert_eq!(
+            normalize_speech_text(request(english, None, Some(false)), ming).text,
+            english
+        );
+        let chinese = "我们花了$100m。";
+        assert_eq!(
+            normalize_speech_text(request(chinese, None, None), ming).text,
+            chinese
+        );
+        let mut cloned = request(english, None, None);
+        cloned.reference_text = Some("It cost $10m.".into());
+        assert_eq!(
+            normalize_speech_text(cloned, ming)
+                .reference_text
+                .as_deref(),
+            Some("It cost ten million dollars.")
+        );
+    }
+
     /// Kokoro speaks "$1,250.75" and "March 3rd" as words by default; a
     /// family that reads them itself is left alone unless the request asks,
     /// and a request can turn Kokoro's off.
@@ -1193,7 +1270,7 @@ mod tests {
         use crate::runtime::adapters::RuntimeAdapterRegistry;
         // Families whose engine executors stream committed audio and publish
         // the final marker.
-        const ENGINE_STREAM_EMITTERS: [ModelFamily; 10] = [
+        const ENGINE_STREAM_EMITTERS: [ModelFamily; 11] = [
             ModelFamily::Qwen3Tts,
             ModelFamily::FishS2Tts,
             ModelFamily::Audio8Tts,
@@ -1203,6 +1280,7 @@ mod tests {
             ModelFamily::VibeVoiceTts,
             ModelFamily::ChatterboxTts,
             ModelFamily::Maya1Tts,
+            ModelFamily::MingTts,
             ModelFamily::Maya2Tts,
         ];
         let registry = RuntimeAdapterRegistry::built_in();

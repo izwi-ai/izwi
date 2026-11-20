@@ -83,6 +83,7 @@ def family_cases(family, reference):
     ryan = {"voice": "ryan", "language": "English"}
     greedy = dict(ryan, temperature=0.0, top_k=1)
     seeded = {"seed": 7}
+    ming = {"voice": "US_Emma"}
     table = {
         "kokoro": [
             ("short", "short", {"voice": "af_heart"}, False),
@@ -142,6 +143,21 @@ def family_cases(family, reference):
             ("med_stream", "med", seeded, True),
             ("num", "num", seeded, False),
             ("long", "long", seeded, False),
+        ],
+        # Ming 3.0 TTS: a built-in voice, a clone with and without its
+        # transcript, a described voice, an emotion on a clone, streaming,
+        # numbers, and "long" as a segment plan.
+        "ming": [
+            ("short", "short", ming, False),
+            ("clone", "short", clone, False),
+            ("clone_audio_only", "short", {"reference_audio": reference[0]}, False),
+            ("design", "short",
+             {"instructions": "A calm adult female narrator with a warm, clear voice."}, False),
+            ("emotion", "short", dict(clone, emotion="happy"), False),
+            ("med", "med", ming, False),
+            ("med_stream", "med", ming, True),
+            ("num", "num", ming, False),
+            ("long", "long", ming, False),
         ],
         # Fish Audio Drama 3: a voice its seed sets, a cloned one, chunked
         # streaming, tags, a referenced speaker beside a seeded one, and

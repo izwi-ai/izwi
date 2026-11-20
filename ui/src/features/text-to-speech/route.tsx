@@ -17,6 +17,7 @@ import { NewTextToSpeechModal } from "@/features/text-to-speech/components/NewTe
 import { TextToSpeechRecordDetail } from "@/features/text-to-speech/components/TextToSpeechRecordDetail";
 import { useTextToSpeechHistory } from "@/features/text-to-speech/hooks/useTextToSpeechHistory";
 import { useSpeechStreamPlayback } from "@/features/text-to-speech/hooks/useSpeechStreamPlayback";
+import { SpeechLivePanel } from "@/features/text-to-speech/components/SpeechLivePanel";
 import { useTextToSpeechRecord } from "@/features/text-to-speech/hooks/useTextToSpeechRecord";
 import { useNewItemShortcut } from "@/hooks/useNewItemShortcut";
 import {
@@ -499,26 +500,34 @@ export function TextToSpeechPage({
     [playback, refreshHistory, streamingRecord?.id],
   );
 
+  // Streaming playback in this tab, or a take still rendering that can be
+  // listened to from its start: one panel below the page header.
+  const livePanel =
+    playback.status !== "idle" ? (
+      <SpeechLivePanel
+        state={playback.status}
+        progress={playback.progress}
+        onStop={() => playback.stop()}
+      />
+    ) : visibleRecord &&
+      visibleRecordReplaysInProgress &&
+      (visibleRecord.processing_status === "pending" ||
+        visibleRecord.processing_status === "processing") ? (
+      <SpeechLivePanel
+        state="available"
+        onListen={() => {
+          void playback.listen(visibleRecord).catch(() => {});
+        }}
+      />
+    ) : null;
+
   return (
     <PageShell>
-      {playback.status !== "idle" && (
-        <div role="status" className="flex items-center justify-between gap-3 rounded-md border p-3">
-          <span>{playback.status === "playing" ? "Playing generated speech" : "Waiting for first audio"}</span>
-          {playback.progress && <span role="status">{playback.progress.completedSegments} of {playback.progress.totalSegments} sections generated</span>}
-          <Button variant="outline" size="sm" onClick={() => playback.stop()}>Stop generation and playback</Button>
-        </div>
-      )}
-      {playback.error && <p role="alert" className="text-sm text-destructive">{playback.error}</p>}
-      {playback.status === "idle" && visibleRecord && visibleRecordReplaysInProgress &&
-        (visibleRecord.processing_status === "pending" || visibleRecord.processing_status === "processing") && (
-        <Button variant="outline" onClick={() => { void playback.listen(visibleRecord).catch(() => {}); }}>
-          Listen from beginning
-        </Button>
-      )}
       {recordId ? (
         <>
           <TextToSpeechRecordDetail
             parentCrumb={{ label: "Text to Speech", to: "/text-to-speech" }}
+            live={livePanel}
             extraMenuItems={[
               {
                 id: "models",
@@ -534,7 +543,7 @@ export function TextToSpeechPage({
             error={recordError}
             deleteError={recordActionError}
             deletePending={recordDeletePending}
-            actionError={recordCancelError}
+            actionError={recordCancelError ?? playback.error}
             cancelPending={recordCancelPending}
             onCancel={() => void handleDetailCancel()}
             onDelete={() => void handleDetailDelete()}
@@ -580,6 +589,20 @@ export function TextToSpeechPage({
               </>
             }
           />
+
+          {livePanel || playback.error ? (
+            <div className="mb-5 space-y-3">
+              {livePanel}
+              {playback.error ? (
+                <p
+                  role="alert"
+                  className="rounded-[14px] border border-(--danger-border) bg-(--danger-bg) p-4 text-sm text-(--danger-text)"
+                >
+                  {playback.error}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
 
           <HistoryToolbar>
             <SearchField

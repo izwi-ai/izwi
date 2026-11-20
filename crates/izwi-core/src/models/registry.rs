@@ -86,6 +86,7 @@ use crate::models::architectures::lfm25_audio::{
 use crate::models::architectures::lfm3_audio::model::{InvocationLmState, Lfm3AudioModel};
 use crate::models::architectures::lfm3_audio::physical::{lfm3_audio_kv_dtype, Lfm3AudioWorkload};
 use crate::models::architectures::maya1::Maya1TtsModel;
+use crate::models::architectures::ming_tts::MingTtsModel;
 use crate::models::architectures::maya2::Maya2TtsModel;
 use crate::models::architectures::nemotron::asr::{
     NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput,
@@ -185,6 +186,7 @@ type VoxtralLoaderFn = fn(
 type VoxtralTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralTtsModel>;
 type ChatterboxTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<ChatterboxTtsModel>;
 type Maya1TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Maya1TtsModel>;
+type MingTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<MingTtsModel>;
 type Maya2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<Maya2TtsModel>;
 type VibeVoiceTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VibeVoiceTtsModel>;
 type FishS2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishS2TtsModel>;
@@ -244,6 +246,12 @@ struct Maya1TtsLoaderRegistration {
     name: &'static str,
     family: ModelFamily,
     loader: Maya1TtsLoaderFn,
+}
+
+struct MingTtsLoaderRegistration {
+    name: &'static str,
+    family: ModelFamily,
+    loader: MingTtsLoaderFn,
 }
 
 struct Maya2TtsLoaderRegistration {
@@ -595,6 +603,14 @@ fn load_maya1_tts_model(
     Maya1TtsModel::load(model_dir, variant, device)
 }
 
+fn load_ming_tts_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+) -> Result<MingTtsModel> {
+    MingTtsModel::load(model_dir, variant, device)
+}
+
 fn load_maya2_tts_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -869,6 +885,12 @@ const MAYA1_TTS_LOADER_REGISTRY: &[Maya1TtsLoaderRegistration] = &[Maya1TtsLoade
     loader: load_maya1_tts_model,
 }];
 
+const MING_TTS_LOADER_REGISTRY: &[MingTtsLoaderRegistration] = &[MingTtsLoaderRegistration {
+    name: "ming_tts",
+    family: ModelFamily::MingTts,
+    loader: load_ming_tts_model,
+}];
+
 const MAYA2_TTS_LOADER_REGISTRY: &[Maya2TtsLoaderRegistration] = &[Maya2TtsLoaderRegistration {
     name: "maya2_tts",
     family: ModelFamily::Maya2Tts,
@@ -1032,6 +1054,15 @@ fn resolve_maya1_tts_loader_registration(
 ) -> Option<&'static Maya1TtsLoaderRegistration> {
     let family = variant.family();
     MAYA1_TTS_LOADER_REGISTRY
+        .iter()
+        .find(|registration| registration.family == family)
+}
+
+fn resolve_ming_tts_loader_registration(
+    variant: ModelVariant,
+) -> Option<&'static MingTtsLoaderRegistration> {
+    let family = variant.family();
+    MING_TTS_LOADER_REGISTRY
         .iter()
         .find(|registration| registration.family == family)
 }
@@ -6037,14 +6068,35 @@ pub struct Maya1TtsModelLease {
     inner: TrackedModelLease<Maya1TtsModel>,
 }
 
+/// A loaded Ming TTS handle that fences unload for the exact model
+/// instance retained by an admitted incremental request.
+#[derive(Clone)]
+pub struct MingTtsModelLease {
+    inner: TrackedModelLease<MingTtsModel>,
+}
+
 impl Maya1TtsModelLease {
     pub(crate) fn model_arc(&self) -> Arc<Maya1TtsModel> {
         self.inner.model.clone()
     }
 }
 
+impl MingTtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<MingTtsModel> {
+        self.inner.model.clone()
+    }
+}
+
 impl Deref for Maya1TtsModelLease {
     type Target = Maya1TtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Deref for MingTtsModelLease {
+    type Target = MingTtsModel;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -7916,6 +7968,7 @@ pub struct ModelRegistry {
     chatterbox_tts_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<ChatterboxTtsModel>>>>>,
     maya1_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Maya1TtsModel>>>>>,
+    ming_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<MingTtsModel>>>>>,
     maya2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Maya2TtsModel>>>>>,
     vibevoice_tts_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<VibeVoiceTtsModel>>>>>,
@@ -8124,6 +8177,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::VoxtralTts => "voxtral_tts",
         ModelFamily::ChatterboxTts => "chatterbox_tts",
         ModelFamily::Maya1Tts => "maya1_tts",
+        ModelFamily::MingTts => "ming_tts",
         ModelFamily::Maya2Tts => "maya2_tts",
         ModelFamily::VibeVoiceTts => "vibevoice_tts",
         ModelFamily::FishS2Tts => "fish_s2_tts",
@@ -8268,6 +8322,7 @@ impl ModelRegistry {
             voxtral_tts_models: Arc::new(RwLock::new(HashMap::new())),
             chatterbox_tts_models: Arc::new(RwLock::new(HashMap::new())),
             maya1_tts_models: Arc::new(RwLock::new(HashMap::new())),
+            ming_tts_models: Arc::new(RwLock::new(HashMap::new())),
             maya2_tts_models: Arc::new(RwLock::new(HashMap::new())),
             vibevoice_tts_models: Arc::new(RwLock::new(HashMap::new())),
             fish_s2_tts_models: Arc::new(RwLock::new(HashMap::new())),
@@ -8619,6 +8674,24 @@ impl ModelRegistry {
                         *variant,
                         "maya1_tts",
                         "maya1_tts",
+                        LoadedModelActualRuntime::default(),
+                        None,
+                        None,
+                        serde_json::to_value(model.diagnostics()).ok(),
+                    ));
+                }
+            }
+        }
+
+        {
+            let guard = self.ming_tts_models.read().await;
+            for (variant, entry) in guard.iter() {
+                if let Some(model) = entry.ready_model() {
+                    diagnostics.push(loaded_model_diagnostics_entry(
+                        &self.device,
+                        *variant,
+                        "ming_tts",
+                        "ming_tts",
                         LoadedModelActualRuntime::default(),
                         None,
                         None,
@@ -9369,6 +9442,64 @@ impl ModelRegistry {
         })
     }
 
+    pub async fn load_ming_tts(
+        &self,
+        variant: ModelVariant,
+        model_dir: &Path,
+    ) -> Result<Arc<MingTtsModel>> {
+        let registration = resolve_ming_tts_loader_registration(variant).ok_or_else(|| {
+            Error::InvalidInput(format!("Unsupported Ming TTS model variant: {variant}"))
+        })?;
+
+        let (entry, loading_guard) = {
+            let mut guard = self.ming_tts_models.write().await;
+            let entry = guard
+                .entry(variant)
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Ming TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
+        };
+
+        info!(
+            "Loading Ming TTS model {variant} ({}) from {model_dir:?}",
+            registration.name
+        );
+
+        entry
+            .model
+            .get_or_try_init({
+                let model_dir = model_dir.to_path_buf();
+                let device = self.device.clone();
+                let loader = registration.loader;
+                move || async move {
+                    DeviceThread::for_device(&device.device)?
+                        .submit(move || loader(&model_dir, variant, device))
+                        .await
+                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                        .map(Arc::new)
+                }
+            })
+            .await?;
+        let model = {
+            let guard = self.ming_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Ming TTS model {variant} load was superseded before publication"
+            ))
+        })
+    }
+
     pub async fn load_maya2_tts(
         &self,
         variant: ModelVariant,
@@ -10027,8 +10158,18 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
+    pub async fn get_ming_tts(&self, variant: ModelVariant) -> Option<Arc<MingTtsModel>> {
+        let guard = self.ming_tts_models.read().await;
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
     pub fn try_get_maya1_tts(&self, variant: ModelVariant) -> Option<Arc<Maya1TtsModel>> {
         let guard = self.maya1_tts_models.try_read().ok()?;
+        guard.get(&variant).and_then(|entry| entry.ready_model())
+    }
+
+    pub fn try_get_ming_tts(&self, variant: ModelVariant) -> Option<Arc<MingTtsModel>> {
+        let guard = self.ming_tts_models.try_read().ok()?;
         guard.get(&variant).and_then(|entry| entry.ready_model())
     }
 
@@ -10040,12 +10181,28 @@ impl ModelRegistry {
             .map(|inner| Maya1TtsModelLease { inner })
     }
 
+    pub async fn get_ming_tts_lease(&self, variant: ModelVariant) -> Option<MingTtsModelLease> {
+        let guard = self.ming_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| MingTtsModelLease { inner })
+    }
+
     pub fn try_get_maya1_tts_lease(&self, variant: ModelVariant) -> Option<Maya1TtsModelLease> {
         let guard = self.maya1_tts_models.try_read().ok()?;
         guard
             .get(&variant)
             .and_then(|entry| entry.acquire_ready())
             .map(|inner| Maya1TtsModelLease { inner })
+    }
+
+    pub fn try_get_ming_tts_lease(&self, variant: ModelVariant) -> Option<MingTtsModelLease> {
+        let guard = self.ming_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire_ready())
+            .map(|inner| MingTtsModelLease { inner })
     }
 
     pub(crate) async fn get_loading_maya1_tts(
@@ -10058,11 +10215,31 @@ impl ModelRegistry {
             .and_then(|entry| entry.model.get().cloned())
     }
 
+    pub(crate) async fn get_loading_ming_tts(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<MingTtsModel>> {
+        let guard = self.ming_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
     pub(crate) async fn publish_maya1_tts_ready(&self, variant: ModelVariant) -> Result<()> {
         let guard = self.maya1_tts_models.read().await;
         let entry = guard.get(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(
                 "cannot publish missing Maya1 TTS model {variant} as ready"
+            ))
+        })?;
+        entry.publish_ready()
+    }
+
+    pub(crate) async fn publish_ming_tts_ready(&self, variant: ModelVariant) -> Result<()> {
+        let guard = self.ming_tts_models.read().await;
+        let entry = guard.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "cannot publish missing Ming TTS model {variant} as ready"
             ))
         })?;
         entry.publish_ready()
@@ -10496,6 +10673,21 @@ impl ModelRegistry {
     pub async fn unload_maya1_tts(&self, variant: ModelVariant) {
         let entry = {
             let mut guard = self.maya1_tts_models.write().await;
+            let entry = guard.remove(&variant);
+            if let Some(entry) = &entry {
+                entry.reset_ready();
+            }
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
+        }
+    }
+
+    pub async fn unload_ming_tts(&self, variant: ModelVariant) {
+        let entry = {
+            let mut guard = self.ming_tts_models.write().await;
             let entry = guard.remove(&variant);
             if let Some(entry) = &entry {
                 entry.reset_ready();

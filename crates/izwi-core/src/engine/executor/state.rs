@@ -10,6 +10,7 @@ use crate::models::architectures::lfm25_audio::asr_retained::Lfm25AudioAsrRetain
 use crate::models::architectures::lfm25_audio::tts_retained::Lfm25AudioTtsRetainedState;
 use crate::models::architectures::maya1::retained::Maya1RetainedState;
 use crate::models::architectures::maya2::retained::Maya2RetainedState;
+use crate::models::architectures::ming_tts::retained::MingRetainedState;
 use crate::models::architectures::nemotron::asr::{
     NemotronPreparedEncoderArtifact, NemotronRetainedDecodeState,
 };
@@ -27,8 +28,9 @@ use crate::models::architectures::voxtral::tts::retained::VoxtralTtsRetainedStat
 use crate::models::registry::{
     AsrModelLease, Audio8TtsModelLease, ChatterboxTtsModelLease, FishDrama3TtsModelLease,
     FishS2TtsModelLease, Lfm25AudioModelLease, Maya1TtsModelLease, Maya2TtsModelLease,
-    NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, NativeChatReplayCheckpoint,
-    QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease, VoxtralTtsModelLease,
+    MingTtsModelLease, NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState,
+    NativeChatReplayCheckpoint, QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease,
+    VoxtralTtsModelLease,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
@@ -284,6 +286,16 @@ pub(super) struct ActiveMaya1TtsDecode {
     pub(super) variant: ModelVariant,
     pub(super) model: Maya1TtsModelLease,
     pub(super) state: Maya1RetainedState,
+    /// A streamed request's next chunk sequence.
+    pub(super) stream_sequence: usize,
+    /// A final-only request's settled samples, handed over at finalize.
+    pub(super) rendered: Vec<f32>,
+}
+
+pub(super) struct ActiveMingTtsDecode {
+    pub(super) variant: ModelVariant,
+    pub(super) model: MingTtsModelLease,
+    pub(super) state: MingRetainedState,
     /// A streamed request's next chunk sequence.
     pub(super) stream_sequence: usize,
     /// A final-only request's settled samples, handed over at finalize.

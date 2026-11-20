@@ -51,6 +51,11 @@ use crate::models::architectures::maya2::{
     maya2_backbone_precision, maya2_depth_dtype, maya2_depth_graph_device_bytes,
     maya2_mimi_bf16_device_bytes, maya2_reloads_in_f32,
 };
+use crate::models::architectures::ming_tts::{
+    ming_tts_flow_graph_device_bytes,     ming_lm_precision, ming_reloads_in_f32, unused_tensors as ming_unused_tensors, MingPrecision,
+    MingTtsConfig,
+    WEIGHTS_FILE as MING_TTS_WEIGHTS_FILE,
+};
 use crate::models::architectures::qwen3::core::qwen3_dense_projection_fusion_enabled;
 use crate::models::architectures::qwen3::tts::speech_tokenizer::{
     encoder_reads_tensor, read_encoder_acoustic_codebooks,
@@ -76,6 +81,7 @@ pub(super) fn has_plan(variant: ModelVariant) -> bool {
             | ModelFamily::VoxtralTts
             | ModelFamily::ChatterboxTts
             | ModelFamily::Maya1Tts
+            | ModelFamily::MingTts
             | ModelFamily::Maya2Tts
     )
 }
@@ -116,6 +122,7 @@ pub(super) fn residency_plan(
         ModelFamily::ChatterboxTts => chatterbox_tts_plan(variant, model_path, device, backend),
         ModelFamily::Maya1Tts if variant.is_maya1_gguf() => maya1_gguf_plan(model_path, backend),
         ModelFamily::Maya1Tts => maya1_tts_plan(model_path, device, backend),
+        ModelFamily::MingTts => ming_tts_plan(model_path, device, backend),
         ModelFamily::Maya2Tts => maya2_tts_plan(model_path, device, backend),
         _ => Ok(None),
     }
@@ -529,6 +536,76 @@ fn price_maya1_tts(
         for tensor in &file.tensors {
             if tensor.name.starts_with("snac.") {
                 ledger.var(tensor, Source::Copied, &[DType::F32])?;
+            } else {
+                ledger.var(tensor, Source::Mapped, &[dtype])?;
+            }
+        }
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+fn ming_tts_plan(
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let Some(files) = census_of(&[model_path.join(MING_TTS_WEIGHTS_FILE)])? else {
+        return Ok(None);
+    };
+    let unused = ming_unused_tensors(&MingTtsConfig::load(model_path)?)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    let dtype = ming_lm_precision(device).dtype;
+    // The flow path's CUDA graphs allocate at the load's self-check.
+    let graphs = ming_tts_flow_graph_device_bytes(backend);
+    let plan = price_ming_tts(
+        &files,
+        backend,
+        dtype,
+        MingPrecision::flow_dtype_for(dtype),
+        &unused,
+    )?
+    .with_deferred_device_bytes(graphs);
+    if ming_reloads_in_f32(device, dtype) {
+        // A model that fails its load-time probe reloads in F32.
+        let dense = price_ming_tts(&files, backend, DType::F32, DType::F32, &unused)?;
+        return Ok(Some(plan.with_fallback_peak(&dense)));
+    }
+    Ok(Some(plan))
+}
+
+/// Ming-3.0-tts (`ming_tts/model.rs`), read through the staged loader: the
+/// language model at `dtype` (its down projections in F32 under F16), the
+/// aggregator and flow head at `flow_dtype`, the VAE at F32, the
+/// two small heads on the host. The tensors inference never reads (the VAE
+/// stacks' one-row token tables, an unused layer norm, the stored window
+/// and the rotary buffers) are not loaded. CAM++ (28 MB) lives on the host.
+fn price_ming_tts(
+    files: &[CensusFile],
+    backend: BackendKind,
+    dtype: DType,
+    flow_dtype: DType,
+    unused: &[String],
+) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::staged(backend);
+    for file in files {
+        for tensor in &file.tensors {
+            let name = tensor.name.as_str();
+            if unused.iter().any(|skipped| skipped == name)
+                || name.ends_with("rotary_embed.inv_freq")
+                || name.starts_with("stop_head.")
+                || name.starts_with("spk_head.")
+            {
+                continue;
+            }
+            if name.starts_with("audio.") {
+                ledger.var(tensor, Source::Mapped, &[DType::F32])?;
+            } else if name.starts_with("linear_proj_audio.") || name.starts_with("flowloss.") {
+                ledger.var(tensor, Source::Mapped, &[flow_dtype])?;
+            } else if dtype == DType::F16 && name.ends_with(".mlp.down_proj.weight") {
+                // Kept in F32 under F16 weights (`ming_tts/stack.rs`).
+                ledger.var(tensor, Source::Mapped, &[DType::F32])?;
             } else {
                 ledger.var(tensor, Source::Mapped, &[dtype])?;
             }
@@ -1091,6 +1168,56 @@ mod tests {
             }] })
             .to_string(),
         )
+    }
+
+    /// Ming-3.0-tts priced from its published tensors: the language model
+    /// (494.0M parameters) and the aggregator and flow head (204.9M) at the
+    /// backend's dtype, the language model's down projections (104.6M) in
+    /// F32 under F16, the VAE (780.4M) in F32, with the tensors inference
+    /// skips left out: 5.51 GiB on the CPU, 4.40 GiB on Metal, 4.21 GiB on
+    /// CUDA.
+    #[test]
+    fn ming_tts_plan_prices_the_language_model_at_its_dtype_and_the_vae_in_f32() {
+        let cfg = MingTtsConfig::pinned();
+        let tensors = crate::models::architectures::ming_tts::published_tensors(&cfg)
+            .into_iter()
+            .map(|(name, shape)| {
+                let dtype = if name.ends_with("rotary_embed.inv_freq") {
+                    "F32"
+                } else {
+                    "BF16"
+                };
+                serde_json::json!([name, dtype, shape])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tensors.len(), 1_180);
+        let files = fixture(
+            &serde_json::json!({ "files": [{
+                "path": MING_TTS_WEIGHTS_FILE,
+                "format": "safetensors",
+                "total_bytes": 2_958_909_864_u64,
+                "tensor_count": tensors.len(),
+                "tensors": tensors,
+            }] })
+            .to_string(),
+        );
+        let unused = ming_unused_tensors(&cfg)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        for (backend, dtype, gib) in [
+            (BackendKind::Cpu, DType::F32, 5.51),
+            (BackendKind::Metal, DType::F16, 4.40),
+            (BackendKind::Cuda, DType::BF16, 4.21),
+        ] {
+            let flow = MingPrecision::flow_dtype_for(dtype);
+            let estimate = price_ming_tts(&files, backend, dtype, flow, &unused)
+                .unwrap()
+                .estimate()
+                .unwrap();
+            assert_gib(&format!("Ming {backend:?}"), estimate.resident_bytes, gib);
+            assert!(estimate.load_peak_bytes >= estimate.resident_bytes);
+        }
     }
 
     /// Maya1's releases priced at their stored widths, SNAC aside: the

@@ -239,6 +239,7 @@ impl ModelFamily {
             | Self::FishS2Tts
             | Self::Audio8Tts
             | Self::ChatterboxTts
+            | Self::MingTts
             | Self::Maya1Tts
             | Self::Maya2Tts
             | Self::ParakeetAsr

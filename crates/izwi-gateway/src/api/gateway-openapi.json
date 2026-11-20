@@ -1626,6 +1626,13 @@
             ],
             "description": "The `languages` entry a request without `language` speaks (LFM3\nAudio: `en-US`); absent, pickers default to English."
           },
+          "emotions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The emotions a request may name with `emotion` (Ming 3.0 TTS): a\ncloned voice takes any of them, a built-in voice the ones it was\nrecorded in."
+          },
           "inline_tags": {
             "type": "array",
             "items": {
@@ -3308,6 +3315,13 @@
             "format": "float",
             "description": "Classifier-free guidance weight, in [0, 1]; 0 turns guidance off\n(Chatterbox; its default is 0.5)."
           },
+          "dialect": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A Chinese dialect to speak in: cantonese or sichuanese (Ming 3.0\nTTS, with a reference voice or no voice)."
+          },
           "diffusion_steps": {
             "type": [
               "integer",
@@ -3315,6 +3329,13 @@
             ],
             "description": "VibeVoice diffusion steps per frame.",
             "minimum": 0
+          },
+          "emotion": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The emotion to speak with: neutral, happy, sad, angry, fearful,\ndisgusted or surprised (Ming 3.0 TTS). A cloned voice takes any; a\nbuilt-in voice the ones it was recorded in. One of `emotion`,\n`dialect`, the three levels below and a voice description per\nrequest."
           },
           "exaggeration": {
             "type": [
@@ -3339,6 +3360,13 @@
             ],
             "description": "Speak numbers, currency, dates, times and units as words. Unset keeps\nthe model's default: on for Kokoro (English) and Maya 2 Native (in the\nrequest's language), off for models that read them themselves."
           },
+          "pitch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pitch as a level: low, medium or high (Ming 3.0 TTS)."
+          },
           "repetition_penalty": {
             "type": [
               "number",
@@ -3355,6 +3383,13 @@
             "format": "int64",
             "description": "Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Fish Audio Drama 3,\nVoxtral noise, Kokoro noise). Fish Audio Drama 3's voice without a\nreference comes from it, and chunk i of long text samples from\nseed + i.",
             "minimum": 0
+          },
+          "speaking_rate": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Speaking rate as a level: low (slow), medium or high (fast) (Ming\n3.0 TTS, with a reference voice or no voice)."
           },
           "subtalker_do_sample": {
             "type": [
@@ -3391,6 +3426,13 @@
             ],
             "format": "float",
             "description": "Nucleus sampling threshold, in (0, 1]."
+          },
+          "volume": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Volume as a level: low, medium or high (Ming 3.0 TTS)."
           }
         }
       },

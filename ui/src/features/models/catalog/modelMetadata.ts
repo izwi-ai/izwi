@@ -15,6 +15,7 @@ export const PROVIDER_ORDER = [
   "Resemble AI",
   "Maya Research",
   "Salesforce",
+  "inclusionAI",
   "Other",
 ] as const;
 
@@ -100,6 +101,9 @@ export function getModelProviderLabel(variant: string): string {
     variant.startsWith("salesforce-sovereign-intelligence/")
   ) {
     return "Salesforce";
+  }
+  if (variant.startsWith("Ming-") || variant.startsWith("inclusionAI/")) {
+    return "inclusionAI";
   }
   return "Other";
 }
@@ -349,6 +353,23 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "24 kHz",
     ],
     size: "5.49 GB",
+  },
+  "Ming-3.0-tts-0.5B": {
+    shortName: "Ming 3.0 TTS 0.5B",
+    fullName: "Ming 3.0 TTS 0.5B by inclusionAI",
+    description:
+      "Speech in Chinese and English, plus German, Spanish, French, Korean and Japanese, with 85 built-in voices, voice cloning from a short clip (its transcript is optional), and voices designed from a description. Emotions, three levels of speed, pitch and volume, Cantonese and Sichuanese, and inline sounds such as [Laughter] and [Sigh].",
+    category: "tts",
+    capabilities: [
+      "Text to Speech",
+      "Voice Cloning",
+      "Voice Design",
+      "Emotions",
+      "7 Languages",
+      "Streaming",
+      "44.1 kHz",
+    ],
+    size: "3.00 GB",
   },
   // Text Chat
   "Qwen3.5-0.8B": {

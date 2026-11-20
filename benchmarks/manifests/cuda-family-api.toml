@@ -77,6 +77,14 @@ iterations = 1
 text = "CUDA model evidence."
 
 [[benchmarks]]
+name = "ming-tts-cuda"
+command = "tts"
+model = "Ming-3.0-tts-0.5B"
+speaker = "US_Emma"
+iterations = 1
+text = "CUDA model evidence."
+
+[[benchmarks]]
 name = "fish-drama3-tts-cuda"
 command = "tts"
 model = "FishAudio-Drama-3"

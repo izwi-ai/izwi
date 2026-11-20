@@ -191,9 +191,18 @@ async fn assert_idle(runtime: &RuntimeService) {
 /// Load, speech with and without streaming, a cloned voice, requests alone
 /// and together bit for bit, the budget's error, and unload back to the
 /// ledger's baseline.
+// The body runs several requests through the runtime; an unoptimized build
+// needs more than the default test stack (see `block_on_large_stack`).
+#[test]
+fn synthetic_drama3_speaks_through_the_runtime_alone_and_together() {
+    crate::block_on_large_stack(
+        4,
+        synthetic_drama3_speaks_through_the_runtime_alone_and_together_body,
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn synthetic_drama3_speaks_through_the_runtime_alone_and_together() {
+async fn synthetic_drama3_speaks_through_the_runtime_alone_and_together_body() {
     let _authority = crate::engine::resources::test_support::authority_test_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -330,9 +339,15 @@ async fn synthetic_drama3_speaks_through_the_runtime_alone_and_together() {
 /// mid-decode (a stream cancelled at its first audio): each request ends
 /// cancelled, the engine goes idle and the retained row is released, and
 /// the next request speaks as it did before.
+// The body runs several requests through the runtime; an unoptimized build
+// needs more than the default test stack (see `block_on_large_stack`).
+#[test]
+fn synthetic_drama3_cancels_mid_prefill_and_mid_decode() {
+    crate::block_on_large_stack(4, synthetic_drama3_cancels_mid_prefill_and_mid_decode_body);
+}
+
 #[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn synthetic_drama3_cancels_mid_prefill_and_mid_decode() {
+async fn synthetic_drama3_cancels_mid_prefill_and_mid_decode_body() {
     let _authority = crate::engine::resources::test_support::authority_test_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -482,9 +497,18 @@ async fn stream_with_codes(
 /// codes it generated, the codes of exactly the audio it streamed. A chunk
 /// without its history speaks otherwise. Only a model that continues
 /// speech across chunks takes history.
+// The body runs several requests through the runtime; an unoptimized build
+// needs more than the default test stack (see `block_on_large_stack`).
+#[test]
+fn synthetic_drama3_chunks_carry_their_history_through_the_runtime() {
+    crate::block_on_large_stack(
+        4,
+        synthetic_drama3_chunks_carry_their_history_through_the_runtime_body,
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn synthetic_drama3_chunks_carry_their_history_through_the_runtime() {
+async fn synthetic_drama3_chunks_carry_their_history_through_the_runtime_body() {
     use crate::models::architectures::fish_drama3::test_support::stub_frame;
     use crate::models::architectures::fish_drama3::{
         FishDrama3Codes, FishDrama3History, FishDrama3HistoryTurn,
@@ -605,9 +629,15 @@ async fn synthetic_drama3_chunks_carry_their_history_through_the_runtime() {
 /// leave the prompt no room for any text are invalid input naming them,
 /// while text too long beside them stays a context error (shorter chunks of
 /// it fit).
+// The body runs several requests through the runtime; an unoptimized build
+// needs more than the default test stack (see `block_on_large_stack`).
+#[test]
+fn synthetic_drama3_prepares_every_speaker_reference() {
+    crate::block_on_large_stack(4, synthetic_drama3_prepares_every_speaker_reference_body);
+}
+
 #[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn synthetic_drama3_prepares_every_speaker_reference() {
+async fn synthetic_drama3_prepares_every_speaker_reference_body() {
     use crate::models::architectures::fish_drama3::prompt::speaker_reference_transcript;
     use crate::models::architectures::fish_drama3::FishDrama3ReferenceAudio;
     use crate::runtime::SpeechSpeakerReference;
@@ -1071,16 +1101,20 @@ mod metal {
         );
     }
 
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn synthetic_drama3_speaks_on_metal_at_width_1() {
-        speaks_alone_and_together(false, "synthetic_drama3_speaks_on_metal_at_width_1").await;
+    // The body nests every leg's request future; see `block_on_large_stack`.
+    #[test]
+    fn synthetic_drama3_speaks_on_metal_at_width_1() {
+        crate::block_on_large_stack(4, || {
+            speaks_alone_and_together(false, "synthetic_drama3_speaks_on_metal_at_width_1")
+        });
     }
 
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn synthetic_drama3_speaks_on_metal_at_width_2() {
-        speaks_alone_and_together(true, "synthetic_drama3_speaks_on_metal_at_width_2").await;
+    // The body nests every leg's request future; see `block_on_large_stack`.
+    #[test]
+    fn synthetic_drama3_speaks_on_metal_at_width_2() {
+        crate::block_on_large_stack(4, || {
+            speaks_alone_and_together(true, "synthetic_drama3_speaks_on_metal_at_width_2")
+        });
     }
 }
 
@@ -1250,15 +1284,15 @@ mod cuda {
         );
     }
 
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn synthetic_drama3_speaks_on_cuda_at_width_1() {
-        speaks_alone_and_together(1).await;
+    // The body nests every leg's request future; see `block_on_large_stack`.
+    #[test]
+    fn synthetic_drama3_speaks_on_cuda_at_width_1() {
+        crate::block_on_large_stack(4, || speaks_alone_and_together(1));
     }
 
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn synthetic_drama3_speaks_on_cuda_at_width_8() {
-        speaks_alone_and_together(8).await;
+    // The body nests every leg's request future; see `block_on_large_stack`.
+    #[test]
+    fn synthetic_drama3_speaks_on_cuda_at_width_8() {
+        crate::block_on_large_stack(4, || speaks_alone_and_together(8));
     }
 }

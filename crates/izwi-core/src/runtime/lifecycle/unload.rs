@@ -152,6 +152,10 @@ impl ModelLifecycleController {
                 self.model_registry.unload_maya1_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;
             }
+            ModelFamily::MingTts => {
+                self.model_registry.unload_ming_tts(variant).await;
+                self.clear_active_tts_variant(variant).await;
+            }
             ModelFamily::Maya2Tts => {
                 self.model_registry.unload_maya2_tts(variant).await;
                 self.clear_active_tts_variant(variant).await;

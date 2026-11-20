@@ -13,9 +13,23 @@ use crate::catalog::ModelFamily;
 
 /// Whether `family` normalizes speech text when the request does not say.
 /// Maya 2 Native was evaluated and is served upstream with its own
-/// multilingual normaliser on.
+/// multilingual normaliser on. Ming 3.0 TTS has no normaliser upstream and
+/// read "$10m" as "10 amps" or "10 M8s".
 pub(crate) fn family_normalizes_by_default(family: ModelFamily) -> bool {
-    matches!(family, ModelFamily::KokoroTts | ModelFamily::Maya2Tts)
+    matches!(
+        family,
+        ModelFamily::KokoroTts | ModelFamily::Maya2Tts | ModelFamily::MingTts
+    )
+}
+
+/// Whether `text` holds a Chinese, Japanese or Korean character (a text a
+/// model reads with its own conventions, not English rules).
+pub(crate) fn has_cjk(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(c,
+            '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'
+            | '\u{ac00}'..='\u{d7af}' | '\u{f900}'..='\u{faff}')
+    })
 }
 
 /// Whether text in `language` (or, without one, for `speaker`) is English:
@@ -78,6 +92,33 @@ const MONTHS: [&str; 12] = [
     "december",
 ];
 const MAGNITUDES: [&str; 4] = ["thousand", "million", "billion", "trillion"];
+
+/// Magnitudes written onto a currency amount ("$10m", "$2.5bn", "$300K"),
+/// matched without case: the suffix and its word.
+const ATTACHED_MAGNITUDES: &[(&str, &str)] = &[
+    ("k", "thousand"),
+    ("mn", "million"),
+    ("m", "million"),
+    ("bn", "billion"),
+    ("b", "billion"),
+    ("tn", "trillion"),
+    ("t", "trillion"),
+];
+
+/// The magnitude written right after a currency amount ending at `end`,
+/// and the characters it takes, when a word boundary follows it.
+fn attached_magnitude(chars: &[char], end: usize) -> Option<(&'static str, usize)> {
+    ATTACHED_MAGNITUDES.iter().find_map(|(suffix, word)| {
+        let length = suffix.chars().count();
+        let matches = chars.get(end..end + length).is_some_and(|written| {
+            written
+                .iter()
+                .zip(suffix.chars())
+                .all(|(written, expected)| written.to_ascii_lowercase() == expected)
+        });
+        (matches && word_boundary(chars, end + length)).then_some((*word, length))
+    })
+}
 
 /// Units after a number: the abbreviation, its singular and its plural.
 const UNITS: &[(&str, &str, &str)] = &[
@@ -349,6 +390,11 @@ pub(crate) fn normalize_english(text: &str) -> String {
             {
                 if let Some(number) = parse_number(&chars, index + 1) {
                     let end = index + 1 + number.len;
+                    if let Some((magnitude, consumed)) = attached_magnitude(&chars, end) {
+                        out.push_str(&format!("{} {magnitude} {many}", number_words(&number)));
+                        index = end + consumed;
+                        continue;
+                    }
                     if word_boundary(&chars, end) {
                         if let Some((magnitude, consumed)) =
                             following_word(&chars, end, &MAGNITUDES)
@@ -552,6 +598,7 @@ mod tests {
     fn kokoro_and_maya2_opt_in_by_default() {
         assert!(family_normalizes_by_default(ModelFamily::KokoroTts));
         assert!(family_normalizes_by_default(ModelFamily::Maya2Tts));
+        assert!(family_normalizes_by_default(ModelFamily::MingTts));
         for family in [
             ModelFamily::Qwen3Tts,
             ModelFamily::FishS2Tts,
@@ -565,5 +612,13 @@ mod tests {
         assert!(!is_english(None, Some("jf_alpha")));
         assert!(is_english(Some("en-US"), Some("jf_alpha")));
         assert!(!is_english(Some("fr"), None));
+    }
+
+    #[test]
+    fn cjk_text_is_told_from_english() {
+        assert!(has_cjk("傍晚的风"));
+        assert!(has_cjk("こんにちは"));
+        assert!(has_cjk("안녕하세요"));
+        assert!(!has_cjk("about 600 are worth over $100m"));
     }
 }

@@ -76,7 +76,16 @@ widest batch it may run at on each backend is recorded in one table in code,
 `crates/izwi-core/src/catalog/batch_width.rs`. Each loaded model clamps the
 automatic engine width, and one derived from `IZWI_MAX_NUM_SEQS`, to its
 family's width. Every other capability (TTS, ASR, realtime) stays at two on
-CPU and Metal. An explicit `IZWI_MAX_BATCH_SIZE` applies as asked (up to 32
+CPU and Metal, except Ming 3.0 TTS on Metal, which decodes eight rows: its
+flow head and aggregator run every row of a step in one call, a request gets
+the bits it gets alone at every count from two to eight
+(`requests_together_match_each_alone_on_the_checkpoint`; byte parity at c2
+to c8 through the server with `run-tts-concurrency.py report
+--require-parity`), and the flow head costs 27 ms a latent alone and 12 ms a
+request at eight. Through the server (M1 Pro, 2026-11-20) it serves 1.9
+audio-s/s at one stream, 3.05 at four and 3.2 at eight; at two rows it stopped
+at 1.7. On Metal TTS decode takes the engine's tensor width
+(`catalog::tts_engine_width`) and every other TTS family clamps back to two. An explicit `IZWI_MAX_BATCH_SIZE` applies as asked (up to 32
 on any backend) to chat and speech models alike, above the certified width,
 and the runtime logs a warning that the rows run uncertified.
 The automatic engine width on CPU and Metal is the widest certified family

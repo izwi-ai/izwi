@@ -63,6 +63,7 @@ MODELS = {
     'FishAudio-S2-Pro': {CLONE: True},
     'FishAudio-Drama-3': {},
     'Audio8-TTS-Realistic-Air': {},
+    'Ming-3.0-tts-0.5B': {'voice': 'US_Emma'},
     'Chatterbox-500M': {'voice': 'default'},
     'Chatterbox-Multilingual-500M': {'voice': 'default', 'language': 'en'},
     'Maya1-3B': {'voice': 'ava'},

@@ -59,7 +59,11 @@ export function PageHeader({
               {breadcrumbs.map((crumb, index) => (
                 <li
                   key={index}
-                  className="flex min-w-0 items-center gap-1.5"
+                  // Parent crumbs keep their width; the last one truncates.
+                  className={cn(
+                    "flex items-center gap-1.5",
+                    crumb.to ? "shrink-0" : "min-w-0",
+                  )}
                 >
                   {index > 0 ? (
                     <ChevronRight

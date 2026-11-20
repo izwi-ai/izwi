@@ -78,6 +78,7 @@ Common models:
 | `Maya1-3B` | TTS (voice design from a description, emotion tags) | ~6.7 GB |
 | `Maya1-3B-GGUF` | TTS (Maya1 with a Q8_0 decoder) | ~3.6 GB |
 | `Maya2-Native-2.5B` | TTS (English and 11 Indic languages, 20 voices, cloning across languages) | ~5.5 GB |
+| `Ming-3.0-tts-0.5B` | TTS (7 languages, 85 voices, cloning, voice design, emotions; MIT) | ~3.0 GB |
 | `Parakeet-TDT-0.6B-v3` | ASR (default) | ~2.5 GB |
 | `Qwen3-ASR-0.6B-GGUF` | ASR (compact) | ~1.0 GB |
 | `Rumble-2-Flash` | ASR (Reson8, compact multilingual, transcript style options) | ~1.0 GB |

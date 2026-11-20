@@ -409,6 +409,20 @@ pub enum ModelVariant {
         alias = "Maya1-GGUF"
     )]
     Maya13BGguf,
+    /// inclusionAI's Ming-3.0-tts-0.5B (Qwen2.5-0.5B with a flow-matching
+    /// head over continuous latents and a 44.1 kHz transformer VAE): built-in
+    /// voices, voice cloning and voice design in one checkpoint
+    #[serde(
+        rename = "Ming-3.0-tts-0.5B",
+        alias = "inclusionAI/Ming-3.0-tts-0.5B",
+        alias = "Ming-3.0-tts-0.5b",
+        alias = "ming-3.0-tts-0.5b",
+        alias = "Ming-3.0-tts",
+        alias = "ming-3.0-tts",
+        alias = "Ming 3.0 TTS 0.5B",
+        alias = "Ming 3.0 TTS"
+    )]
+    Ming30Tts05B,
     /// Maya Research's Maya 2 Native (Qwen3-1.7B backbone + depth decoder
     /// over Kyutai Mimi; 12 Indic and English languages, 20 voices, cloning)
     #[serde(
@@ -502,6 +516,22 @@ impl ModelVariant {
     pub const MAYA1_FRAME_RATE_HZ: f32 = 24_000.0 * 7.0 / 2_048.0;
     /// Named voice descriptions.
     pub const MAYA1_BUILT_IN_VOICE_COUNT: usize = 9;
+    /// Ming-3.0-tts-0.5B as published 2026-11-19 (weights sha256
+    /// `45c4d78d…`).
+    pub const MING_TTS_ARTIFACT_REVISION: &'static str = "ffd36ab5764c39c7e5565dfed66a3aeeced58ab9";
+    /// The speaker encoder's repository and pin: CAM++'s PyTorch checkpoint
+    /// (`campplus_cn_common.bin`, sha256 `3388cf5f…`), the weights upstream
+    /// ships as `campplus.onnx`.
+    pub const MING_TTS_SPEAKER_REPO: &'static str = "funasr/campplus";
+    pub const MING_TTS_SPEAKER_ARTIFACT_REVISION: &'static str =
+        "e4b6ede7ce16997aff4ae69fbca1f0175e2afede";
+    /// The most latents one request generates (40 s); the 512-position
+    /// context bounds it further by the prompt's length.
+    pub const MING_TTS_MAX_OUTPUT_FRAMES: usize = 500;
+    /// Latents per second of audio (one per 3,528 samples at 44.1 kHz).
+    pub const MING_TTS_FRAME_RATE_HZ: f32 = 12.5;
+    /// Voices in [`crate::catalog::MING_TTS_VOICES`].
+    pub const MING_TTS_BUILT_IN_VOICE_COUNT: usize = crate::catalog::MING_TTS_VOICES.len();
     /// Maya 2 Native's release 1.0 (2026-10-25) as of its card rewrite.
     pub const MAYA2_ARTIFACT_REVISION: &'static str = "1403b841a6af0f920781319e851d4d6bdeb596c6";
     /// LiquidAI/LFM2.5-1.2B-Instruct-GGUF; its Q4_K_M file is byte-identical
@@ -609,6 +639,7 @@ impl ModelVariant {
             }
             Self::Maya13B => Some(Self::MAYA1_ARTIFACT_REVISION),
             Self::Maya13BGguf => Some(Self::MAYA1_GGUF_ARTIFACT_REVISION),
+            Self::Ming30Tts05B => Some(Self::MING_TTS_ARTIFACT_REVISION),
             Self::Maya2Native25B => Some(Self::MAYA2_ARTIFACT_REVISION),
             Self::Lfm2512BInstructGguf => Some(Self::LFM25_12B_INSTRUCT_GGUF_ARTIFACT_REVISION),
             Self::Lfm2512BThinkingGguf => Some(Self::LFM25_12B_THINKING_GGUF_ARTIFACT_REVISION),
@@ -702,6 +733,7 @@ impl ModelVariant {
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => "ResembleAI/chatterbox",
             Self::Maya13B => "maya-research/maya1",
             Self::Maya13BGguf => "mradermacher/maya1-GGUF",
+            Self::Ming30Tts05B => "inclusionAI/Ming-3.0-tts-0.5B",
             Self::Maya2Native25B => "maya-research/maya2-native",
         }
     }
@@ -768,6 +800,7 @@ impl ModelVariant {
             Self::ChatterboxMultilingual500M => "Chatterbox Multilingual",
             Self::Maya13B => "Maya1",
             Self::Maya13BGguf => "Maya1 GGUF",
+            Self::Ming30Tts05B => "Ming 3.0 TTS 0.5B",
             Self::Maya2Native25B => "Maya 2 Native",
         }
     }
@@ -834,6 +867,7 @@ impl ModelVariant {
             Self::ChatterboxMultilingual500M => "Chatterbox-Multilingual-500M",
             Self::Maya13B => "Maya1-3B",
             Self::Maya13BGguf => "Maya1-3B-GGUF",
+            Self::Ming30Tts05B => "Ming-3.0-tts-0.5B",
             Self::Maya2Native25B => "Maya2-Native-2.5B",
         }
     }
@@ -924,6 +958,9 @@ impl ModelVariant {
             // The Q8_0 GGUF (3,516,496,480 B), Maya1's config and tokenizer
             // (22,854,118 B) and SNAC.
             Self::Maya13BGguf => 3_618_838_852,
+            // The checkpoint (2,959,055,504 B), its config and tokenizer
+            // (11,452,403 B) and CAM++'s checkpoint (28,036,335 B).
+            Self::Ming30Tts05B => 2_998_544_242,
             // Both BF16 shards, their index, the release config, backbone
             // config and tokenizer and the voice list at the pin
             // (5,021,048,540 B), Mimi's config and weights (384,650,945 B)
@@ -1037,6 +1074,12 @@ impl ModelVariant {
             // 3.5 GB of Q8_0 weights, ~0.5 GB of F32 KV per 2,300-position
             // request and SNAC.
             Self::Maya13BGguf => 5.0,
+            // 1.48B parameters. On the CPU all F32 (5.9 GB); on Metal the
+            // language model and flow path in F16 (1.4 GB, the language
+            // model's down projections in F32: +0.2 GB) beside the F32 VAE
+            // (3.1 GB); on CUDA the same in BF16 without the F32 down
+            // projections; ~10 MB of KV a request.
+            Self::Ming30Tts05B => 6.5,
             // 5.0 GB of weights at F16/BF16 (10 GB in F32 on the CPU, priced
             // by its residency plan), Mimi in F32, ~0.22 GB of KV per
             // 2,048-position request.
@@ -1087,6 +1130,7 @@ impl ModelVariant {
             Self::VoxtralMini4BRealtime2602 => [18.5, 10.0, 9.0],
             Self::Lfm25Audio15BGguf => [2.5, 2.5, 1.5],
             Self::VibeVoice15BTts => [11.5, 6.5, 5.5],
+            Self::Ming30Tts05B => [6.5, 5.0, 5.0],
             // 601M parameters (F32 on the CPU, 16-bit elsewhere) and a 1.35 GB
             // F32 codec; CUDA adds the fast transformer's graphs.
             Self::Audio8TtsRealisticAir => [5.5, 4.0, 4.5],
@@ -1348,6 +1392,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::Audio8Tts
                 | crate::catalog::ModelFamily::ChatterboxTts
                 | crate::catalog::ModelFamily::Maya1Tts
+                | crate::catalog::ModelFamily::MingTts
                 | crate::catalog::ModelFamily::Maya2Tts
         )
     }
@@ -1360,7 +1405,8 @@ impl ModelVariant {
             Self::VibeVoiceAsr
             | Self::VibeVoice15BTts
             | Self::Chatterbox500M
-            | Self::ChatterboxMultilingual500M => Some("MIT"),
+            | Self::ChatterboxMultilingual500M
+            | Self::Ming30Tts05B => Some("MIT"),
             Self::FishAudioS2Pro => Some("Fish Audio Research License"),
             Self::FishAudioDrama3 => Some("Fish Audio Community License v1.0"),
             Self::Nemotron35AsrStreaming06B
@@ -1415,6 +1461,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::VoxtralTts
                 | crate::catalog::ModelFamily::ChatterboxTts
                 | crate::catalog::ModelFamily::Maya1Tts
+                | crate::catalog::ModelFamily::MingTts
                 | crate::catalog::ModelFamily::Maya2Tts
         )
     }
@@ -1700,6 +1747,23 @@ impl ModelVariant {
                 max_speakers: 1,
                 max_references: 1,
             },
+            // Three ways to a voice: a built-in one by name, a reference
+            // clip (its transcript improves the clone and is optional), or a
+            // description. Speed is one of three levels, not a factor.
+            Self::Ming30Tts05B => SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(Self::MING_TTS_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: true,
+                reference_transcript_required: false,
+                supports_voice_description: true,
+                supports_streaming: true,
+                supports_speed_control: false,
+                supports_auto_long_form: true,
+                supports_seeded_voice: false,
+                supports_speaker_dialogue: false,
+                max_speakers: 1,
+                max_references: 1,
+            },
             Self::Maya13B | Self::Maya13BGguf => SpeechModelCapabilities {
                 supports_builtin_voices: true,
                 built_in_voice_count: Some(Self::MAYA1_BUILT_IN_VOICE_COUNT),
@@ -1779,6 +1843,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::Audio8Tts => Some(Self::AUDIO8_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::ChatterboxTts => Some(Self::CHATTERBOX_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::Maya1Tts => Some(Self::MAYA1_MAX_OUTPUT_FRAMES),
+            crate::catalog::ModelFamily::MingTts => Some(Self::MING_TTS_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::Maya2Tts => Some(Self::MAYA2_MAX_OUTPUT_FRAMES),
             crate::catalog::ModelFamily::Lfm3Audio => Some(Self::LFM3_AUDIO_MAX_OUTPUT_FRAMES),
             _ => None,
@@ -1796,6 +1861,7 @@ impl ModelVariant {
             crate::catalog::ModelFamily::Audio8Tts => Some(Self::AUDIO8_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::ChatterboxTts => Some(Self::CHATTERBOX_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::Maya1Tts => Some(Self::MAYA1_FRAME_RATE_HZ),
+            crate::catalog::ModelFamily::MingTts => Some(Self::MING_TTS_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::Maya2Tts => Some(Self::MAYA2_FRAME_RATE_HZ),
             crate::catalog::ModelFamily::Lfm3Audio => Some(Self::LFM3_AUDIO_FRAME_RATE_HZ),
             _ => None,
@@ -1808,6 +1874,7 @@ impl ModelVariant {
         match self.family() {
             crate::catalog::ModelFamily::FishS2Tts
             | crate::catalog::ModelFamily::FishDrama3Tts
+            | crate::catalog::ModelFamily::MingTts
             | crate::catalog::ModelFamily::Audio8Tts => Some(44_100),
             crate::catalog::ModelFamily::Qwen3Tts
             | crate::catalog::ModelFamily::KokoroTts
@@ -2032,6 +2099,7 @@ impl ModelVariant {
             Self::FishAudioS2Pro => true,
             Self::Chatterbox500M | Self::ChatterboxMultilingual500M => true,
             Self::Maya13B | Self::Maya13BGguf => true,
+            Self::Ming30Tts05B => true,
             Self::Maya2Native25B => true,
             // D13: visible by default. Admission refuses a machine that
             // cannot hold its ~32 GiB before it reads a weight; certification
@@ -2108,6 +2176,7 @@ impl ModelVariant {
             Self::ChatterboxMultilingual500M,
             Self::Maya13B,
             Self::Maya13BGguf,
+            Self::Ming30Tts05B,
             Self::Maya2Native25B,
         ]
     }
@@ -2251,6 +2320,7 @@ impl ModelVariant {
     pub fn speech_inline_tags(&self) -> &'static [&'static str] {
         match self.family() {
             crate::catalog::ModelFamily::Maya1Tts => MAYA1_INLINE_TAGS,
+            crate::catalog::ModelFamily::MingTts => crate::catalog::MING_TTS_INLINE_TAGS,
             crate::catalog::ModelFamily::Maya2Tts => crate::catalog::MAYA2_SUGGESTED_TAGS,
             crate::catalog::ModelFamily::FishDrama3Tts => FISH_DRAMA3_INLINE_TAGS,
             _ => &[],

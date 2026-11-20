@@ -92,7 +92,7 @@ class Scorer(unittest.TestCase):
 
     def test_every_family_has_cases_with_known_texts(self):
         for family in ('kokoro', 'lfm', 'qwen_cv', 'qwen_base', 'qwen_greedy', 'vibevoice',
-                       'voxtral', 'fish', 'chatterbox', 'drama3'):
+                       'voxtral', 'fish', 'chatterbox', 'drama3', 'audio8', 'ming'):
             for case_id, key, _, _ in scorer.family_cases(family, ('ref', 'text')):
                 self.assertIn(key, scorer.TEXTS, (family, case_id))
         with self.assertRaises(SystemExit):

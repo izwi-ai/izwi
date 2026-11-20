@@ -48,6 +48,9 @@ export interface SpeechModelCapabilities {
   /** Whether a tag `inline_tags` lacks is refused (Maya1); otherwise the
    * list is a suggestion. */
   inline_tags_strict?: boolean;
+  /** The emotions a request may name (Ming 3.0 TTS): on a cloned voice any
+   * of them; a built-in voice speaks only the ones it was recorded in. */
+  emotions?: string[];
 }
 
 export interface SpeechLanguage {

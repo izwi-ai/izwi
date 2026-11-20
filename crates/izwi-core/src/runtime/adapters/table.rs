@@ -39,6 +39,7 @@ pub(crate) enum LoadedAdapterKind {
     VoxtralTts,
     ChatterboxTts,
     Maya1Tts,
+    MingTts,
     Maya2Tts,
     Lfm3AudioTts,
     Lfm3AudioAsr,
@@ -75,6 +76,7 @@ impl LoadedAdapterKind {
             Self::VoxtralTts => "builtin.voxtral_tts.physical_sequence",
             Self::ChatterboxTts => "builtin.chatterbox_tts.physical_sequence",
             Self::Maya1Tts => "builtin.maya1_tts.physical_sequence",
+            Self::MingTts => "builtin.ming_tts.physical_sequence",
             Self::Maya2Tts => "builtin.maya2_tts.physical_sequence",
             Self::Lfm3AudioTts => "builtin.lfm3_audio_tts.physical_sequence",
             Self::Lfm3AudioAsr => "builtin.lfm3_audio_asr.physical_sequence",
@@ -290,6 +292,10 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         // its frames arrive; a stream sends them, a final-only request keeps
         // them until it finishes.
         row(F::Maya1Tts, C::Tts, Loaded::Maya1Tts, RetainedAndInvocation).chunked(),
+        // Streams on its TTS route: every request decodes VAE windows as
+        // its latents arrive; a stream sends them, a final-only request
+        // keeps them until it finishes.
+        row(F::MingTts, C::Tts, Loaded::MingTts, RetainedAndInvocation).chunked(),
         // Streams on its TTS route: every request decodes Mimi windows as its
         // frames arrive; a stream sends them, a final-only request keeps them
         // until it finishes.

@@ -24,6 +24,8 @@ pub(crate) mod metal_encoder;
 pub mod metal_fp8;
 pub mod metal_fp8_gemm;
 #[cfg(feature = "metal")]
+pub(crate) mod metal_dense_mv;
+#[cfg(feature = "metal")]
 pub(crate) mod metal_kquant_mv;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_lfm_norm;

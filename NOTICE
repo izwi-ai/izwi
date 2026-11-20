@@ -59,6 +59,23 @@ Version 2.0) and includes a Rust port of the decoder of:
   tokens decode through. Copyright (c) 2023, Descript; Copyright (c) 2024,
   Hubert Siuzdak. MIT License.
 
+The Ming 3.0 TTS text-to-speech family
+(crates/izwi-core/src/models/architectures/ming_tts) runs inclusionAI's
+Ming-3.0-tts-0.5B (https://huggingface.co/inclusionAI/Ming-3.0-tts-0.5B, MIT
+License) and includes Rust ports of:
+
+* Ming-3.0-tts's inference code (https://github.com/inclusionAI/Ming-3.0-tts):
+  the prompt layout and control captions, the flow-matching sampler, the audio
+  VAE and its inverse STFT, and the trailing-silence trim.
+  Copyright (c) 2025 inclusionAI. MIT License.
+* The Qwen2.5-0.5B language model architecture it builds on
+  (https://huggingface.co/Qwen/Qwen2.5-0.5B). Copyright (c) Alibaba Cloud.
+  Apache License, Version 2.0.
+* CAM++ (https://github.com/modelscope/3D-Speaker), whose funasr/campplus
+  weights (https://huggingface.co/funasr/campplus, Apache License, Version
+  2.0) give cloned voices their speaker embedding. Copyright (c) Alibaba
+  Speech Lab. Apache License, Version 2.0.
+
 The Maya 2 Native text-to-speech family
 (crates/izwi-core/src/models/architectures/maya2) runs Maya Research's
 Maya 2 Native (https://huggingface.co/maya-research/maya2-native, Apache

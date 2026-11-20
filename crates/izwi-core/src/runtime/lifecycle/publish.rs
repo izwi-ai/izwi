@@ -47,6 +47,7 @@ impl ModelLifecycleController {
             | ModelFamily::Audio8Tts
             | ModelFamily::FishDrama3Tts
             | ModelFamily::ChatterboxTts
+            | ModelFamily::MingTts
             | ModelFamily::Maya1Tts
             | ModelFamily::Maya2Tts => {
                 if matches!(
@@ -61,6 +62,7 @@ impl ModelLifecycleController {
                         | ModelFamily::Audio8Tts
                         | ModelFamily::FishDrama3Tts
                         | ModelFamily::ChatterboxTts
+                        | ModelFamily::MingTts
                         | ModelFamily::Maya1Tts
                         | ModelFamily::Maya2Tts
                 ) {

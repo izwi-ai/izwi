@@ -1301,6 +1301,7 @@ fn audio_adapters_remain_scalar_except_for_exact_family_native_opt_ins() {
                                 | crate::catalog::ModelFamily::VibeVoiceTts
                                 | crate::catalog::ModelFamily::VoxtralTts
                                 | crate::catalog::ModelFamily::ChatterboxTts
+                                | crate::catalog::ModelFamily::MingTts
                                 | crate::catalog::ModelFamily::Maya1Tts
                                 | crate::catalog::ModelFamily::Maya2Tts
                                 | crate::catalog::ModelFamily::Lfm3Audio
@@ -4217,6 +4218,7 @@ fn batched_tts_families_decode_at_the_tts_width_and_prefill_at_the_engine_rows()
         (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 1),
         (ModelVariant::Qwen3Tts12Hz17BBase, 1),
         (ModelVariant::Maya13B, 8),
+        (ModelVariant::Ming30Tts05B, 8),
         (ModelVariant::Maya2Native25B, 8),
         (ModelVariant::Chatterbox500M, 8),
         (ModelVariant::Voxtral4BTts2603, 8),

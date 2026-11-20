@@ -63,6 +63,9 @@ Converts text to speech using a TTS model. The OSS server emits WAV audio for th
 | `--exaggeration <F>` | Emotion intensity, 0 to 2 (Chatterbox only) | `0.5` |
 | `--cfg-weight <F>` | Classifier-free guidance weight, 0 to 1; `0` turns guidance off (Chatterbox only) | `0.5` |
 | `--min-p <F>` | Min-p sampling threshold, 0 to 1 (Chatterbox only) | `0.05` |
+| `--emotion <NAME>` | `neutral`, `happy`, `sad`, `angry`, `fearful`, `disgusted` or `surprised` (`Ming-3.0-tts-0.5B` only) | voice default |
+| `--dialect <NAME>` | `cantonese` or `sichuanese` (`Ming-3.0-tts-0.5B` only) | — |
+| `--speaking-rate`, `--pitch`, `--volume <LEVEL>` | `low`, `medium` or `high` (`Ming-3.0-tts-0.5B` only) | — |
 | `--stream` | Stream audio as it is generated into a WAV file and report time to first audio (WAV only) | — |
 | `-p, --play` | Play the saved WAV with the system player (afplay on macOS; paplay, aplay, ffplay or play on Linux; PowerShell on Windows). Not with `--format pcm`. | — |
 
@@ -204,6 +207,36 @@ The tags are `<angry>`, `<appalled>`, `<chuckle>`, `<cry>`, `<curious>`,
 `<sigh>`, `<sing>`, `<snort>` and `<whisper>`; the server returns `400` for
 any other `<word>` in Maya1's text. Long text is spoken in sentences of up to
 about 11 seconds, each with the same voice description.
+
+### Ming 3.0 TTS
+
+`Ming-3.0-tts-0.5B` speaks Chinese and English, and German, Spanish, French,
+Korean and Japanese with `--language`. Pick one of 85 voices with `--speaker`
+(see [Voice Presets](/models/voice-presets#ming-3-0-tts)), clone one from
+`--reference-audio` (`--reference-text` is optional and improves the clone),
+or describe one with `--instructions`:
+
+```bash
+izwi tts "The old radio crackled softly as the storm moved across the valley." \
+  --model Ming-3.0-tts-0.5B \
+  --speaker UK_George \
+  --output ming.wav
+
+izwi tts "我终于可以把这个好消息告诉大家了！" \
+  --model Ming-3.0-tts-0.5B \
+  --speaker 灵风信 --emotion happy \
+  --output ming-happy.wav
+
+izwi tts "Once upon a time, a small boat drifted down the river." \
+  --model Ming-3.0-tts-0.5B \
+  --instructions "A warm, low storyteller voice with a gentle pace." \
+  --output ming-design.wav
+```
+
+A request takes one control: `--emotion`, `--dialect`, the levels
+`--speaking-rate`, `--pitch` and `--volume`, or `--instructions`. A built-in
+voice takes only an emotion it was recorded in; a cloned voice takes any one
+control. Sounds such as `[Laughter]` or `[Sigh]` can go in the text.
 
 ### Maya 2 Native
 

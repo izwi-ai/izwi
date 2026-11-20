@@ -16,7 +16,7 @@ usage() {
 Usage: scripts/bench/run-tts-matrix.sh --backend <cpu|metal|cuda> --models <Model:family,...> [options]
 
 Families: kokoro, lfm, qwen_cv, qwen_base, qwen_greedy, vibevoice, voxtral, fish, chatterbox,
-drama3, audio8 (see scripts/bench/score-tts-matrix.py for each family's cases).
+drama3, audio8, ming (see scripts/bench/score-tts-matrix.py for each family's cases).
 
 Options:
   --only <cases>      Comma-separated case ids to run (default: every case)

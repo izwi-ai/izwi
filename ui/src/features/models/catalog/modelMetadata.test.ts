@@ -32,6 +32,21 @@ describe("model display metadata", () => {
     ).toBe("asr");
   });
 
+  it("lists Ming 3.0 TTS as an inclusionAI speech model", () => {
+    expect(getModelDisplayName("Ming-3.0-tts-0.5B", "Ming 3.0 TTS 0.5B")).toBe(
+      "Ming 3.0 TTS 0.5B",
+    );
+    expect(getModelProviderLabel("Ming-3.0-tts-0.5B")).toBe("inclusionAI");
+    const detail = resolveModelDetail({
+      variant: "Ming-3.0-tts-0.5B",
+      display_name: "Ming 3.0 TTS 0.5B",
+      task: "tts",
+    });
+    expect(detail.category).toBe("tts");
+    expect(detail.capabilities).toContain("Voice Cloning");
+    expect(detail.capabilities).toContain("Voice Design");
+  });
+
   it("lists both LFM3 Audio variants as Liquid AI speech models", () => {
     expect(getModelDisplayName("LFM3-Audio-2B-GGUF", "LFM3 Audio 2B GGUF")).toBe(
       "LFM3 Audio 2B",

@@ -176,6 +176,232 @@ pub(super) fn chatterbox_tts_request_params(
     Ok(generation)
 }
 
+/// Ming generation for a request: the guidance scale is the request's
+/// `cfg_scale`, else the reference's 2.0; the budget is the request's, else
+/// the model's 500 latents (the context bounds it further once the prompt
+/// is built, and the stop head ends speech long before either); the seed
+/// defaults to one derived from the request id.
+pub(super) fn ming_tts_request_params(
+    params: &GenerationParams,
+    request_id: &str,
+) -> Result<MingGenerationParams> {
+    let speech = &params.speech;
+    let generation = MingGenerationParams {
+        guidance: speech.cfg_scale.unwrap_or(MING_TTS_DEFAULT_GUIDANCE),
+        max_new_tokens: if params.max_tokens == 0 {
+            ModelVariant::MING_TTS_MAX_OUTPUT_FRAMES
+        } else {
+            params
+                .max_tokens
+                .clamp(MING_TTS_MIN_LATENTS, ModelVariant::MING_TTS_MAX_OUTPUT_FRAMES)
+        },
+        seed: speech
+            .seed
+            .filter(|seed| *seed != 0)
+            .unwrap_or_else(|| EngineCoreRequest::chat_request_seed(request_id).max(1)),
+    };
+    generation.validate()?;
+    Ok(generation)
+}
+
+/// Whose voice a Ming request speaks with and what its caption asks for,
+/// resolved before any audio is read.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct MingTtsVoicePlan {
+    pub(super) control: MingControl,
+    /// The language as the request named it; `None` leaves it to the text.
+    pub(super) language: Option<String>,
+    /// A reference clip (base64) and its transcript, for a cloned voice.
+    pub(super) reference: Option<(String, Option<String>)>,
+}
+
+/// Resolve a Ming request's voice and control.
+///
+/// The model was trained on one control per request, so the request may set
+/// one of: an emotion, a dialect, speed / pitch / volume, or a voice
+/// description. A reference clip is a cloned voice and takes any one of the
+/// first three. A named built-in voice takes an emotion it was recorded in
+/// and nothing else. With no voice at all the default built-in voice of the
+/// text's language speaks, unless a control is set: then the model picks a
+/// voice to perform it with.
+pub(super) fn ming_tts_voice_plan(
+    speaker: Option<&str>,
+    description: Option<&str>,
+    reference_audio: Option<&str>,
+    reference_text: Option<&str>,
+    language: Option<&str>,
+    text: &str,
+    speech: &crate::engine::SpeechSamplingOptions,
+) -> Result<MingTtsVoicePlan> {
+    fn set(value: Option<&str>) -> Option<&str> {
+        value.map(str::trim).filter(|value| !value.is_empty())
+    }
+    let invalid = |message: String| Error::InvalidInput(message);
+    let language = set(language);
+    if let Some(language) = language {
+        if ming_tts_language(language).is_none() {
+            return Err(invalid(format!(
+                "Ming 3.0 TTS does not speak '{language}'; it takes {}",
+                MING_TTS_LANGUAGES
+                    .iter()
+                    .map(|language| language.code)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+    let emotion = match set(speech.emotion.as_deref()) {
+        None => None,
+        Some(value) => Some(MingEmotion::parse(value).ok_or_else(|| {
+            invalid(format!(
+                "`emotion` must be one of {}; got '{value}'",
+                MING_TTS_EMOTIONS.join(", ")
+            ))
+        })?),
+    };
+    let dialect = match set(speech.dialect.as_deref()) {
+        None => None,
+        Some(value) => Some(MingDialect::parse(value).ok_or_else(|| {
+            invalid(format!(
+                "`dialect` must be one of {}; got '{value}'",
+                MING_TTS_DIALECTS.join(", ")
+            ))
+        })?),
+    };
+    let level = |name: &str, value: Option<&str>| -> Result<Option<MingLevel>> {
+        match set(value) {
+            None => Ok(None),
+            Some(value) => MingLevel::parse(value).map(Some).ok_or_else(|| {
+                invalid(format!(
+                    "`{name}` must be one of {}; got '{value}'",
+                    MING_TTS_LEVELS.join(", ")
+                ))
+            }),
+        }
+    };
+    let speed = level("speaking_rate", speech.speaking_rate.as_deref())?;
+    let pitch = level("pitch", speech.pitch.as_deref())?;
+    let volume = level("volume", speech.volume.as_deref())?;
+    let prosody = speed.is_some() || pitch.is_some() || volume.is_some();
+    let description = set(description);
+    let controls = [
+        emotion.is_some(),
+        dialect.is_some(),
+        prosody,
+        description.is_some(),
+    ]
+    .into_iter()
+    .filter(|set| *set)
+    .count();
+    if controls > 1 {
+        return Err(invalid(
+            "Ming 3.0 TTS takes one control per request: an emotion, a dialect, \
+             speaking_rate / pitch / volume, or a voice description"
+                .into(),
+        ));
+    }
+    let control = || {
+        if let Some(emotion) = emotion {
+            MingControl::Emotion(emotion)
+        } else if let Some(dialect) = dialect {
+            MingControl::Dialect(dialect)
+        } else if prosody {
+            MingControl::Prosody {
+                speed,
+                pitch,
+                volume,
+            }
+        } else {
+            MingControl::None
+        }
+    };
+    // The dialect task names no target language upstream.
+    let plan_language = if dialect.is_some() {
+        None
+    } else {
+        language.map(str::to_string)
+    };
+
+    if let Some(audio) = set(reference_audio) {
+        if description.is_some() {
+            return Err(invalid(
+                "Ming 3.0 TTS speaks with a reference voice or a described one, not both".into(),
+            ));
+        }
+        return Ok(MingTtsVoicePlan {
+            control: control(),
+            language: plan_language,
+            reference: Some((audio.to_string(), set(reference_text).map(str::to_string))),
+        });
+    }
+    if set(reference_text).is_some() {
+        return Err(invalid(
+            "`reference_text` was given without `reference_audio`".into(),
+        ));
+    }
+    if let Some(description) = description {
+        return Ok(MingTtsVoicePlan {
+            control: MingControl::VoiceDesign(description.to_string()),
+            language: plan_language,
+            reference: None,
+        });
+    }
+    if let Some(name) = set(speaker) {
+        if dialect.is_some() || prosody {
+            return Err(invalid(format!(
+                "a Ming 3.0 TTS built-in voice ('{name}') takes no dialect, speaking_rate, pitch \
+                 or volume; use them with a reference voice, or leave `voice` out and the model \
+                 picks one"
+            )));
+        }
+        let model_name = ming_tts_model_voice_name(name, emotion.map(MingEmotion::name))
+            .map_err(|available| {
+                if available.is_empty() {
+                    invalid(format!(
+                        "the Ming 3.0 TTS voice '{name}' has one delivery and takes no `emotion`"
+                    ))
+                } else {
+                    invalid(format!(
+                        "the Ming 3.0 TTS voice '{name}' speaks these emotions: {}",
+                        available.join(", ")
+                    ))
+                }
+            })?;
+        return Ok(MingTtsVoicePlan {
+            control: MingControl::BuiltInVoice(model_name),
+            language: plan_language,
+            reference: None,
+        });
+    }
+    if controls == 1 {
+        // No voice named: the model performs the control in a voice of its
+        // own choosing.
+        return Ok(MingTtsVoicePlan {
+            control: control(),
+            language: plan_language,
+            reference: None,
+        });
+    }
+    let chinese = match language.and_then(ming_tts_language) {
+        Some(language) => language.code == "zh",
+        None => text
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+    };
+    let default = if chinese {
+        MING_TTS_DEFAULT_CHINESE_VOICE
+    } else {
+        MING_TTS_DEFAULT_VOICE
+    };
+    Ok(MingTtsVoicePlan {
+        control: MingControl::BuiltInVoice(
+            ming_tts_model_voice_name(default, None).unwrap_or_else(|_| default.to_string()),
+        ),
+        language: plan_language,
+        reference: None,
+    })
+}
+
 /// Maya1 generation for a request: unset fields keep the card's sampling
 /// (temperature 0.4, top-p 0.9, top-k 50, repetition penalty 1.1, at least
 /// 28 tokens); the budget is the request's, else one sized to `text`, within
@@ -2072,6 +2298,187 @@ impl RuntimeService {
             .map_err(|failure| failure.error)
     }
 
+    pub(super) async fn prepare_ming_tts_for_binding(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        residency_lease: Option<&ModelResidencyLease>,
+    ) -> Result<(EngineCoreRequest, JobLease)> {
+        if request.task_type != TaskType::TTS
+            || request
+                .model_variant
+                .is_none_or(|variant| variant.family() != ModelFamily::MingTts)
+            || request
+                .prepared_ming_tts_artifact_for_executor()?
+                .is_some()
+        {
+            return Ok((request, job));
+        }
+        let variant = request.model_variant.expect("validated Ming variant");
+        let model = self
+            .model_registry
+            .get_ming_tts_lease(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(format!("Ming model {variant} is not loaded")))?;
+        let residency = residency_lease.ok_or_else(|| {
+            Error::InferenceError("Ming preparation requires model residency".into())
+        })?;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency.variant());
+        let contract = loaded_contract_for_residency(
+            residency,
+            loaded_bundle.as_deref(),
+            CapabilityKind::Tts,
+            false,
+            false,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(ExecutionTargetKind::TokenEngine),
+        )?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!("Ming model {variant} has no effective context"))
+            })?;
+        let text = request
+            .tts_text_for_execution()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Ming request is missing text".into()))?
+            .trim()
+            .to_string();
+        let plan = ming_tts_voice_plan(
+            request.tts_speaker_for_execution(),
+            request.voice_description.as_deref(),
+            request.tts_reference_audio_for_execution(),
+            request.tts_reference_text_for_execution(),
+            request.language.as_deref(),
+            &text,
+            &request.params.speech,
+        )?;
+        let mut params = ming_tts_request_params(&request.params, &request.id)?;
+        // A clone encodes its reference with the VAE and CAM++ here (once
+        // per distinct clip: the model caches encoded voices).
+        let workspace: u64 = if plan.reference.is_some() {
+            768 * 1024 * 1024
+        } else {
+            64 * 1024 * 1024
+        };
+        let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
+            .map_err(|_| Error::Overloaded("Ming retained request exceeds u64".into()))?;
+        job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
+        let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        let preparation_job = self
+            .coordinator
+            .admit_observed_from_preparation(
+                bridge,
+                JobSpec {
+                    request_id: request.id.clone(),
+                    lane: CoordinatorLane::Atomic,
+                    priority: request.priority,
+                    workload_class: request.workload_class,
+                    deadline: request.deadline,
+                    resources: asr_encoder_retained_resources(
+                        self.backend_router.context().backend_kind,
+                        retained_request_bytes,
+                        workspace,
+                    )?,
+                },
+                JobResourceObservation::host(retained_request_bytes),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let work = WorkUnit::PreSequencePreparation {
+            kind: "tts.prepare.ming_tts".into(),
+        };
+        let cost = crate::engine::WorkCost::with_workspace(
+            context_limit as u64,
+            context_limit as u64,
+            lfm25_audio_tts_preparation_workspace(
+                self.backend_router.context().backend_kind,
+                workspace,
+            ),
+        );
+        let cancellation = PreparationCancellation::default();
+        let row = self.coordinator.seal_preparation_row(
+            preparation_job,
+            &contract,
+            &work,
+            cost,
+            context_limit as u64,
+            cancellation.clone(),
+        )?;
+        let model_for_preparation = model.clone();
+        let mut cancellation_guard = PreparationCancellationGuard {
+            cancellation,
+            armed: true,
+        };
+        let mut outcomes = self
+            .coordinator
+            .run_loaded_native_preparation_batch(vec![row], contract, work, move |live| {
+                if live != [0] {
+                    return Err(Error::InferenceError(
+                        "Ming preparation must remain scalar".into(),
+                    ));
+                }
+                let voice = match &plan.reference {
+                    None => MingVoice::Captioned,
+                    Some((audio, transcript)) => MingVoice::Reference(
+                        model_for_preparation.reference_voice(audio, transcript.as_deref(), || {
+                            decode_reference_audio_base64(audio)
+                        })?,
+                    ),
+                };
+                let artifact = model_for_preparation.prepare_retained_artifact(&MingRequest {
+                    text,
+                    language: plan.language,
+                    voice,
+                    control: plan.control,
+                })?;
+                Ok(vec![Ok(PreparationArtifact {
+                    retained: JobResourceObservation {
+                        host_bytes: retained_request_bytes,
+                        accelerator_bytes: 0,
+                    },
+                    value: artifact,
+                })])
+            })
+            .await?;
+        cancellation_guard.armed = false;
+        let (artifact, bridge) = match outcomes
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Ming preparation returned no outcome".into()))?
+        {
+            PreparationRowOutcome::Committed { artifact, bridge } => (artifact, bridge),
+            PreparationRowOutcome::Cancelled => return Err(Error::Cancelled(request.id.clone())),
+            PreparationRowOutcome::TimedOut => return Err(Error::Timeout(request.id.clone())),
+            PreparationRowOutcome::Failed(error) => return Err(error),
+        };
+        let retained = artifact.retained;
+        // The context bounds the budget once the prompt's length is known.
+        params.max_new_tokens = params.max_new_tokens.min(
+            crate::models::architectures::ming_tts::MingRuntime::latent_room(
+                artifact.value.prompt.len(),
+            ),
+        );
+        params.validate()?;
+        let mut prepared = request;
+        prepared.install_ming_tts_execution_model(
+            variant,
+            model,
+            artifact.value,
+            params,
+            context_limit,
+        )?;
+        let (execution, _) = self.coordinator_job_for_request(&prepared)?;
+        self.coordinator
+            .admit_observed_from_preparation(bridge, execution, retained)
+            .await
+            .map(|job| (prepared, job))
+            .map_err(|failure| failure.error)
+    }
+
     pub(super) async fn prepare_maya2_tts_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -2736,6 +3143,9 @@ impl RuntimeService {
             .await?;
         let (request, job) = self
             .prepare_maya1_tts_for_binding(request, job, residency_lease)
+            .await?;
+        let (request, job) = self
+            .prepare_ming_tts_for_binding(request, job, residency_lease)
             .await?;
         let (request, job) = self
             .prepare_maya2_tts_for_binding(request, job, residency_lease)

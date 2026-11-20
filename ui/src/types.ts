@@ -1,3 +1,5 @@
+import { MING_TTS_SPEAKERS } from "@/mingTtsSpeakers";
+
 export type ViewMode =
   | "custom-voice"
   | "voice-clone"
@@ -128,6 +130,15 @@ export function isMaya2Variant(variant: string): boolean {
   );
 }
 
+export function isMingTtsVariant(variant: string): boolean {
+  const normalized = variant.trim().toLowerCase();
+  return (
+    normalized === "ming-3.0-tts-0.5b" ||
+    normalized === "inclusionai/ming-3.0-tts-0.5b" ||
+    normalized === "ming-3.0-tts"
+  );
+}
+
 function isVoxtralAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
@@ -241,6 +252,9 @@ export function getSpeakerProfilesForVariant(variant: string | null): SpeakerPro
   if (isMaya2Variant(variant)) {
     return MAYA2_SPEAKERS;
   }
+  if (isMingTtsVariant(variant)) {
+    return MING_TTS_SPEAKERS;
+  }
   if (isKokoroVariant(variant)) {
     return KOKORO_SPEAKERS;
   }
@@ -252,7 +266,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     id: "custom-voice",
     label: "Text to Speech",
     description:
-      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral, Chatterbox, Maya1, Maya 2 Native, LFM3 Audio)",
+      "Generate speech with built-in voice profiles (Qwen3, Kokoro, Voxtral, Chatterbox, Maya1, Maya 2 Native, Ming 3.0 TTS, LFM3 Audio)",
     icon: "Volume2",
     modelFilter: (variant) =>
       variant.includes("CustomVoice") ||
@@ -261,10 +275,11 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isChatterboxVariant(variant) ||
       isMaya1Variant(variant) ||
       isMaya2Variant(variant) ||
+      isMingTtsVariant(variant) ||
       isLfm3AudioVariant(variant),
     emptyStateTitle: "No TTS Model Loaded",
     emptyStateDescription:
-      "Load a CustomVoice, Kokoro, Voxtral, Chatterbox, Maya1, Maya 2 Native, or LFM3 Audio TTS model to generate speech",
+      "Load a CustomVoice, Kokoro, Voxtral, Chatterbox, Maya1, Maya 2 Native, Ming 3.0 TTS, or LFM3 Audio TTS model to generate speech",
   },
   "voice-clone": {
     id: "voice-clone",
@@ -277,10 +292,11 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       isFishS2TtsVariant(variant) ||
       isFishDrama3Variant(variant) ||
       isAudio8Variant(variant) ||
-      isMaya2Variant(variant),
+      isMaya2Variant(variant) ||
+      isMingTtsVariant(variant),
     emptyStateTitle: "No Base Model Loaded",
     emptyStateDescription:
-      "Load a Base, VibeVoice, Fish S2, Fish Drama 3, Audio8, or Maya 2 Native model to clone voices from reference audio",
+      "Load a Base, VibeVoice, Fish S2, Fish Drama 3, Audio8, Maya 2 Native, or Ming 3.0 TTS model to clone voices from reference audio",
   },
   "voice-design": {
     id: "voice-design",
@@ -288,10 +304,12 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
     description: "Create unique voices from text descriptions",
     icon: "Wand2",
     modelFilter: (variant) =>
-      variant.includes("VoiceDesign") || isMaya1Variant(variant),
+      variant.includes("VoiceDesign") ||
+      isMaya1Variant(variant) ||
+      isMingTtsVariant(variant),
     emptyStateTitle: "No Voice Design Model Loaded",
     emptyStateDescription:
-      "Load the VoiceDesign model to create voices from descriptions",
+      "Load a VoiceDesign, Maya1, or Ming 3.0 TTS model to create voices from descriptions",
   },
   transcription: {
     id: "transcription",
@@ -346,6 +364,9 @@ export interface SpeakerProfile {
   name: string;
   language: string;
   description: string;
+  /** The deliveries the voice exists in, when it has more than one (Ming
+   * 3.0 TTS); the first is its default. */
+  emotions?: string[];
 }
 
 const QWEN_SPEAKERS: SpeakerProfile[] = [

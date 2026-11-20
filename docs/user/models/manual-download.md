@@ -289,6 +289,32 @@ curl -L -o "$MODEL_DIR/snac_24khz.pth" \
 
 ---
 
+## Ming 3.0 TTS
+
+`Ming-3.0-tts-0.5B` (about 3.0 GB) needs four files from Hugging Face
+(`inclusionAI/Ming-3.0-tts-0.5B` at a pinned revision) and CAM++'s speaker
+encoder from `funasr/campplus`, which voice cloning uses. Upstream's
+`campplus.onnx` holds the same weights and is not needed.
+
+```bash
+MODEL_DIR="<izwi-models-path>/Ming-3.0-tts-0.5B"
+
+huggingface-cli download inclusionAI/Ming-3.0-tts-0.5B \
+  config.json tokenizer.json tokenizer_config.json model.safetensors \
+  --revision ffd36ab5764c39c7e5565dfed66a3aeeced58ab9 \
+  --local-dir "$MODEL_DIR"
+
+curl -L -o "$MODEL_DIR/campplus_cn_common.bin" \
+  https://huggingface.co/funasr/campplus/resolve/e4b6ede7ce16997aff4ae69fbca1f0175e2afede/campplus_cn_common.bin
+```
+
+When Izwi downloads CAM++ itself, it checks its size (28,036,335 bytes) and
+SHA-256 (`3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8`).
+Without that file the model still speaks with built-in and described voices
+and refuses cloning.
+
+---
+
 ## Maya 2 Native
 
 `Maya2-Native-2.5B` (about 5.5 GB) needs seven files from Hugging Face

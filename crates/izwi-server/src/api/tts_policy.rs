@@ -7,16 +7,14 @@ use izwi_core::runtime_models::architectures::chatterbox::{
 use izwi_core::runtime_models::architectures::fish_drama3::model::auto_frame_budget as fish_drama3_auto_frame_budget;
 use izwi_core::runtime_models::architectures::fish_drama3::prompt as fish_drama3_prompt;
 use izwi_core::runtime_models::architectures::fish_s2::contracts::CONTROL_TOKENS as FISH_S2_CONTROL_TOKENS;
-use izwi_core::runtime_models::architectures::maya1::{
-    maya1_auto_max_new_tokens, prompt::validate_inline_tags,
-};
 use izwi_core::runtime_models::architectures::lfm3_audio::{
     lfm3_audio_tts_auto_max_frames, prompts::tts_locale as lfm3_audio_tts_locale,
 };
-use izwi_core::runtime_models::architectures::maya2::resolve_language as maya2_language;
-pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::{
-    qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text,
+use izwi_core::runtime_models::architectures::maya1::{
+    maya1_auto_max_new_tokens, prompt::validate_inline_tags,
 };
+use izwi_core::runtime_models::architectures::maya2::resolve_language as maya2_language;
+pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::qwen3::tts::qwen3_tts_auto_max_output_frames;
 use izwi_core::runtime_models::architectures::vibevoice::tts::{
     vibevoice_tts_auto_max_frames_for_text, vibevoice_tts_auto_max_output_frames,
@@ -347,7 +345,91 @@ pub(crate) fn validate_speech_controls(
             )));
         }
     }
+    // Named deliveries: only Ming 3.0 TTS performs them. Which of them a
+    // request may combine depends on its voice, so the engine checks that.
+    if variant.family() != ModelFamily::MingTts {
+        for (name, value) in [
+            ("emotion", &sampling.emotion),
+            ("dialect", &sampling.dialect),
+            ("speaking_rate", &sampling.speaking_rate),
+            ("pitch", &sampling.pitch),
+            ("volume", &sampling.volume),
+        ] {
+            if value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(crate::error::ApiError::bad_request(format!(
+                    "{variant} does not support `{name}`; omit it"
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+/// Ming 3.0 TTS long-form segments: whole sentences of about 12 s of speech,
+/// so a segment fits the model's 512-position context beside a reference
+/// clip and its transcript. A CJK character counts as three (it is spoken
+/// in about the time of three Latin letters).
+pub(crate) const MING_TTS_SEGMENT_MAX_CHARS: usize = 160;
+
+/// `text`'s length for [`MING_TTS_SEGMENT_MAX_CHARS`].
+pub(crate) fn ming_tts_weighted_chars(text: &str) -> usize {
+    text.trim().chars().map(ming_tts_char_weight).sum()
+}
+
+/// Fewest and most weighted characters of a Ming anchor lead (about 1.3 s
+/// and 6 s of speech; see [`ming_tts_anchor_lead_end`]).
+pub(crate) const MING_TTS_ANCHOR_LEAD_MIN_CHARS: usize = 20;
+pub(crate) const MING_TTS_ANCHOR_LEAD_MAX_CHARS: usize = 90;
+
+/// Where the short first segment of an anchored Ming text ends (a byte
+/// offset), or `None` when the text is that short already.
+///
+/// Later segments clone the first one with its latents in the prompt. A
+/// first segment of 11 s made the model drop words at the ends of later
+/// segments with 灵语汐 (11 of 198 words over six seeds; none without the
+/// anchor), a sentence of 3 s none, holding the voice as well (0.89-0.92
+/// between later segments). The lead is the first sentence(s) between
+/// [`MING_TTS_ANCHOR_LEAD_MIN_CHARS`] and [`MING_TTS_ANCHOR_LEAD_MAX_CHARS`]
+/// weighted characters, else the last clause or word boundary before the
+/// most.
+pub(crate) fn ming_tts_anchor_lead_end(text: &str) -> Option<usize> {
+    if ming_tts_weighted_chars(text) <= MING_TTS_ANCHOR_LEAD_MAX_CHARS {
+        return None;
+    }
+    let (mut weight, mut clause, mut word) = (0usize, None, None);
+    let mut chars = text.char_indices().peekable();
+    while let Some((offset, ch)) = chars.next() {
+        weight += ming_tts_char_weight(ch);
+        if weight > MING_TTS_ANCHOR_LEAD_MAX_CHARS {
+            break;
+        }
+        let end = offset + ch.len_utf8();
+        let next_blank = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        let sentence = matches!(ch, '\n' | '。' | '！' | '？')
+            || (matches!(ch, '.' | '!' | '?') && next_blank);
+        if weight >= MING_TTS_ANCHOR_LEAD_MIN_CHARS && !text[..end].trim().is_empty() {
+            if sentence {
+                return Some(end);
+            }
+            if matches!(ch, ',' | '，' | ';' | '；' | '、' | ':' | '：') {
+                clause = Some(end);
+            } else if ch.is_whitespace() || ming_tts_char_weight(ch) > 1 {
+                word = Some(end);
+            }
+        }
+    }
+    clause.or(word)
+}
+
+/// One character's weight for [`MING_TTS_SEGMENT_MAX_CHARS`].
+pub(crate) fn ming_tts_char_weight(c: char) -> usize {
+    match c {
+        '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}' | '\u{ac00}'..='\u{d7af}' => 3,
+        _ => 1,
+    }
 }
 
 /// Maya 2 Native long-form segments: whole sentences up to about 20 s of
@@ -376,6 +458,22 @@ pub(crate) fn validate_speech_language(
                 }
                 error => crate::error::core_api_error(error),
             });
+    }
+    if variant.family() == ModelFamily::MingTts {
+        let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+        if izwi_core::catalog::ming_tts_language(language).is_none() {
+            return Err(crate::error::ApiError::bad_request(format!(
+                "{variant} does not speak '{language}'; it takes {}",
+                izwi_core::catalog::MING_TTS_LANGUAGES
+                    .iter()
+                    .map(|language| language.code)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        return Ok(());
     }
     if variant.family() == ModelFamily::Maya2Tts {
         return maya2_language(language, "")
@@ -502,6 +600,27 @@ pub struct SpeechSamplingRequest {
     /// (Chatterbox; its default is 0.5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cfg_weight: Option<f32>,
+    /// The emotion to speak with: neutral, happy, sad, angry, fearful,
+    /// disgusted or surprised (Ming 3.0 TTS). A cloned voice takes any; a
+    /// built-in voice the ones it was recorded in. One of `emotion`,
+    /// `dialect`, the three levels below and a voice description per
+    /// request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emotion: Option<String>,
+    /// A Chinese dialect to speak in: cantonese or sichuanese (Ming 3.0
+    /// TTS, with a reference voice or no voice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
+    /// Speaking rate as a level: low (slow), medium or high (fast) (Ming
+    /// 3.0 TTS, with a reference voice or no voice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaking_rate: Option<String>,
+    /// Pitch as a level: low, medium or high (Ming 3.0 TTS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch: Option<String>,
+    /// Volume as a level: low, medium or high (Ming 3.0 TTS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
 }
 
 impl SpeechSamplingRequest {
@@ -528,6 +647,11 @@ impl SpeechSamplingRequest {
             min_p: self.min_p,
             exaggeration: self.exaggeration,
             cfg_weight: self.cfg_weight,
+            emotion: self.emotion.clone(),
+            dialect: self.dialect.clone(),
+            speaking_rate: self.speaking_rate.clone(),
+            pitch: self.pitch.clone(),
+            volume: self.volume.clone(),
         }
     }
 }
@@ -608,6 +732,7 @@ pub(crate) fn tts_text_exceeds_one_request(variant: ModelVariant, text: &str) ->
         // Upstream speaks long text in pieces of about 20 s; each piece's
         // budget comes from its own frame prior.
         ModelFamily::Maya2Tts => return text.trim().chars().count() > MAYA2_SEGMENT_MAX_CHARS,
+        ModelFamily::MingTts => return ming_tts_weighted_chars(text) > MING_TTS_SEGMENT_MAX_CHARS,
         ModelFamily::Lfm3Audio => ModelVariant::LFM3_AUDIO_MAX_OUTPUT_FRAMES,
         _ => return false,
     };
@@ -977,6 +1102,105 @@ mod tests {
         );
     }
 
+    /// Ming 3.0 TTS takes named deliveries; every other model refuses them.
+    /// It speaks seven languages and splits long text by spoken length.
+    #[test]
+    fn a_ming_anchor_lead_is_a_short_first_sentence() {
+        fn lead(text: &str) -> Option<&str> {
+            ming_tts_anchor_lead_end(text).map(|end| &text[..end])
+        }
+        let script = "anthropic has about 5,300 employees\n\nafter today's ipo, roughly 2,800 \
+            of them are worth over $10m. about 600 are worth over $100m";
+        assert_eq!(lead(script), Some("anthropic has about 5,300 employees\n"));
+        // A sentence under the fewest joins the next one.
+        assert_eq!(
+            lead(
+                "Hi. Welcome back to the show, everyone. It is good to see you all again \
+                tonight, here in the studio with us."
+            ),
+            Some("Hi. Welcome back to the show, everyone.")
+        );
+        // A first sentence past the most cuts at its last clause or word.
+        let long = "This sentence keeps going and going, well beyond what a short opening \
+            line should ever hold before it finally ends somewhere.";
+        let cut = lead(long).unwrap();
+        assert!(
+            ming_tts_weighted_chars(cut) <= MING_TTS_ANCHOR_LEAD_MAX_CHARS,
+            "{cut:?}"
+        );
+        assert!(cut.ends_with(',') || cut.ends_with(' '), "{cut:?}");
+        // Chinese: the first full stop, three weights a character.
+        let chinese = "傍晚的风从山口吹过来，远处的云慢慢染成了金色。".repeat(4);
+        assert_eq!(
+            lead(&chinese),
+            Some("傍晚的风从山口吹过来，远处的云慢慢染成了金色。")
+        );
+        // Short text is its own lead.
+        assert_eq!(ming_tts_anchor_lead_end("A short line."), None);
+    }
+
+    #[test]
+    fn ming_tts_takes_named_deliveries_languages_and_short_segments() {
+        let ming = ModelVariant::Ming30Tts05B;
+        let request = SpeechSamplingRequest {
+            emotion: Some("happy".into()),
+            ..SpeechSamplingRequest::default()
+        };
+        assert!(validate_speech_controls(ming, &request).is_ok());
+        let error = validate_speech_controls(ModelVariant::Kokoro82M, &request).unwrap_err();
+        assert!(error.message.contains("`emotion`"), "{}", error.message);
+        let blank = SpeechSamplingRequest {
+            pitch: Some("  ".into()),
+            ..SpeechSamplingRequest::default()
+        };
+        assert!(validate_speech_controls(ModelVariant::Kokoro82M, &blank).is_ok());
+        let options = request.options(None, None);
+        assert_eq!(options.emotion.as_deref(), Some("happy"));
+
+        for language in [None, Some("de"), Some("zh-CN"), Some("Japanese"), Some(" ")] {
+            assert!(
+                validate_speech_language(ming, language).is_ok(),
+                "{language:?}"
+            );
+        }
+        let error = validate_speech_language(ming, Some("it")).unwrap_err();
+        assert!(
+            error.message.contains("does not speak"),
+            "{}",
+            error.message
+        );
+
+        // A voice of every kind: named, cloned (transcript optional),
+        // described, or none.
+        let voice =
+            |speaker, reference_audio, reference_text, voice_description| SpeechVoiceRequest {
+                speaker,
+                reference_audio,
+                reference_text,
+                voice_description,
+                saved_voice: false,
+            };
+        for request in [
+            voice(false, false, false, false),
+            voice(true, false, false, false),
+            voice(false, true, false, false),
+            voice(false, true, true, false),
+            voice(false, false, false, true),
+        ] {
+            assert!(validate_speech_voice(ming, request).is_ok());
+        }
+
+        assert_eq!(ming_tts_weighted_chars(" hello "), 5);
+        assert_eq!(ming_tts_weighted_chars("你好"), 6);
+        assert!(!tts_text_exceeds_one_request(ming, &"word ".repeat(30)));
+        assert!(tts_text_exceeds_one_request(ming, &"word ".repeat(40)));
+        assert!(tts_text_exceeds_one_request(ming, &"字".repeat(60)));
+        assert_eq!(
+            resolve_tts_output_frames(ming, "Hello.", None),
+            Some(ModelVariant::MING_TTS_MAX_OUTPUT_FRAMES)
+        );
+    }
+
     #[test]
     fn chatterbox_controls_are_refused_elsewhere_and_range_checked() {
         let chatterbox = ModelVariant::Chatterbox500M;
@@ -1058,7 +1282,10 @@ mod tests {
             let Some(capabilities) = variant.speech_capabilities() else {
                 continue;
             };
-            assert!(validate_speech_streaming(variant, false).is_ok(), "{variant}");
+            assert!(
+                validate_speech_streaming(variant, false).is_ok(),
+                "{variant}"
+            );
             match validate_speech_streaming(variant, true) {
                 Ok(()) => assert!(capabilities.supports_streaming, "{variant}"),
                 Err(error) => {

@@ -1537,6 +1537,7 @@ async fn reserved_file_capability_and_source_identity_fail_before_publication() 
 
 #[tokio::test]
 async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_writes() {
+    const RESERVATION_LIFETIME: Duration = Duration::from_secs(2);
     let root = tempfile::tempdir().unwrap();
     let database = TestDatabase::new().await;
     let media_root = root.path().join("media");
@@ -1550,7 +1551,12 @@ async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_
         ArtifactStoreLimits::default(),
     )
     .unwrap();
-    store.set_reservation_lifetime_for_test(Duration::from_millis(100));
+    // The local provider takes a reserved write only before its expiry and
+    // recovers it only after, both on the wall clock. The reservations live
+    // long enough for a slow runner's write to land (a 100 ms lifetime
+    // expired before the write on the PostgreSQL lane), and the restart
+    // waits for the later one's own expiry.
+    store.set_reservation_lifetime_for_test(RESERVATION_LIFETIME);
     let tenant = ArtifactTenant::from_scheduling_key(None);
     let lease = active_tts_lease(&metadata, None).await;
     let bytes = vec![0x35; 128 * 1024 + 3];
@@ -1573,7 +1579,7 @@ async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_
             "audio/wav",
             Some("speech.wav"),
             &bytes,
-            100,
+            RESERVATION_LIFETIME.as_millis() as u64,
         ))
         .await
         .unwrap();
@@ -1598,7 +1604,15 @@ async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_
 
     drop(store);
     drop(metadata);
-    tokio::time::sleep(Duration::from_millis(110)).await;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let expires_at = i64::try_from(reservation.expires_at).unwrap();
+    tokio::time::sleep(Duration::from_millis(
+        (expires_at - now_ms).max(0) as u64 + 50,
+    ))
+    .await;
     let reopened = ArtifactStore::new(
         Arc::new(BatchRuntimeStore::initialize_with_database(
             database.database(),
@@ -1960,9 +1974,14 @@ async fn invalid_provider_storage_keys_are_recovered_after_the_write_fence() {
 async fn exact_provider_request_without_returned_key_is_recovered_after_reopen() {
     let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-        database.database(),
-    ));
+    // Both clocks are fixed so the 100 ms reservation cannot expire before
+    // the write lands, however slowly the runner goes; the test then moves
+    // them past its expiry instead of sleeping.
+    let clock = Arc::new(AtomicI64::new(1_000));
+    provider.set_now_unix_ms(1_000);
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
+    metadata.set_test_clock(clock.clone());
+    let metadata = Arc::new(metadata);
     let write_id = new_uuid();
     let mut request_metadata = HookMetadata::new();
     request_metadata.insert("tenant_id".into(), "tenant-a".into());
@@ -2003,12 +2022,13 @@ async fn exact_provider_request_without_returned_key_is_recovered_after_reopen()
         .unwrap();
     assert_eq!(provider.object_count(), 1);
     drop(metadata);
-    tokio::time::sleep(Duration::from_millis(110)).await;
+    clock.store(1_200, Ordering::SeqCst);
+    provider.set_now_unix_ms(1_200);
 
+    let mut reopened_metadata = BatchRuntimeStore::initialize_with_database(database.database());
+    reopened_metadata.set_test_clock(clock);
     let reopened = ArtifactStore::new(
-        Arc::new(BatchRuntimeStore::initialize_with_database(
-            database.database(),
-        )),
+        Arc::new(reopened_metadata),
         provider.clone(),
         ArtifactStoreLimits::default(),
     )
