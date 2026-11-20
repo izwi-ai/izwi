@@ -1537,6 +1537,7 @@ async fn reserved_file_capability_and_source_identity_fail_before_publication() 
 
 #[tokio::test]
 async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_writes() {
+    const RESERVATION_LIFETIME: Duration = Duration::from_secs(2);
     let root = tempfile::tempdir().unwrap();
     let database = TestDatabase::new().await;
     let media_root = root.path().join("media");
@@ -1550,7 +1551,12 @@ async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_
         ArtifactStoreLimits::default(),
     )
     .unwrap();
-    store.set_reservation_lifetime_for_test(Duration::from_millis(100));
+    // The local provider takes a reserved write only before its expiry and
+    // recovers it only after, both on the wall clock. The reservations live
+    // long enough for a slow runner's write to land (a 100 ms lifetime
+    // expired before the write on the PostgreSQL lane), and the restart
+    // waits for the later one's own expiry.
+    store.set_reservation_lifetime_for_test(RESERVATION_LIFETIME);
     let tenant = ArtifactTenant::from_scheduling_key(None);
     let lease = active_tts_lease(&metadata, None).await;
     let bytes = vec![0x35; 128 * 1024 + 3];
@@ -1573,7 +1579,7 @@ async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_
             "audio/wav",
             Some("speech.wav"),
             &bytes,
-            100,
+            RESERVATION_LIFETIME.as_millis() as u64,
         ))
         .await
         .unwrap();
@@ -1598,7 +1604,15 @@ async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_
 
     drop(store);
     drop(metadata);
-    tokio::time::sleep(Duration::from_millis(110)).await;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let expires_at = i64::try_from(reservation.expires_at).unwrap();
+    tokio::time::sleep(Duration::from_millis(
+        (expires_at - now_ms).max(0) as u64 + 50,
+    ))
+    .await;
     let reopened = ArtifactStore::new(
         Arc::new(BatchRuntimeStore::initialize_with_database(
             database.database(),
