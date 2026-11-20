@@ -359,14 +359,20 @@ impl MingFlowHead {
                 &self.device,
             )?)
         };
-        let latent = self.sample_batch(&host(hidden)?, &host(history)?, &host(noise)?, guidance)?;
+        let latent = self.sample_batch(
+            &host(hidden)?,
+            &host(history)?,
+            &host(noise)?,
+            &host(&[guidance])?,
+        )?;
         Ok(latent.flatten_all()?.to_vec1::<f32>()?)
     }
 
     /// One latent for each of `rows` requests: `hidden` [rows, 896] (the
     /// language model's states), `history` [rows, 64] (each request's
-    /// previous latent) and `noise` [rows, 64] (each one's start), any
-    /// float dtype on the device. Returns [rows, 64] F32.
+    /// previous latent), `noise` [rows, 64] (each one's start), any float
+    /// dtype on the device, and `guidance` [rows, 1] F32 (each one's
+    /// classifier-free guidance). Returns [rows, 64] F32.
     ///
     /// Ten Euler steps on the reference's time grid. Each step runs every
     /// request's conditional row and its unconditional one (a zero
@@ -379,14 +385,20 @@ impl MingFlowHead {
         hidden: &Tensor,
         history: &Tensor,
         noise: &Tensor,
-        guidance: f32,
+        guidance: &Tensor,
     ) -> Result<Tensor> {
         let rows = hidden.dim(0)?;
-        if rows == 0 || history.dims() != [rows, LATENT_DIM] || noise.dims() != [rows, LATENT_DIM] {
+        if rows == 0
+            || history.dims() != [rows, LATENT_DIM]
+            || noise.dims() != [rows, LATENT_DIM]
+            || guidance.dims() != [rows, 1]
+        {
             return Err(Error::InvalidInput(format!(
-                "Ming flow sampling needs [rows, 64] history and noise for {rows} rows, got {:?} and {:?}",
+                "Ming flow sampling needs [rows, 64] history and noise and [rows, 1] guidance \
+                 for {rows} rows, got {:?}, {:?} and {:?}",
                 history.dims(),
-                noise.dims()
+                noise.dims(),
+                guidance.dims()
             )));
         }
         let twice =
@@ -398,7 +410,7 @@ impl MingFlowHead {
             .forward(&Tensor::cat(&[&hidden, &hidden.zeros_like()?], 0)?)?;
         let history = self.x_embedder.forward(&twice(history)?)?;
         let mut y = noise.to_dtype(DType::F32)?;
-        let guidance = f64::from(guidance);
+        let guidance = guidance.to_dtype(DType::F32)?;
         for (step, &dt) in self.dts.iter().enumerate() {
             let first = cond.broadcast_add(&self.time_table.narrow(0, step, 1)?)?;
             let sequence = Tensor::stack(
@@ -414,7 +426,7 @@ impl MingFlowHead {
             let pred = both.narrow(0, 0, rows)?;
             let null = both.narrow(0, rows, rows)?;
             // pred + (pred - null) * guidance.
-            let velocity = (&pred + ((&pred - &null)? * guidance)?)?;
+            let velocity = (&pred + (&pred - &null)?.broadcast_mul(&guidance)?)?;
             y = (y + (velocity * dt)?)?;
         }
         Ok(y)

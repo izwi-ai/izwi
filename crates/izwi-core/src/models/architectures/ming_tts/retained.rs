@@ -22,7 +22,8 @@ use super::stack::MingForwardRow;
 use super::stream::{MingAudioStream, MingWindow};
 use super::vae::MingVaeDecoder;
 use super::{
-    MingGenerationParams, MingNoiseStream, MingPrompt, MingRuntime, MingStopReason, MIN_LATENTS,
+    MingGenerationParams, MingLatentInput, MingNoiseStream, MingPrompt, MingRuntime,
+    MingStopReason, MIN_LATENTS,
 };
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PhysicalPagedKvCheckpoint};
@@ -337,8 +338,11 @@ pub(crate) fn ming_decode_batch(
     if rows.is_empty() {
         return Err(Error::InvalidInput("Ming decode batch has no rows".into()));
     }
-    let mut steps = Vec::with_capacity(rows.len());
-    let mut next = Vec::with_capacity(rows.len());
+    // Every row's inputs first: its hidden state, history and its own
+    // seeded noise. Then one flow-head call for all of them, and one
+    // aggregator call for the rows that go on: each row's values are the
+    // ones it gets alone (see `flow_group`).
+    let mut inputs = Vec::with_capacity(rows.len());
     for row in rows.iter_mut() {
         let state = &mut *row.state;
         if state.phase != MingPhase::Decode {
@@ -349,16 +353,30 @@ pub(crate) fn ming_decode_batch(
         let hidden = state.pending.take().ok_or_else(|| {
             Error::InferenceError("Ming decode step has no pending hidden state".into())
         })?;
+        let mut noise = state.rng.standard_normals(LATENT_DIM);
+        noise.truncate(LATENT_DIM);
+        inputs.push((hidden, noise));
+    }
+    let latents = runtime.sample_latents(
+        &rows
+            .iter()
+            .zip(&inputs)
+            .map(|(row, (hidden, noise))| MingLatentInput {
+                hidden,
+                history: &row.state.history,
+                noise,
+                guidance: row.state.params.guidance,
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let mut steps = Vec::with_capacity(rows.len());
+    let mut going_on = Vec::with_capacity(rows.len());
+    let mut fed_back = Vec::with_capacity(rows.len() * LATENT_DIM);
+    for ((row, (hidden, _)), latent) in rows.iter_mut().zip(&inputs).zip(latents) {
+        let state = &mut *row.state;
         let step = state.latents_generated();
-        let noise = state.rng.standard_normals(LATENT_DIM);
-        let latent = runtime.sample_latent(
-            &hidden,
-            &state.history,
-            &noise[..LATENT_DIM],
-            state.params.guidance,
-        )?;
         state.latents.extend_from_slice(&latent);
-        let stop = if runtime.stops_at(&hidden, step) {
+        let stop = if runtime.stops_at(hidden, step) {
             Some(MingStopReason::EndOfSpeech)
         } else if step + 1 >= state.budget {
             Some(MingStopReason::LatentBudget)
@@ -370,17 +388,31 @@ pub(crate) fn ming_decode_batch(
                 // The last latent is kept and never fed back.
                 state.phase = MingPhase::Audio;
                 state.stop_reason = Some(reason);
-                next.push(None);
             }
             None => {
-                // One request's latent at a time: the row's embedding is
-                // the one it gets alone.
-                next.push(Some(runtime.latent_embeddings(&latent)?));
+                fed_back.extend_from_slice(&latent);
                 state.history = latent;
             }
         }
+        going_on.push(stop.is_none());
         steps.push(MingDecodeStep {
             finished: stop.is_some(),
+        });
+    }
+    let embeds = if fed_back.is_empty() {
+        None
+    } else {
+        Some(runtime.latent_embeddings(&fed_back)?)
+    };
+    let mut next = Vec::with_capacity(rows.len());
+    let mut fed = 0usize;
+    for &goes_on in &going_on {
+        next.push(match (&embeds, goes_on) {
+            (Some(embeds), true) => {
+                fed += 1;
+                Some(embeds.narrow(0, fed - 1, 1)?)
+            }
+            _ => None,
         });
     }
     let mut forward = rows

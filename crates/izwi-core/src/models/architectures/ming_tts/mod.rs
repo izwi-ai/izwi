@@ -273,6 +273,68 @@ pub struct MingRuntime {
     device: Device,
 }
 
+/// One request's inputs to one latent: the language model's hidden state,
+/// the previous latent, the starting noise and the guidance.
+pub(crate) struct MingLatentInput<'a> {
+    pub(crate) hidden: &'a [f32],
+    pub(crate) history: &'a [f32],
+    pub(crate) noise: &'a [f32],
+    pub(crate) guidance: f32,
+}
+
+/// Requests the flow head and the aggregator take on CUDA: one zero-padded
+/// shape for every call, the shape their CUDA graphs capture.
+pub(crate) const FLOW_GROUP_CUDA: usize = 32;
+/// Most requests one call takes on Metal, unpadded.
+pub(crate) const FLOW_GROUP_METAL: usize = 32;
+
+/// How requests share the flow head's and the aggregator's calls.
+///
+/// A request's values must be the ones it gets alone. Every op on the flow
+/// path keeps rows apart except the matmuls, whose kernel Candle picks by
+/// shape. On CUDA each call is padded to [`FLOW_GROUP_CUDA`] requests: one
+/// shape, the one the CUDA graphs capture. On Metal a call takes the
+/// requests it has: Metal's matmul rounds a row the same for every row
+/// count from two up, and every matmul of the flow head has at least two
+/// rows; an aggregator call is padded to two rows, since its first matmul
+/// has one row a request (a lone request padded to eight would cost 60%
+/// more, M1 Pro). On the CPU the matmul's rounding changes with the row count,
+/// and padding would cost a lone request about 1.5x, so each request runs
+/// alone. The tests check both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlowGroup {
+    /// Most requests one call takes.
+    pub(crate) requests: usize,
+    /// Whether a call is padded to `requests` with zero rows.
+    pub(crate) padded: bool,
+    /// Fewest rows an aggregator call has, zero-padded: its first matmul
+    /// takes one row a request, and Metal runs one row as a GEMV that
+    /// rounds differently from the GEMM of two or more.
+    pub(crate) min_aggregator_rows: usize,
+}
+
+pub(crate) fn flow_group(device: &Device) -> FlowGroup {
+    if device.is_cuda() {
+        FlowGroup {
+            requests: FLOW_GROUP_CUDA,
+            padded: true,
+            min_aggregator_rows: FLOW_GROUP_CUDA,
+        }
+    } else if device.is_metal() {
+        FlowGroup {
+            requests: FLOW_GROUP_METAL,
+            padded: false,
+            min_aggregator_rows: 2,
+        }
+    } else {
+        FlowGroup {
+            requests: 1,
+            padded: false,
+            min_aggregator_rows: 1,
+        }
+    }
+}
+
 fn host_f32(tensor: &Tensor) -> Result<Vec<f32>> {
     Ok(tensor
         .to_dtype(DType::F32)?
@@ -580,21 +642,100 @@ impl MingRuntime {
         noise: &[f32],
         guidance: f32,
     ) -> Result<Vec<f32>> {
-        let latent = self.flow.sample(hidden, history, noise, guidance)?;
-        if latent.iter().any(|value| !value.is_finite()) {
-            return Err(Error::InferenceError(
-                "Ming flow head produced a non-finite latent".into(),
-            ));
+        let mut latents = self.sample_latents(&[MingLatentInput {
+            hidden,
+            history,
+            noise,
+            guidance,
+        }])?;
+        Ok(latents.pop().expect("one request, one latent"))
+    }
+
+    /// One latent for each request, every request's in the same flow-head
+    /// calls ([`flow_group`] at a time). A request's latent depends on its
+    /// own inputs only: it is the one it gets alone.
+    pub(crate) fn sample_latents(&self, rows: &[MingLatentInput<'_>]) -> Result<Vec<Vec<f32>>> {
+        let hidden_size = self.cfg.llm.hidden_size;
+        let group = flow_group(&self.device);
+        let mut out = Vec::with_capacity(rows.len());
+        for chunk in rows.chunks(group.requests) {
+            let width = if group.padded {
+                group.requests
+            } else {
+                chunk.len()
+            };
+            let mut hidden = vec![0f32; width * hidden_size];
+            let mut history = vec![0f32; width * LATENT_DIM];
+            let mut noise = vec![0f32; width * LATENT_DIM];
+            let mut guidance = vec![0f32; width];
+            for (index, row) in chunk.iter().enumerate() {
+                if row.hidden.len() != hidden_size
+                    || row.history.len() != LATENT_DIM
+                    || row.noise.len() != LATENT_DIM
+                {
+                    return Err(Error::InvalidInput(
+                        "Ming flow sampling needs a hidden state, a 64-wide history and \
+                         64 noise values per request"
+                            .into(),
+                    ));
+                }
+                hidden[index * hidden_size..(index + 1) * hidden_size].copy_from_slice(row.hidden);
+                history[index * LATENT_DIM..(index + 1) * LATENT_DIM].copy_from_slice(row.history);
+                noise[index * LATENT_DIM..(index + 1) * LATENT_DIM].copy_from_slice(row.noise);
+                guidance[index] = row.guidance;
+            }
+            let device = |values: Vec<f32>, cols: usize| -> Result<Tensor> {
+                Ok(Tensor::from_vec(values, (width, cols), &self.device)?)
+            };
+            let latents = self
+                .flow
+                .sample_batch(
+                    &device(hidden, hidden_size)?,
+                    &device(history, LATENT_DIM)?,
+                    &device(noise, LATENT_DIM)?,
+                    &device(guidance, 1)?,
+                )?
+                .narrow(0, 0, chunk.len())?
+                .to_device(&Device::Cpu)?
+                .to_vec2::<f32>()?;
+            for latent in latents {
+                if latent.iter().any(|value| !value.is_finite()) {
+                    return Err(Error::InferenceError(
+                        "Ming flow head produced a non-finite latent".into(),
+                    ));
+                }
+                out.push(latent);
+            }
         }
-        Ok(latent)
+        Ok(out)
     }
 
     /// The embeddings the language model reads for `latents` [rows * 64],
-    /// [rows, hidden] in the model dtype on the device.
+    /// [rows, hidden] in the model dtype on the device. The aggregator runs
+    /// [`flow_group`] rows at a time, as the flow head does.
     pub(crate) fn latent_embeddings(&self, latents: &[f32]) -> Result<Tensor> {
         let rows = latents.len() / LATENT_DIM;
-        let latents = Tensor::from_vec(latents.to_vec(), (rows, LATENT_DIM), &self.device)?;
-        self.aggregator.forward(&latents)
+        if rows == 0 || latents.len() != rows * LATENT_DIM {
+            return Err(Error::InvalidInput(
+                "Ming aggregator input must be whole 64-wide latents".into(),
+            ));
+        }
+        let group = flow_group(&self.device);
+        let mut parts = Vec::with_capacity(rows.div_ceil(group.requests));
+        for chunk in latents.chunks(group.requests * LATENT_DIM) {
+            let count = chunk.len() / LATENT_DIM;
+            let width =
+                if group.padded { group.requests } else { count }.max(group.min_aggregator_rows);
+            let mut padded = chunk.to_vec();
+            padded.resize(width * LATENT_DIM, 0.0);
+            let padded = Tensor::from_vec(padded, (width, LATENT_DIM), &self.device)?;
+            parts.push(self.aggregator.forward(&padded)?.narrow(0, 0, count)?);
+        }
+        Ok(if parts.len() == 1 {
+            parts.pop().expect("one group")
+        } else {
+            Tensor::cat(&parts, 0)?
+        })
     }
 
     /// `rows` of prompt embeddings (row-major, F32) as a device tensor.
@@ -773,6 +914,88 @@ mod tests {
         assert_eq!((bf16[0].lm, bf16[0].flow), (DType::BF16, DType::BF16));
         assert_eq!((bf16[1].lm, bf16[1].flow), (DType::BF16, DType::F32));
         assert!(bf16.iter().chain(&f16).all(|step| step.vae == DType::F32));
+    }
+
+    /// Every count from two to eleven requests' latents and embeddings in
+    /// shared calls against each request alone, bit for bit, with mixed
+    /// guidance: a shared call's rounding must not depend on how many
+    /// requests share it.
+    fn requests_together_match_each_alone(runtime: &MingRuntime) {
+        let hidden_size = runtime.config().llm.hidden_size;
+        let mut rng = SplitMix64::new(3);
+        let mut normals = |count: usize| rng.standard_normals(count)[..count].to_vec();
+        let rows = (0..11)
+            .map(|index| {
+                (
+                    normals(hidden_size),
+                    normals(LATENT_DIM),
+                    normals(LATENT_DIM),
+                    if index % 3 == 0 {
+                        1.5
+                    } else {
+                        DEFAULT_GUIDANCE
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let alone = rows
+            .iter()
+            .map(|(hidden, history, noise, guidance)| {
+                runtime
+                    .sample_latent(hidden, history, noise, *guidance)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(alone[0], alone[1]);
+        let embeddings = |latents: &[f32]| {
+            runtime
+                .latent_embeddings(latents)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap()
+        };
+        let embedded_alone = alone
+            .iter()
+            .map(|latent| embeddings(latent).remove(0))
+            .collect::<Vec<_>>();
+        for count in 2..=rows.len() {
+            let inputs = rows[..count]
+                .iter()
+                .map(|(hidden, history, noise, guidance)| MingLatentInput {
+                    hidden,
+                    history,
+                    noise,
+                    guidance: *guidance,
+                })
+                .collect::<Vec<_>>();
+            let together = runtime.sample_latents(&inputs).unwrap();
+            assert_eq!(together, alone[..count], "sampler, {count} requests");
+            assert_eq!(
+                embeddings(&alone[..count].concat()),
+                embedded_alone[..count],
+                "aggregator, {count} requests"
+            );
+        }
+    }
+
+    #[test]
+    fn requests_sampled_together_match_each_alone_on_the_cpu() {
+        requests_together_match_each_alone(&synthetic::tiny_runtime());
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn requests_sampled_together_match_each_alone_on_metal() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "requests_sampled_together_match_each_alone_on_metal",
+        ) else {
+            return;
+        };
+        requests_together_match_each_alone(&synthetic::tiny_runtime_on(&device, DType::F16));
     }
 
     #[test]

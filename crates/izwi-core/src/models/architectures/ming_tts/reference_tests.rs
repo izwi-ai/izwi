@@ -519,6 +519,23 @@ fn bench_components() {
         runtime.stops_at(&hidden, 10);
     });
     eprintln!("flow head (10 steps, CFG batch 2): {flow_ms:.1} ms");
+    for requests in [2usize, 4, 8] {
+        let inputs = (0..requests)
+            .map(|_| super::MingLatentInput {
+                hidden: &hidden,
+                history: &history,
+                noise: &noise,
+                guidance: DEFAULT_GUIDANCE,
+            })
+            .collect::<Vec<_>>();
+        let ms = time_ms(&runtime, calls, || {
+            runtime.sample_latents(&inputs).unwrap();
+        });
+        eprintln!(
+            "flow head, {requests} requests together: {ms:.1} ms ({:.1} ms a request)",
+            ms / requests as f64
+        );
+    }
     eprintln!("aggregator: {aggregator_ms:.1} ms; stop head: {stop_ms:.2} ms");
 
     for width in [1usize, 2, 4] {
@@ -582,4 +599,71 @@ fn bench_components() {
     eprintln!(
         "per latent excluding the language model: {per_latent:.1} ms; 80 ms of audio per latent"
     );
+}
+
+/// Requests sampled together get the latents and embeddings they get
+/// alone, on the published checkpoint at the test device's precision, for
+/// every count from two to eight (a shared call's rounding must not depend
+/// on how many requests share it).
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn requests_together_match_each_alone_on_the_checkpoint() {
+    let (runtime, _device) = runtime();
+    let hidden_size = runtime.config().llm.hidden_size;
+    let mut rng = crate::models::shared::noise::SplitMix64::new(21);
+    let mut normals = |count: usize, scale: f32| {
+        rng.standard_normals(count)[..count]
+            .iter()
+            .map(|value| value * scale)
+            .collect::<Vec<f32>>()
+    };
+    let rows = (0..8)
+        .map(|_| {
+            (
+                normals(hidden_size, 3.0),
+                normals(LATENT_DIM, 1.0),
+                normals(LATENT_DIM, 1.0),
+            )
+        })
+        .collect::<Vec<_>>();
+    let alone = rows
+        .iter()
+        .map(|(hidden, history, noise)| {
+            runtime
+                .sample_latent(hidden, history, noise, DEFAULT_GUIDANCE)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let host = |tensor: candle_core::Tensor| {
+        tensor
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
+    };
+    let embedded_alone = alone
+        .iter()
+        .map(|latent| host(runtime.latent_embeddings(latent).unwrap()).remove(0))
+        .collect::<Vec<_>>();
+    for count in 2..=rows.len() {
+        let inputs = rows[..count]
+            .iter()
+            .map(|(hidden, history, noise)| super::MingLatentInput {
+                hidden,
+                history,
+                noise,
+                guidance: DEFAULT_GUIDANCE,
+            })
+            .collect::<Vec<_>>();
+        let together = runtime.sample_latents(&inputs).unwrap();
+        assert_eq!(together, alone[..count], "sampler, {count} requests");
+        let embedded = host(runtime.latent_embeddings(&alone[..count].concat()).unwrap());
+        assert_eq!(
+            embedded,
+            embedded_alone[..count],
+            "aggregator, {count} requests"
+        );
+    }
 }
