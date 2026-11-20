@@ -1071,16 +1071,20 @@ mod metal {
         );
     }
 
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn synthetic_drama3_speaks_on_metal_at_width_1() {
-        speaks_alone_and_together(false, "synthetic_drama3_speaks_on_metal_at_width_1").await;
+    // The body nests every leg's request future; see `block_on_large_stack`.
+    #[test]
+    fn synthetic_drama3_speaks_on_metal_at_width_1() {
+        crate::block_on_large_stack(4, || {
+            speaks_alone_and_together(false, "synthetic_drama3_speaks_on_metal_at_width_1")
+        });
     }
 
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn synthetic_drama3_speaks_on_metal_at_width_2() {
-        speaks_alone_and_together(true, "synthetic_drama3_speaks_on_metal_at_width_2").await;
+    // The body nests every leg's request future; see `block_on_large_stack`.
+    #[test]
+    fn synthetic_drama3_speaks_on_metal_at_width_2() {
+        crate::block_on_large_stack(4, || {
+            speaks_alone_and_together(true, "synthetic_drama3_speaks_on_metal_at_width_2")
+        });
     }
 }
 
@@ -1250,15 +1254,15 @@ mod cuda {
         );
     }
 
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn synthetic_drama3_speaks_on_cuda_at_width_1() {
-        speaks_alone_and_together(1).await;
+    // The body nests every leg's request future; see `block_on_large_stack`.
+    #[test]
+    fn synthetic_drama3_speaks_on_cuda_at_width_1() {
+        crate::block_on_large_stack(4, || speaks_alone_and_together(1));
     }
 
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn synthetic_drama3_speaks_on_cuda_at_width_8() {
-        speaks_alone_and_together(8).await;
+    // The body nests every leg's request future; see `block_on_large_stack`.
+    #[test]
+    fn synthetic_drama3_speaks_on_cuda_at_width_8() {
+        crate::block_on_large_stack(4, || speaks_alone_and_together(8));
     }
 }

@@ -181,6 +181,39 @@ pub use runtime_models::{
     ModelRegistry, QwenTtsModelLease, MODEL_FAMILY_REGISTRATIONS,
 };
 
+/// Run an async test body on its own thread, in a multi-thread runtime
+/// whose threads also get a 32 MiB stack.
+///
+/// An unoptimized test build polls a whole engine request inline, and a
+/// body that nests several (multi-request, long-form or cancellation legs
+/// through `RuntimeService`) comes within a few percent of the default
+/// 2 MiB test stack, so any growth of a request type overflows it. `body`
+/// builds the future on that thread, so it may hold non-`Send` guards
+/// (the env and authority locks) across awaits.
+#[cfg(test)]
+pub(crate) fn block_on_large_stack<F, Fut>(worker_threads: usize, body: F) -> Fut::Output
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future,
+    Fut::Output: Send + 'static,
+{
+    const STACK_BYTES: usize = 32 << 20;
+    std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .thread_stack_size(STACK_BYTES)
+                .enable_all()
+                .build()
+                .expect("a test runtime")
+                .block_on(body())
+        })
+        .expect("a test thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 #[cfg(test)]
 pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {
     use std::sync::{Mutex, OnceLock};
