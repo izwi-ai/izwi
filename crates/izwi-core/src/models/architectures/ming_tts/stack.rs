@@ -20,6 +20,7 @@ use candle_nn::VarBuilder;
 
 use super::config::MingStackConfig;
 use crate::error::{Error, Result};
+use crate::kernels::residual_norm;
 use crate::models::shared::attention::mixed::{
     MixedRowLayout, MixedRowSpan, PreparedPhysicalMixedStep,
 };
@@ -70,6 +71,19 @@ pub(crate) fn project_rows(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -
     }
 }
 
+/// An RMSNorm gain in F32, the form the fused norm takes.
+fn norm_gain(vb: VarBuilder, hidden: usize) -> Result<Tensor> {
+    Ok(vb.get(hidden, "weight")?.to_dtype(DType::F32)?)
+}
+
+/// RMSNorm of `x` with an F32 `gain` in one launch, its statistics and
+/// result in F32 (`residual_norm`): the input is never narrowed first, so
+/// the language model's F32 residual stream, which carries values past
+/// F16's range, normalizes exactly as wide as it is. The caller casts.
+fn norm_f32(x: &Tensor, gain: &Tensor, eps: f64) -> Result<Tensor> {
+    Ok(residual_norm::rms_norm(x, gain, eps as f32, DType::F32)?)
+}
+
 fn project(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     let product = x.matmul(&weight.t()?)?;
     match bias {
@@ -78,10 +92,11 @@ fn project(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor>
     }
 }
 
-/// One layer's weights, each as the checkpoint stores it. Nothing is
-/// joined on the device: a joined tensor is a device-written buffer, which
-/// Metal rounds up to a power of two (the 35 MB gate-and-up pair of an F32
-/// stack would take 64 MB), and the load plan prices the stored tensors.
+/// One layer's weights, each as the checkpoint stores it (the two norm
+/// gains in F32, for the fused norm). Nothing is joined on the device: a
+/// joined tensor is a device-written buffer, which Metal rounds up to a
+/// power of two (the 35 MB gate-and-up pair of an F32 stack would take
+/// 64 MB), and the load plan prices the stored tensors.
 pub(crate) struct MingLayer {
     input_norm: Tensor,
     q: Tensor,
@@ -108,7 +123,7 @@ impl MingLayer {
         };
         let bias = |vb: VarBuilder, rows: usize| -> Result<Tensor> { Ok(vb.get(rows, "bias")?) };
         Ok(Self {
-            input_norm: vb.pp("input_layernorm").get(hidden, "weight")?,
+            input_norm: norm_gain(vb.pp("input_layernorm"), hidden)?,
             q: weight(attn.pp("q_proj"), cfg.q_out(), hidden)?,
             q_bias: bias(attn.pp("q_proj"), cfg.q_out())?,
             k: weight(attn.pp("k_proj"), cfg.kv_out(), hidden)?,
@@ -116,7 +131,7 @@ impl MingLayer {
             v: weight(attn.pp("v_proj"), cfg.kv_out(), hidden)?,
             v_bias: bias(attn.pp("v_proj"), cfg.kv_out())?,
             o_proj: weight(attn.pp("o_proj"), hidden, cfg.q_out())?,
-            post_norm: vb.pp("post_attention_layernorm").get(hidden, "weight")?,
+            post_norm: norm_gain(vb.pp("post_attention_layernorm"), hidden)?,
             gate: weight(mlp.pp("gate_proj"), cfg.intermediate_size, hidden)?,
             up: weight(mlp.pp("up_proj"), cfg.intermediate_size, hidden)?,
             down: {
@@ -152,7 +167,7 @@ impl MingLayer {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let tokens = x.dim(0)?;
         let head_dim = cfg.head_dim;
-        let normed = rms_norm(x, &self.input_norm, cfg.rms_norm_eps)?.to_dtype(self.dtype())?;
+        let normed = norm_f32(x, &self.input_norm, cfg.rms_norm_eps)?.to_dtype(self.dtype())?;
         let run = |weight: &Tensor, bias: &Tensor| -> Result<Tensor> {
             if rows_independent {
                 project_rows(&normed, weight, Some(bias))
@@ -160,17 +175,14 @@ impl MingLayer {
                 project(&normed, weight, Some(bias))
             }
         };
+        // Callers build the tables in the layer's dtype; a cast is a no-op.
         let (cos, sin) = (&cos.to_dtype(self.dtype())?, &sin.to_dtype(self.dtype())?);
         let q = run(&self.q, &self.q_bias)?.reshape((tokens, cfg.num_attention_heads, head_dim))?;
         let k = run(&self.k, &self.k_bias)?.reshape((tokens, cfg.num_key_value_heads, head_dim))?;
         let v = run(&self.v, &self.v_bias)?
             .reshape((tokens, cfg.num_key_value_heads, head_dim))?
             .contiguous()?;
-        Ok((
-            rotate_half_split(&q, cos, sin)?,
-            rotate_half_split(&k, cos, sin)?,
-            v,
-        ))
+        Ok((rope_tokens(&q, cos, sin)?, rope_tokens(&k, cos, sin)?, v))
     }
 
     /// The residual branches after attention: `attn` is [tokens, q_out] in
@@ -197,18 +209,43 @@ impl MingLayer {
             }
         };
         let wide = x.dtype();
-        let x = x.add(&run(attn, &self.o_proj)?.to_dtype(wide)?)?;
-        let normed = rms_norm(&x, &self.post_norm, cfg.rms_norm_eps)?.to_dtype(self.dtype())?;
+        // The residual add and the post-attention norm are one launch; the
+        // sum stays in the stream's dtype (F32).
+        let (x, normed) = residual_norm::add_rms_norm(
+            x,
+            &run(attn, &self.o_proj)?,
+            &self.post_norm,
+            cfg.rms_norm_eps as f32,
+            DType::F32,
+        )?;
+        let normed = normed.to_dtype(self.dtype())?;
         let down_dtype = self.down.dtype();
         let gate = run(&normed, &self.gate)?.to_dtype(down_dtype)?;
         let up = run(&normed, &self.up)?.to_dtype(down_dtype)?;
-        let mlp = run(&candle_nn::ops::silu(&gate)?.mul(&up)?, &self.down)?;
+        let gated = match crate::kernels::try_fused_silu_mul(&gate, &up) {
+            Some(gated) => gated,
+            None => candle_nn::ops::silu(&gate)?.mul(&up)?,
+        };
+        let mlp = run(&gated, &self.down)?;
         Ok(x.add(&mlp.to_dtype(wide)?)?)
     }
 }
 
 /// The half-split rotation of `x` [tokens, heads, dim] by per-token
-/// `cos`/`sin` [tokens, dim / 2].
+/// `cos`/`sin` [tokens, dim / 2]: Candle's fused `rope_thd` over the tokens
+/// as one sequence.
+fn rope_tokens(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    Ok(candle_nn::rotary_emb::rope_thd(
+        &x.unsqueeze(0)?.contiguous()?,
+        &cos.contiguous()?,
+        &sin.contiguous()?,
+    )?
+    .squeeze(0)?)
+}
+
+/// The same rotation spelled out (the reference [`rope_tokens`] is tested
+/// against).
+#[cfg(test)]
 fn rotate_half_split(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let half = x.dim(D::Minus1)? / 2;
     let x1 = x.narrow(D::Minus1, 0, half)?;
@@ -284,7 +321,7 @@ impl MingTrunk {
         let device = vb.device().clone();
         let embed = vb.get((vocab_size, cfg.hidden_size), "embed_tokens.weight")?;
         let layers = load_layers(&cfg, &vb)?;
-        let norm = vb.pp("norm").get(cfg.hidden_size, "weight")?;
+        let norm = norm_gain(vb.pp("norm"), cfg.hidden_size)?;
         let (rope_cos, rope_sin) = rope_table(
             &frequencies(&cfg)?,
             0,
@@ -490,7 +527,7 @@ impl MingTrunk {
                 &self.device,
             )?;
             let tails = hidden.index_select(&last, 0)?;
-            Ok(rms_norm(&tails, &self.norm, cfg.rms_norm_eps)?.to_dtype(DType::F32)?)
+            norm_f32(&tails, &self.norm, cfg.rms_norm_eps)
         })();
 
         let outcome = result
@@ -565,7 +602,7 @@ impl MingWindowStack {
             dtype: vb.dtype(),
             device: vb.device().clone(),
             layers: load_layers(&cfg, &vb)?,
-            norm: vb.pp("norm").get(cfg.hidden_size, "weight")?,
+            norm: norm_gain(vb.pp("norm"), cfg.hidden_size)?,
             freqs: frequencies(&cfg)?,
             cfg,
             window_keys,
@@ -668,7 +705,7 @@ impl MingWindowStack {
             ));
         }
         state.position = start + count;
-        rms_norm(&hidden, &self.norm, cfg.rms_norm_eps)
+        norm_f32(&hidden, &self.norm, cfg.rms_norm_eps)
     }
 
     /// [`Self::forward`] of one chunk from position 0, reporting for each
@@ -1026,5 +1063,27 @@ pub(crate) mod tests {
         );
         assert!(max_diff(&wide, &half) < 2e-3, "{wide:?} vs {half:?}");
         assert!(wide.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn fused_rotation_is_the_half_split_rotation() {
+        let x = random(&mut SplitMix64::new(11), &[5, 3, 8], 1.0);
+        let freqs = rope_frequencies(8, 1e6, &RopeScaling::Default).unwrap();
+        let (cos, sin) = rope_table(&freqs, 7, 5, 4, DType::F32, &Device::Cpu).unwrap();
+        let fused = host(&rope_tokens(&x, &cos, &sin).unwrap());
+        let spelled = host(&rotate_half_split(&x, &cos, &sin).unwrap());
+        assert!(max_diff(&fused, &spelled) < 1e-6, "{fused:?} vs {spelled:?}");
+    }
+
+    #[test]
+    fn the_fused_norm_keeps_values_past_half_precision() {
+        // The language model's residual stream reaches ~74,000 on the
+        // published weights: the norm must not narrow it before its sums.
+        let x = Tensor::from_vec(vec![74_000f32, -3.0, 2.0, 1.0], (1, 4), &Device::Cpu).unwrap();
+        let gain = Tensor::ones(4, DType::F32, &Device::Cpu).unwrap();
+        let fused = host(&norm_f32(&x, &gain, 1e-6).unwrap());
+        let spelled = host(&rms_norm(&x, &gain, 1e-6).unwrap());
+        assert!(fused.iter().all(|value| value.is_finite()));
+        assert!(max_diff(&fused, &spelled) < 1e-5, "{fused:?} vs {spelled:?}");
     }
 }
