@@ -254,6 +254,17 @@ each stage of a latent with the device drained around every call. M1 Pro,
 | Prefill, 160 positions | 84 ms | 55 ms | 447 ms | 342 ms |
 | A sentence end to end, RTF | 1.57 | 0.96 | 4.31 | 4.10 |
 
+Through the server on Metal (`run-tts-concurrency.py`, buffered requests of
+about 8 s of audio, byte parity with one stream at every level):
+
+| Streams | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| Before, audio-s/s | 0.65 | 0.66 | 0.67 | 0.66 |
+| Now, audio-s/s | 1.10 | 1.75 | 2.77 | 3.10 |
+
+Ming decodes eight rows on Metal (`catalog::tts_decode_width`), two on the
+CPU and 32 on CUDA.
+
 The flow head is most of a latent everywhere. On Metal its matmuls at a few
 rows run as GEMMs well below the memory bandwidth (about 40 of its 59 ms); a
 skinny-GEMM kernel is the next lever there. On the CPU the flow head is
