@@ -30,27 +30,58 @@ fn model_dir() -> PathBuf {
     )
 }
 
-fn device() -> (Device, DType) {
-    match std::env::var("IZWI_MING_TTS_TEST_DEVICE").as_deref() {
-        Ok("metal") => (Device::new_metal(0).expect("a Metal device"), DType::F16),
-        Ok("metal-f32") => (Device::new_metal(0).expect("a Metal device"), DType::F32),
-        _ => (Device::Cpu, DType::F32),
-    }
+/// The test device and its dtype. A Metal device comes with the shared
+/// device's test lease, held while this lives.
+struct TestDevice {
+    device: Device,
+    dtype: DType,
+    _lease: Option<Box<dyn std::any::Any>>,
 }
 
-fn runtime() -> MingRuntime {
-    let (device, dtype) = device();
+fn device() -> TestDevice {
+    let (metal, dtype) = match std::env::var("IZWI_MING_TTS_TEST_DEVICE").as_deref() {
+        Ok("metal") => (true, DType::F16),
+        Ok("metal-f32") => (true, DType::F32),
+        _ => (false, DType::F32),
+    };
+    if !metal {
+        return TestDevice {
+            device: Device::Cpu,
+            dtype,
+            _lease: None,
+        };
+    }
+    #[cfg(feature = "metal")]
+    {
+        let (device, lease) = crate::backends::metal_test_device_or_skip("ming_tts reference")
+            .expect("IZWI_MING_TTS_TEST_DEVICE=metal on a machine without Metal");
+        TestDevice {
+            device,
+            dtype,
+            _lease: Some(Box::new(lease)),
+        }
+    }
+    #[cfg(not(feature = "metal"))]
+    panic!("IZWI_MING_TTS_TEST_DEVICE=metal needs a build with the metal feature")
+}
+
+/// The runtime at the first precision whose probe passes, and the device
+/// it runs on (keep it alive with the runtime).
+fn runtime() -> (MingRuntime, TestDevice) {
+    let test_device = device();
+    let (device, dtype) = (&test_device.device, test_device.dtype);
     let precision = MingPrecision::ladder(dtype)
         .into_iter()
         .find(|precision| {
-            let runtime = MingRuntime::load(&model_dir(), &device, *precision).unwrap();
+            let runtime = MingRuntime::load(&model_dir(), device, *precision).unwrap();
             let report = runtime.numeric_self_check();
             eprintln!("{}", report.reason);
             report.passed
         })
         .expect("a precision that passes its probe");
     eprintln!("precision: {precision:?}");
-    MingRuntime::load(&model_dir(), &device, precision).unwrap()
+    let runtime = MingRuntime::load(&model_dir(), device, precision).unwrap();
+    (runtime, test_device)
 }
 
 fn write_wav(name: &str, samples: &[f32]) {
@@ -157,7 +188,7 @@ fn published_config_and_tokenizer_match_the_port() {
 #[test]
 #[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
 fn built_in_voices_speak_english_and_chinese() {
-    let runtime = runtime();
+    let (runtime, _device) = runtime();
     speak(
         &runtime,
         "builtin_en_emma",
@@ -193,7 +224,7 @@ fn built_in_voices_speak_english_and_chinese() {
 #[test]
 #[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
 fn a_seed_reproduces_and_another_seed_differs() {
-    let runtime = runtime();
+    let (runtime, _device) = runtime();
     let request = built_in("Same words, same seed.", "US_Emma", None);
     let a = speak(&runtime, "seed_a", &request, 5);
     let b = speak(&runtime, "seed_a_again", &request, 5);
@@ -205,7 +236,7 @@ fn a_seed_reproduces_and_another_seed_differs() {
 #[test]
 #[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
 fn voice_design_and_controls_speak() {
-    let runtime = runtime();
+    let (runtime, _device) = runtime();
     let request = |text: &str, control: MingControl| MingRequest {
         text: text.to_string(),
         language: None,
@@ -250,7 +281,7 @@ fn voice_design_and_controls_speak() {
 #[test]
 #[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
 fn a_reference_voice_clones_with_and_without_its_transcript() {
-    let runtime = runtime();
+    let (runtime, _device) = runtime();
     // The reference is a built-in voice's own audio, so the test needs no
     // recording: clone what the model just said.
     let source_text = "This is the voice I would like you to copy, please.";
@@ -322,7 +353,7 @@ fn a_reference_voice_clones_with_and_without_its_transcript() {
 #[test]
 #[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
 fn speaker_encoder_separates_voices() {
-    let runtime = runtime();
+    let (runtime, _device) = runtime();
     let speaker = CampPlus::open(&model_dir().join(SPEAKER_WEIGHTS_FILE)).unwrap();
     let text = "A short sentence for comparing two different speakers.";
     let emma_a = speak(&runtime, "spk_emma_a", &built_in(text, "US_Emma", None), 41);
@@ -360,9 +391,8 @@ fn speaker_encoder_separates_voices() {
 fn half_precision_passes_its_range_probe() {
     // Some step of the ladder passes; the language model keeps the device's
     // dtype whatever the flow path needs.
-    let runtime = runtime();
-    let (_, dtype) = device();
-    assert_eq!(runtime.lm_dtype(), dtype);
+    let (runtime, device) = runtime();
+    assert_eq!(runtime.lm_dtype(), device.dtype);
     let report = runtime.numeric_self_check();
     eprintln!("{}", report.diagnostics());
     assert!(report.passed, "{}", report.reason);
@@ -374,7 +404,8 @@ fn half_precision_passes_its_range_probe() {
 #[test]
 #[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
 fn trace_language_model_magnitudes() {
-    let (device, dtype) = device();
+    let test_device = device();
+    let (device, dtype) = (&test_device.device, test_device.dtype);
     let host = MingRuntime::load(&model_dir(), &Device::Cpu, MingPrecision::F32).unwrap();
     let prompt = host
         .prompt(&built_in(
@@ -384,14 +415,14 @@ fn trace_language_model_magnitudes() {
         ))
         .unwrap();
     let cfg = MingTtsConfig::load(&model_dir()).unwrap();
-    let vb = super::weights::mmap_checkpoint(&model_dir(), dtype, &device).unwrap();
+    let vb = super::weights::mmap_checkpoint(&model_dir(), dtype, device).unwrap();
     let stack =
         super::stack::MingWindowStack::load(cfg.llm.clone(), vb.pp("model").pp("model"), 4_096)
             .unwrap();
     let x = candle_core::Tensor::from_vec(
         prompt.embeds.clone(),
         (prompt.positions, cfg.llm.hidden_size),
-        &device,
+        device,
     )
     .unwrap();
     eprintln!("layer | q | attn out | gate | up | gated | mlp out | residual ({dtype:?})");
@@ -399,3 +430,4 @@ fn trace_language_model_magnitudes() {
         eprintln!("{layer:2} | {row:?}");
     }
 }
+
