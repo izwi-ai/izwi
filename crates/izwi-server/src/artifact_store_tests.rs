@@ -1974,9 +1974,14 @@ async fn invalid_provider_storage_keys_are_recovered_after_the_write_fence() {
 async fn exact_provider_request_without_returned_key_is_recovered_after_reopen() {
     let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-        database.database(),
-    ));
+    // Both clocks are fixed so the 100 ms reservation cannot expire before
+    // the write lands, however slowly the runner goes; the test then moves
+    // them past its expiry instead of sleeping.
+    let clock = Arc::new(AtomicI64::new(1_000));
+    provider.set_now_unix_ms(1_000);
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
+    metadata.set_test_clock(clock.clone());
+    let metadata = Arc::new(metadata);
     let write_id = new_uuid();
     let mut request_metadata = HookMetadata::new();
     request_metadata.insert("tenant_id".into(), "tenant-a".into());
@@ -2017,12 +2022,13 @@ async fn exact_provider_request_without_returned_key_is_recovered_after_reopen()
         .unwrap();
     assert_eq!(provider.object_count(), 1);
     drop(metadata);
-    tokio::time::sleep(Duration::from_millis(110)).await;
+    clock.store(1_200, Ordering::SeqCst);
+    provider.set_now_unix_ms(1_200);
 
+    let mut reopened_metadata = BatchRuntimeStore::initialize_with_database(database.database());
+    reopened_metadata.set_test_clock(clock);
     let reopened = ArtifactStore::new(
-        Arc::new(BatchRuntimeStore::initialize_with_database(
-            database.database(),
-        )),
+        Arc::new(reopened_metadata),
         provider.clone(),
         ArtifactStoreLimits::default(),
     )
