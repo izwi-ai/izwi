@@ -431,3 +431,155 @@ fn trace_language_model_magnitudes() {
     }
 }
 
+/// Milliseconds per call of `step` on the test device, waiting for the
+/// device after each call (two warm-up calls first).
+fn time_ms(runtime: &MingRuntime, calls: usize, mut step: impl FnMut()) -> f64 {
+    for _ in 0..2 {
+        step();
+    }
+    runtime.device().synchronize().unwrap();
+    let started = std::time::Instant::now();
+    for _ in 0..calls {
+        step();
+        runtime.device().synchronize().unwrap();
+    }
+    started.elapsed().as_secs_f64() * 1000.0 / calls as f64
+}
+
+/// What each stage costs per latent on the test device, and the real-time
+/// factor end to end (a benchmark; it asserts nothing).
+/// `IZWI_MING_TTS_BENCH_CALLS` sets the timed calls per stage (default 20).
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn bench_components() {
+    use super::stack::MingForwardRow;
+    use super::stream::MingAudioStream;
+
+    let calls = std::env::var("IZWI_MING_TTS_BENCH_CALLS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20usize);
+    let (runtime, _device) = runtime();
+    let request = built_in(
+        "The quick brown fox jumps over the lazy dog, and then it runs into the woods to rest.",
+        "US_Emma",
+        None,
+    );
+    let prompt = runtime.prompt(&request).unwrap();
+    let embeds = runtime.prompt_rows(&prompt.embeds).unwrap();
+    let hidden_size = runtime.config().llm.hidden_size;
+    let prefill_ms = time_ms(&runtime, calls.min(5), || {
+        let mut cache = runtime.scratch_cache(super::CONTEXT_POSITIONS).unwrap();
+        runtime
+            .trunk()
+            .forward(&mut [MingForwardRow {
+                embeds: &embeds,
+                cache: &mut cache,
+            }])
+            .unwrap();
+    });
+    eprintln!(
+        "prefill ({} positions): {prefill_ms:.1} ms",
+        prompt.positions
+    );
+
+    // A sentence end to end; its latents feed the VAE timing below.
+    let mut cache = runtime.scratch_cache(super::CONTEXT_POSITIONS).unwrap();
+    let started = std::time::Instant::now();
+    let output = runtime
+        .generate_physical(&request, &params(11), &mut cache)
+        .unwrap();
+    let wall = started.elapsed().as_secs_f64();
+    let audio = output.samples.len() as f64 / f64::from(SAMPLE_RATE);
+    write_wav("bench_end_to_end", &output.samples);
+    eprintln!(
+        "end to end: {} latents, {audio:.2} s of audio in {wall:.2} s, RTF {:.2} \
+         (lm+flow {:.0} ms = {:.1} ms/latent, codec {:.0} ms)",
+        output.latents,
+        wall / audio,
+        output.lm_ms,
+        f64::from(output.lm_ms) / output.latents as f64,
+        output.codec_ms,
+    );
+
+    let hidden: Vec<f32> = (0..hidden_size)
+        .map(|index| ((index as f32) * 0.37).sin())
+        .collect();
+    let history = vec![0.1f32; LATENT_DIM];
+    let noise = vec![0.5f32; LATENT_DIM];
+    let flow_ms = time_ms(&runtime, calls, || {
+        runtime
+            .sample_latent(&hidden, &history, &noise, DEFAULT_GUIDANCE)
+            .unwrap();
+    });
+    let aggregator_ms = time_ms(&runtime, calls, || {
+        runtime.latent_embeddings(&history).unwrap();
+    });
+    let stop_ms = time_ms(&runtime, calls, || {
+        runtime.stops_at(&hidden, 10);
+    });
+    eprintln!("flow head (10 steps, CFG batch 2): {flow_ms:.1} ms");
+    eprintln!("aggregator: {aggregator_ms:.1} ms; stop head: {stop_ms:.2} ms");
+
+    for width in [1usize, 2, 4] {
+        let mut caches = (0..width)
+            .map(|_| {
+                let mut cache = runtime.scratch_cache(super::CONTEXT_POSITIONS).unwrap();
+                runtime
+                    .trunk()
+                    .forward(&mut [MingForwardRow {
+                        embeds: &embeds,
+                        cache: &mut cache,
+                    }])
+                    .unwrap();
+                cache
+            })
+            .collect::<Vec<_>>();
+        let next = runtime.latent_embeddings(&history).unwrap();
+        // Each call appends a position; stay inside the context.
+        let room = super::CONTEXT_POSITIONS - prompt.positions - 1;
+        let width_calls = calls.min(room / 3);
+        let step_ms = time_ms(&runtime, width_calls, || {
+            let mut rows = caches
+                .iter_mut()
+                .map(|cache| MingForwardRow {
+                    embeds: &next,
+                    cache,
+                })
+                .collect::<Vec<_>>();
+            runtime.trunk().forward_batch(&mut rows).unwrap();
+        });
+        eprintln!(
+            "language-model step, {width} row(s): {step_ms:.1} ms ({:.1} ms/row)",
+            step_ms / width as f64
+        );
+    }
+
+    // The VAE's cost does not depend on the values: the sentence's latent
+    // count of stand-ins.
+    let latents = (0..output.latents * LATENT_DIM)
+        .map(|index| ((index as f32) * 0.11).sin())
+        .collect::<Vec<_>>();
+    let latents = &latents;
+    let window_ms = {
+        let count = output.latents;
+        let started = std::time::Instant::now();
+        let mut stream = MingAudioStream::default();
+        let mut windows = 0;
+        while let Some(window) = stream.next_window(count, true) {
+            stream.decode(runtime.decoder(), latents, window).unwrap();
+            windows += 1;
+        }
+        runtime.device().synchronize().unwrap();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "VAE: {count} latents in {windows} window(s), {ms:.1} ms ({:.1} ms/latent)",
+            ms / count as f64
+        );
+        ms / count as f64
+    };
+    let per_latent = flow_ms + aggregator_ms + stop_ms + window_ms;
+    eprintln!(
+        "per latent excluding the language model: {per_latent:.1} ms; 80 ms of audio per latent"
+    );
+}

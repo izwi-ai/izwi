@@ -7,6 +7,7 @@ VibeVoice-1.5B
 FishAudio-S2-Pro
 FishAudio-Drama-3
 Audio8-TTS-Realistic-Air
+Ming-3.0-tts-0.5B
 Chatterbox-500M
 Parakeet-TDT-0.6B-v3
 Whisper-Large-v3-Turbo

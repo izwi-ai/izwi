@@ -86,6 +86,21 @@ text = "Continuous audio batching should remain responsive and clear."
 [benchmarks.matrix]
 concurrent = [1, 2, 4, 8]
 
+# Ming 3.0 TTS speaks one built-in voice; every request's flow-head noise
+# comes from its own seed.
+[[benchmarks]]
+name = "ming-tts-cpu-concurrency"
+command = "tts"
+model = "Ming-3.0-tts-0.5B"
+speaker = "US_Emma"
+iterations = 8
+warmup = true
+stream = true
+text = "Continuous audio batching should remain responsive and clear."
+
+[benchmarks.matrix]
+concurrent = [1, 2, 4, 8]
+
 # Chatterbox streams windows while T3 runs; each re-runs the S3Gen flow over
 # the reference prompt, so its first audio comes after the first window.
 [[benchmarks]]
