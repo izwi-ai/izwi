@@ -13,6 +13,10 @@
     {"input": "It weighs 1 kg and it is 20°C outside.", "expected": "It weighs one kilogram and it is twenty degrees Celsius outside."},
     {"input": "Pi is 3.14 and the low was -5.", "expected": "Pi is three point one four and the low was minus five."},
     {"input": "He finished 21st of 1,000,000 runners.", "expected": "He finished twenty-first of one million runners."},
-    {"input": "Play the MP3 in 4K on v1.2.", "expected": "Play the MP3 in 4K on v1.2."}
+    {"input": "Play the MP3 in 4K on v1.2.", "expected": "Play the MP3 in 4K on v1.2."},
+    {"input": "roughly 2,800 of them are worth over $10m. about 600 are worth over $100m", "expected": "roughly two thousand eight hundred of them are worth over ten million dollars. about six hundred are worth over one hundred million dollars"},
+    {"input": "A $2.5bn round and a $300K grant.", "expected": "A two point five billion dollars round and a three hundred thousand dollars grant."},
+    {"input": "It sold for £3M, then €1.2tn.", "expected": "It sold for three million pounds, then one point two trillion euros."},
+    {"input": "She ran 10m and paid $5mm.", "expected": "She ran 10m and paid $5mm."}
   ]
 }

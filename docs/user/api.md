@@ -531,6 +531,10 @@ out of range returns `400`.
 - Text longer than about 12 s of speech is spoken in segments. Without a
   reference, later segments clone the first segment's voice, so a built-in
   or described voice stays the same voice throughout.
+- English text speaks numbers, currency (`$10m` as "ten million dollars"),
+  dates, times and units as words by default, whatever the voice; Chinese
+  text is read as written. Set `normalize_text: false` to send the text as
+  written.
 - One control per request: `emotion` (`neutral`, `happy`, `sad`, `angry`,
   `fearful`, `disgusted`, `surprised`), `dialect` (`cantonese`,
   `sichuanese`), the levels `speaking_rate`, `pitch` and `volume` (`low`,
