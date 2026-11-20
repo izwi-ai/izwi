@@ -667,3 +667,56 @@ fn requests_together_match_each_alone_on_the_checkpoint() {
         );
     }
 }
+
+/// Speaker similarity between stretches of WAV files (a diagnostic; it
+/// asserts nothing). `IZWI_MING_TTS_VOICE_WAVS` lists `path:start-end,...`
+/// (seconds) entries separated by `;`; each stretch is embedded with CAM++
+/// and compared with every other stretch of its file.
+#[test]
+#[ignore = "needs the Ming-3.0-tts-0.5B checkpoint"]
+fn voice_identity_across_stretches() {
+    let Ok(spec) = std::env::var("IZWI_MING_TTS_VOICE_WAVS") else {
+        eprintln!("set IZWI_MING_TTS_VOICE_WAVS");
+        return;
+    };
+    let speaker = CampPlus::open(&model_dir().join(SPEAKER_WEIGHTS_FILE)).unwrap();
+    let cosine = |a: &[f32], b: &[f32]| {
+        let dot = a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (norm(a) * norm(b))
+    };
+    for entry in spec.split(';').filter(|entry| !entry.trim().is_empty()) {
+        let (path, windows) = entry.rsplit_once(':').unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        // 16-bit mono PCM: find the `data` chunk.
+        let rate = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        let data = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
+        let samples = bytes[data..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| f32::from(i16::from_le_bytes(*pair)) / 32768.0)
+            .collect::<Vec<_>>();
+        let stretches = windows
+            .split(',')
+            .map(|window| {
+                let (start, end) = window.split_once('-').unwrap();
+                let at = |s: &str| (s.parse::<f32>().unwrap() * rate as f32) as usize;
+                let (start, end) = (at(start), at(end).min(samples.len()));
+                (
+                    window.to_string(),
+                    speaker.embed_clip(&samples[start..end], rate).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        eprintln!("{path}");
+        for (name, a) in &stretches {
+            let row = stretches
+                .iter()
+                .map(|(_, b)| format!("{:5.2}", cosine(a, b)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("  {name:>12}: {row}");
+        }
+    }
+}

@@ -211,6 +211,28 @@ diagnostics report the result (`dtype`, `flow_dtype`, `vae_dtype`).
 largest values on the test device. RMSNorm statistics are F32 everywhere:
 `eps` 1e-6 is below F16's smallest normal number.
 
+## Long text
+
+The server cuts text longer than one request into segments of whole
+sentences of at most 160 characters, a CJK character counting three (about
+12 s of speech: `api/tts_policy.rs`), on every speech route, the durable
+one included. Each segment is its own request.
+
+A built-in voice or a description is a caption: each request samples a
+voice that fits it, so a long text changed speaker at every segment (on
+灵语汐 the second segment of a three-segment text measured 0.45-0.62 speaker
+similarity to the first, about what two different voices give). When the
+request brings no reference, the first segment's audio and text become the
+reference of the rest (`SegmentVoiceAnchor`, `FirstSegmentVoice` in
+`api/tts_long_form.rs`): later segments clone it with its latents in the
+prompt, keep any single control (an emotion, say) and drop a description.
+Segments then measure 0.85-0.92 to the first. The speaker embedding alone,
+without the transcript, held the voice no better than before. A first
+segment under 1 s or over 20 s is not used, and the next one is. Later
+segments wait for the first and still run side by side with each other.
+`voice_identity_across_stretches` (an ignored reference test) prints CAM++
+similarities between stretches of WAV files.
+
 ## Kernels and CUDA graphs
 
 - Norms are `kernels::residual_norm` (one launch, F32 statistics, an F32

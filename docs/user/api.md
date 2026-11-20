@@ -528,6 +528,9 @@ out of range returns `400`.
   `instructions`. Without any, the default voice of the text's language
   speaks. A reference must last at least 1 s, and at most 20 s with a
   transcript.
+- Text longer than about 12 s of speech is spoken in segments. Without a
+  reference, later segments clone the first segment's voice, so a built-in
+  or described voice stays the same voice throughout.
 - One control per request: `emotion` (`neutral`, `happy`, `sad`, `angry`,
   `fearful`, `disgusted`, `surprised`), `dialect` (`cantonese`,
   `sichuanese`), the levels `speaking_rate`, `pitch` and `volume` (`low`,

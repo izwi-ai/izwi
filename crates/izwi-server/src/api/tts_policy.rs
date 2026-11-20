@@ -7,16 +7,14 @@ use izwi_core::runtime_models::architectures::chatterbox::{
 use izwi_core::runtime_models::architectures::fish_drama3::model::auto_frame_budget as fish_drama3_auto_frame_budget;
 use izwi_core::runtime_models::architectures::fish_drama3::prompt as fish_drama3_prompt;
 use izwi_core::runtime_models::architectures::fish_s2::contracts::CONTROL_TOKENS as FISH_S2_CONTROL_TOKENS;
-use izwi_core::runtime_models::architectures::maya1::{
-    maya1_auto_max_new_tokens, prompt::validate_inline_tags,
-};
 use izwi_core::runtime_models::architectures::lfm3_audio::{
     lfm3_audio_tts_auto_max_frames, prompts::tts_locale as lfm3_audio_tts_locale,
 };
-use izwi_core::runtime_models::architectures::maya2::resolve_language as maya2_language;
-pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::{
-    qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text,
+use izwi_core::runtime_models::architectures::maya1::{
+    maya1_auto_max_new_tokens, prompt::validate_inline_tags,
 };
+use izwi_core::runtime_models::architectures::maya2::resolve_language as maya2_language;
+pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::qwen3::tts::qwen3_tts_auto_max_output_frames;
 use izwi_core::runtime_models::architectures::vibevoice::tts::{
     vibevoice_tts_auto_max_frames_for_text, vibevoice_tts_auto_max_output_frames,
@@ -357,7 +355,10 @@ pub(crate) fn validate_speech_controls(
             ("pitch", &sampling.pitch),
             ("volume", &sampling.volume),
         ] {
-            if value.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+            if value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
                 return Err(crate::error::ApiError::bad_request(format!(
                     "{variant} does not support `{name}`; omit it"
                 )));
@@ -375,13 +376,15 @@ pub(crate) const MING_TTS_SEGMENT_MAX_CHARS: usize = 160;
 
 /// `text`'s length for [`MING_TTS_SEGMENT_MAX_CHARS`].
 pub(crate) fn ming_tts_weighted_chars(text: &str) -> usize {
-    text.trim()
-        .chars()
-        .map(|c| match c {
-            '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}' | '\u{ac00}'..='\u{d7af}' => 3,
-            _ => 1,
-        })
-        .sum()
+    text.trim().chars().map(ming_tts_char_weight).sum()
+}
+
+/// One character's weight for [`MING_TTS_SEGMENT_MAX_CHARS`].
+pub(crate) fn ming_tts_char_weight(c: char) -> usize {
+    match c {
+        '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}' | '\u{ac00}'..='\u{d7af}' => 3,
+        _ => 1,
+    }
 }
 
 /// Maya 2 Native long-form segments: whole sentences up to about 20 s of
@@ -1075,22 +1078,28 @@ mod tests {
         assert_eq!(options.emotion.as_deref(), Some("happy"));
 
         for language in [None, Some("de"), Some("zh-CN"), Some("Japanese"), Some(" ")] {
-            assert!(validate_speech_language(ming, language).is_ok(), "{language:?}");
+            assert!(
+                validate_speech_language(ming, language).is_ok(),
+                "{language:?}"
+            );
         }
         let error = validate_speech_language(ming, Some("it")).unwrap_err();
-        assert!(error.message.contains("does not speak"), "{}", error.message);
+        assert!(
+            error.message.contains("does not speak"),
+            "{}",
+            error.message
+        );
 
         // A voice of every kind: named, cloned (transcript optional),
         // described, or none.
-        let voice = |speaker, reference_audio, reference_text, voice_description| {
-            SpeechVoiceRequest {
+        let voice =
+            |speaker, reference_audio, reference_text, voice_description| SpeechVoiceRequest {
                 speaker,
                 reference_audio,
                 reference_text,
                 voice_description,
                 saved_voice: false,
-            }
-        };
+            };
         for request in [
             voice(false, false, false, false),
             voice(true, false, false, false),
@@ -1193,7 +1202,10 @@ mod tests {
             let Some(capabilities) = variant.speech_capabilities() else {
                 continue;
             };
-            assert!(validate_speech_streaming(variant, false).is_ok(), "{variant}");
+            assert!(
+                validate_speech_streaming(variant, false).is_ok(),
+                "{variant}"
+            );
             match validate_speech_streaming(variant, true) {
                 Ok(()) => assert!(capabilities.supports_streaming, "{variant}"),
                 Err(error) => {

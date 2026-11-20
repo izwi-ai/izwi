@@ -24,7 +24,9 @@ use crate::api::idempotency::{
 use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
-use crate::api::tts_long_form::{expand_generation_requests_for_long_form, generate_long_form_tts};
+use crate::api::tts_long_form::{
+    expand_generation_requests_for_long_form, generate_long_form_tts, SegmentVoiceAnchor,
+};
 #[cfg(test)]
 use crate::api::tts_policy::qwen_tts_auto_max_frames_for_text;
 use crate::api::tts_policy::resolve_tts_output_frames;
@@ -2488,7 +2490,18 @@ async fn stream_record_creation(
         // not the take: generation runs on into the record, which the history
         // page shows when it is ready. Cancel stops it (`speech_stream_tasks`).
         let mut client_gone = false;
-        for (request_index, request) in planned_requests.into_iter().enumerate() {
+        // A model that picks its own voice (Ming 3.0 TTS) speaks the later
+        // segments with the first one's (a segment-planning model anchors
+        // inside its plan).
+        let mut voice_anchor = match planned_requests.first() {
+            Some(first) if planned_requests.len() > 1 && !variant.plans_own_speech_segments() => {
+                SegmentVoiceAnchor::for_request(variant, first)
+            }
+            _ => SegmentVoiceAnchor::Off,
+        };
+        for (request_index, mut request) in planned_requests.into_iter().enumerate() {
+            voice_anchor.apply(&mut request);
+            let segment_text = request.text.clone();
             // A later long-form segment opens with a short pause and fades in
             // (TPIPE-5); its predecessor's PCM is already sent.
             let mut pause_pending = request_index > 0;
@@ -2559,6 +2572,7 @@ async fn stream_record_creation(
                     }
                 };
 
+                voice_anchor.collect(&chunk.samples, chunk_sample_rate);
                 let chunk = if pause_pending && !chunk.samples.is_empty() {
                     pause_pending = false;
                     AudioChunk {
@@ -2689,7 +2703,15 @@ async fn stream_record_creation(
             }
 
             match generation_outcome {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    if let Err(err) = voice_anchor.finish_segment(&segment_text) {
+                        tracing::warn!(
+                            record_id = %placeholder_record_id,
+                            error = %err,
+                            "Long-form voice anchor could not be kept"
+                        );
+                    }
+                }
                 Ok(Err(err)) => {
                     failed = true;
                     failure_message = Some(err.to_string());
