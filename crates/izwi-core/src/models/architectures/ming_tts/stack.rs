@@ -20,6 +20,7 @@ use candle_nn::VarBuilder;
 
 use super::config::MingStackConfig;
 use crate::error::{Error, Result};
+use crate::kernels::cuda::stretch_graphs::StretchGraphs;
 use crate::kernels::residual_norm;
 use crate::models::shared::attention::mixed::{
     MixedRowLayout, MixedRowSpan, PreparedPhysicalMixedStep,
@@ -306,6 +307,9 @@ pub struct MingTrunk {
     rope_cos: Tensor,
     rope_sin: Tensor,
     max_positions: usize,
+    /// On CUDA, the decode step's stretches as graphs (see
+    /// [`Self::forward`]), or why there are none.
+    graphs: std::result::Result<StretchGraphs, String>,
 }
 
 impl MingTrunk {
@@ -330,6 +334,12 @@ impl MingTrunk {
             dtype,
             &device,
         )?;
+        let graphs = StretchGraphs::resolve(
+            "Ming TTS language model",
+            super::graphs::MING_TTS_DECODE_GRAPHS_ENV,
+            &device,
+            cfg.num_hidden_layers + 1,
+        );
         Ok(Self {
             cfg,
             dtype,
@@ -340,6 +350,7 @@ impl MingTrunk {
             rope_cos,
             rope_sin,
             max_positions,
+            graphs,
         })
     }
 
@@ -353,6 +364,14 @@ impl MingTrunk {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The decode-step graphs' state and counters, for the diagnostics.
+    pub fn decode_graphs_diagnostics(&self) -> serde_json::Value {
+        match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        }
     }
 
     pub fn max_positions(&self) -> usize {
@@ -483,9 +502,43 @@ impl MingTrunk {
                 .map(|group| group.iter().map(|&i| &*rows[i].cache).collect::<Vec<_>>())
                 .collect::<Vec<_>>();
             let scale = 1.0 / (cfg.head_dim as f32).sqrt();
-            for (index, layer) in self.layers.iter().enumerate() {
-                let tokens = hidden.dim(0)?;
-                let (q, k, v) = layer.qkv(&hidden, &cos, &sin, cfg, rows_independent)?;
+            let tokens = hidden.dim(0)?;
+            // The layers run as `layers + 1` stretches around the paged
+            // attention: the first layer's norm, projections and rotation;
+            // then each layer's residual branches with the next layer's
+            // projections; then the last layer's residual branches. On CUDA
+            // a decode step (one position a row) at a graphed width replays
+            // each stretch as a graph, captured and checked bit for bit
+            // against the eager stretch first; elsewhere the stretches run
+            // as they are, in the same order.
+            let decode_step = spans.iter().all(|span| span.q_len == 1);
+            let mut run = match &self.graphs {
+                Ok(graphs) if decode_step => graphs.begin(tokens),
+                _ => None,
+            };
+            let mut stretch = |index: usize,
+                               inputs: Vec<Tensor>,
+                               body: &dyn Fn(&[Tensor]) -> Result<Vec<Tensor>>|
+             -> Result<Vec<Tensor>> {
+                match run.as_mut() {
+                    Some(run) => run.run(index, &inputs, body),
+                    None => body(&inputs),
+                }
+            };
+            let first = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                let (q, k, v) = self.layers[0].qkv(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    cfg,
+                    rows_independent,
+                )?;
+                Ok(vec![q, k, v])
+            };
+            let mut qkv = stretch(0, vec![hidden.clone(), cos.clone(), sin.clone()], &first)?;
+            let last_layer = self.layers.len() - 1;
+            for index in 0..self.layers.len() {
+                let (q, k, v) = (&qkv[0], &qkv[1], &qkv[2]);
                 let mut outputs = Vec::with_capacity(steps.len());
                 let mut offset = 0usize;
                 for ((step, group), &count) in steps.iter_mut().zip(&caches).zip(&group_tokens) {
@@ -493,9 +546,9 @@ impl MingTrunk {
                     outputs.push(step.write_and_attend(
                         group,
                         index,
-                        &slice(&q)?,
-                        &slice(&k)?,
-                        &slice(&v)?,
+                        &slice(q)?,
+                        &slice(k)?,
+                        &slice(v)?,
                         scale,
                         None,
                         None,
@@ -506,13 +559,34 @@ impl MingTrunk {
                     outputs.pop().expect("one group")
                 } else {
                     Tensor::cat(&outputs, 0)?
+                }
+                .reshape((tokens, cfg.q_out()))?;
+                let layer = &self.layers[index];
+                if index == last_layer {
+                    let tail = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                        Ok(vec![layer.finish(
+                            &inputs[0],
+                            &inputs[1],
+                            cfg,
+                            rows_independent,
+                        )?])
+                    };
+                    hidden = stretch(index + 1, vec![hidden, attn], &tail)?.remove(0);
+                    break;
+                }
+                let next = &self.layers[index + 1];
+                let between = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                    let x = layer.finish(&inputs[0], &inputs[1], cfg, rows_independent)?;
+                    let (q, k, v) = next.qkv(&x, &inputs[2], &inputs[3], cfg, rows_independent)?;
+                    Ok(vec![x, q, k, v])
                 };
-                hidden = layer.finish(
-                    &hidden,
-                    &attn.reshape((tokens, cfg.q_out()))?,
-                    cfg,
-                    rows_independent,
+                let mut outputs = stretch(
+                    index + 1,
+                    vec![hidden, attn, cos.clone(), sin.clone()],
+                    &between,
                 )?;
+                hidden = outputs.remove(0);
+                qkv = outputs;
             }
             // Last position of each row, back in row order.
             let mut offsets = vec![0usize; rows.len()];
@@ -1072,7 +1146,10 @@ pub(crate) mod tests {
         let (cos, sin) = rope_table(&freqs, 7, 5, 4, DType::F32, &Device::Cpu).unwrap();
         let fused = host(&rope_tokens(&x, &cos, &sin).unwrap());
         let spelled = host(&rotate_half_split(&x, &cos, &sin).unwrap());
-        assert!(max_diff(&fused, &spelled) < 1e-6, "{fused:?} vs {spelled:?}");
+        assert!(
+            max_diff(&fused, &spelled) < 1e-6,
+            "{fused:?} vs {spelled:?}"
+        );
     }
 
     #[test]
@@ -1084,6 +1161,9 @@ pub(crate) mod tests {
         let fused = host(&norm_f32(&x, &gain, 1e-6).unwrap());
         let spelled = host(&rms_norm(&x, &gain, 1e-6).unwrap());
         assert!(fused.iter().all(|value| value.is_finite()));
-        assert!(max_diff(&fused, &spelled) < 1e-5, "{fused:?} vs {spelled:?}");
+        assert!(
+            max_diff(&fused, &spelled) < 1e-5,
+            "{fused:?} vs {spelled:?}"
+        );
     }
 }

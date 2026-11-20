@@ -1566,6 +1566,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Allows Metal SDPA for masked attention when the mask shape is supported.",
     ),
     CoreEnvVar::new(
+        "IZWI_MING_TTS_DECODE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, a Ming-3.0-tts decode step of 1 to 4 or 8 rows runs its language model as CUDA graphs of the work between two layers' paged attention (the residual branches, norms and the next layer's projections and rotation), captured per row count and checked bit for bit against the eager stretch before replaying; attention stays eager. Any graph failure keeps every step eager. Any false value, or cuda.decode_graphs=off, turns them off; `decode_graphs` in the model diagnostics reports why they are off, captures and replays.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MING_TTS_FLOW_GRAPHS",
         Flag,
         "true",

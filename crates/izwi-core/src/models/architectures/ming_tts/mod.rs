@@ -521,6 +521,12 @@ impl MingRuntime {
         self.graphs.diagnostics()
     }
 
+    /// The language model's decode-step CUDA graphs: their state and
+    /// counters.
+    pub fn decode_graphs_diagnostics(&self) -> serde_json::Value {
+        self.trunk.decode_graphs_diagnostics()
+    }
+
     pub fn model_dir(&self) -> &Path {
         &self.model_dir
     }

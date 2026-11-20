@@ -54,6 +54,8 @@ pub struct MingTtsDiagnostics {
     pub voice_cloning: bool,
     /// The flow path's CUDA graphs: why they are off, or their counters.
     pub flow_graphs: serde_json::Value,
+    /// The language model's decode-step CUDA graphs, likewise.
+    pub decode_graphs: serde_json::Value,
 }
 
 /// What one audio-window quantum did.
@@ -172,6 +174,7 @@ impl MingTtsModel {
             vae_window_keys: self.runtime.decoder().window_keys(),
             voice_cloning: self.runtime.can_clone_voices(),
             flow_graphs: self.runtime.flow_graphs_diagnostics(),
+            decode_graphs: self.runtime.decode_graphs_diagnostics(),
         }
     }
 

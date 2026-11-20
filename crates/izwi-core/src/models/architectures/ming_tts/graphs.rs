@@ -30,6 +30,10 @@ fn flow_graphs_requested() -> bool {
     ON.get()
 }
 
+/// Kill switch for the language model's decode-step graphs (a boolean; on
+/// when unset). The global `IZWI_CUDA_DECODE_GRAPHS=off` turns them off too.
+pub(crate) const MING_TTS_DECODE_GRAPHS_ENV: &str = "IZWI_MING_TTS_DECODE_GRAPHS";
+
 const MIB: u64 = 1024 * 1024;
 
 /// What the graphs may hold: the sampler and the aggregator at the loaded
