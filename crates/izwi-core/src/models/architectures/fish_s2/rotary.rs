@@ -187,6 +187,13 @@ impl FishS2RotaryCache {
                 x.dtype()
             )));
         }
+        // On CUDA one launch in this layout, the same F32 rotation rounded
+        // once (`rope_pairs`); elsewhere Candle's rope_i in F32.
+        if crate::kernels::cuda::rope_pairs::serves(x.device(), x.dtype())
+            && cos.dtype() == DType::F32
+        {
+            return Ok(crate::kernels::cuda::rope_pairs::rotate(x, cos, sin)?);
+        }
         let input = x.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
         let rotated = candle_nn::rotary_emb::rope_i(&input, cos, sin)?;
         rotated

@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/kernels/cuda/transducer_greedy.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/small_attention.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/bias_rows.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/rope_pairs.cu");
 
     println!("cargo::rustc-check-cfg=cfg(izwi_cublas_grouped)");
 
@@ -73,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "src/kernels/cuda/transducer_greedy.cu",
             "src/kernels/cuda/small_attention.cu",
             "src/kernels/cuda/bias_rows.cu",
+            "src/kernels/cuda/rope_pairs.cu",
         ])
         .arg("-std=c++17")
         .arg("-O3")
