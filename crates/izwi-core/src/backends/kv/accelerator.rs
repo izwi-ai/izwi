@@ -3213,6 +3213,12 @@ fn update_u32_tensor(
             "injected attention metadata update failure".into(),
         ));
     }
+    if device.is_cuda() {
+        // One copy of the whole (small) table: each upload can wait on the
+        // stream, and a scattered diff cost two uploads and a kernel.
+        crate::kernels::cuda::kv_rows::overwrite_u32(&destination.flatten_all()?, next)?;
+        return Ok(true);
+    }
     let indices = accelerator_indices(&indices, device)?;
     let value_count = values.len();
     let values = Tensor::from_vec(values, value_count, device)?;

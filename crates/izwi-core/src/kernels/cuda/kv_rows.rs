@@ -201,6 +201,60 @@ impl InplaceOp3 for KvWriteRows {
     }
 }
 
+/// Overwrite every element of the contiguous u32 `tensor` with `values`, in
+/// place: on CUDA one host-to-device copy into the existing buffer (a diff
+/// scattered through uploaded indices and values cost two uploads and a
+/// kernel). Candle routes the copy through its graph-capture cache, as it
+/// does for any upload.
+pub fn overwrite_u32(tensor: &Tensor, values: &[u32]) -> Result<()> {
+    if tensor.dtype() != candle_core::DType::U32 || tensor.elem_count() != values.len() {
+        bail!(
+            "izwi-overwrite-u32: {:?} {:?} tensor, {} values",
+            tensor.dims(),
+            tensor.dtype(),
+            values.len()
+        )
+    }
+    tensor.inplace_op1(&OverwriteU32 {
+        values: values.to_vec(),
+    })
+}
+
+struct OverwriteU32 {
+    values: Vec<u32>,
+}
+
+impl candle_core::InplaceOp1 for OverwriteU32 {
+    fn name(&self) -> &'static str {
+        "izwi-overwrite-u32"
+    }
+
+    fn cpu_fwd(&self, storage: &mut CpuStorage, layout: &Layout) -> Result<()> {
+        let CpuStorage::U32(data) = storage else {
+            bail!("izwi-overwrite-u32 takes a u32 tensor")
+        };
+        let Some((start, end)) = layout.contiguous_offsets() else {
+            bail!("izwi-overwrite-u32 takes a contiguous tensor")
+        };
+        data[start..end].copy_from_slice(&self.values);
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(&self, storage: &mut candle_core::CudaStorage, layout: &Layout) -> Result<()> {
+        use candle_core::cuda_backend::CudaStorageSlice;
+        let Some((start, end)) = layout.contiguous_offsets() else {
+            bail!("izwi-overwrite-u32 takes a contiguous tensor")
+        };
+        let device = storage.device.clone();
+        let CudaStorageSlice::U32(data) = &mut storage.slice else {
+            bail!("izwi-overwrite-u32 takes a u32 tensor")
+        };
+        let mut view = data.slice_mut(start..end);
+        device.memcpy_htod(self.values.as_slice(), &mut view)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +297,15 @@ mod tests {
         for dtype in [DType::F32, DType::BF16, DType::F16] {
             check(&Device::Cpu, dtype);
         }
+    }
+
+    #[test]
+    fn overwrite_replaces_every_element_in_place() {
+        let tensor = Tensor::new(&[1u32, 2, 3, 4], &Device::Cpu).unwrap();
+        let alias = tensor.clone();
+        overwrite_u32(&tensor, &[9, 8, 7, 6]).unwrap();
+        assert_eq!(alias.to_vec1::<u32>().unwrap(), [9, 8, 7, 6]);
+        assert!(overwrite_u32(&tensor, &[1, 2]).is_err());
     }
 
     #[test]
