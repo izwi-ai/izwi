@@ -196,6 +196,15 @@ pub(crate) struct MingVaePending {
     last: bool,
 }
 
+/// A window read back to the host ([`MingVaeDecoder::read_back`]): what the
+/// inverse STFT needs, with no device work left.
+pub(crate) struct MingVaeHostWindow {
+    /// The head's frames, [frames, 2 * bins] row-major F32.
+    head: Option<Vec<f32>>,
+    ready: usize,
+    last: bool,
+}
+
 impl MingVaeDecoder {
     /// Load the decoder from `vb` (rooted at `audio.decoder`). On CUDA its
     /// windows run at the fixed shape, their graph off until
@@ -458,7 +467,34 @@ impl MingVaeDecoder {
         state: &mut MingVaeDecodeState,
         pending: MingVaePending,
     ) -> Result<Vec<f32>> {
+        let host = self.read_back(pending)?;
+        self.finish_host(state, host)
+    }
+
+    /// Reads a queued window's head back to the host: the device half of
+    /// [`Self::finish`], which must run on the thread that owns the device.
+    pub(crate) fn read_back(&self, pending: MingVaePending) -> Result<MingVaeHostWindow> {
         let MingVaePending { head, ready, last } = pending;
+        let head = head
+            .map(|head| -> Result<Vec<f32>> {
+                Ok(head
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?)
+            })
+            .transpose()?;
+        Ok(MingVaeHostWindow { head, ready, last })
+    }
+
+    /// The host half of [`Self::finish`]: the inverse STFT of a read-back
+    /// window and the samples it settles. Touches no device memory, so the
+    /// windows of several requests can run on separate threads.
+    pub(crate) fn finish_host(
+        &self,
+        state: &mut MingVaeDecodeState,
+        host: MingVaeHostWindow,
+    ) -> Result<Vec<f32>> {
+        let MingVaeHostWindow { head, ready, last } = host;
         if state.latents() == 0 {
             if last {
                 state.finished = true;
@@ -466,10 +502,6 @@ impl MingVaeDecoder {
             return Ok(Vec::new());
         }
         if let Some(head) = head {
-            let head = head
-                .to_device(&Device::Cpu)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
             if head.iter().any(|value| !value.is_finite()) {
                 return Err(Error::InferenceError(
                     "Ming VAE decoder produced a non-finite spectrum".into(),

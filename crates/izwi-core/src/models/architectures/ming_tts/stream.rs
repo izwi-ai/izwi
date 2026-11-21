@@ -163,6 +163,23 @@ impl MingAudioStream {
         Ok(out)
     }
 
+    /// [`Self::finish`] for a window already read back to the host
+    /// ([`MingVaeDecoder::read_back`]): host work only.
+    pub(crate) fn finish_host(
+        &mut self,
+        decoder: &MingVaeDecoder,
+        host: super::vae::MingVaeHostWindow,
+        window: MingWindow,
+    ) -> Result<Vec<f32>> {
+        let decoded = decoder.finish_host(&mut self.vae, host)?;
+        let mut out = self.trim.push(&decoded);
+        if window.last {
+            out.extend(self.trim.finish());
+        }
+        self.samples += out.len();
+        Ok(out)
+    }
+
     /// Whether the last window has run.
     pub(crate) fn done(&self) -> bool {
         self.vae.finished()

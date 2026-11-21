@@ -338,19 +338,44 @@ pub(crate) fn ming_audio_batch(
             None => None,
         });
     }
-    let mut out = Vec::with_capacity(states.len());
-    for (state, queued) in states.iter_mut().zip(queued) {
-        out.push(match queued {
-            Some((window, pending)) => {
-                let istft = Instant::now();
-                let samples = state.audio.finish(decoder, pending, window)?;
-                state.timings.istft_ms += elapsed_ms(istft);
-                state.timings.windows += 1;
-                Some(samples)
-            }
+    // Each window is read back on this (the device's) thread, then the
+    // inverse STFTs, pure host work, run on the worker pool side by side: one
+    // after another they held the device thread for about 5 ms a request,
+    // so the GPU sat idle for most of a wide audio quantum.
+    let mut read = Vec::with_capacity(queued.len());
+    for queued in queued {
+        read.push(match queued {
+            Some((window, pending)) => Some((window, decoder.read_back(pending)?)),
             None => None,
         });
     }
+    let finish = |state: &mut MingRetainedState,
+                  read: Option<(MingWindow, super::vae::MingVaeHostWindow)>|
+     -> Result<Option<Vec<f32>>> {
+        let Some((window, host)) = read else {
+            return Ok(None);
+        };
+        let istft = Instant::now();
+        let samples = state.audio.finish_host(decoder, host, window)?;
+        state.timings.istft_ms += elapsed_ms(istft);
+        state.timings.windows += 1;
+        Ok(Some(samples))
+    };
+    let due = read.iter().filter(|read| read.is_some()).count();
+    let out = if due > 1 {
+        use rayon::prelude::*;
+        states
+            .par_iter_mut()
+            .zip(read)
+            .map(|(state, read)| finish(state, read))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        states
+            .iter_mut()
+            .zip(read)
+            .map(|(state, read)| finish(state, read))
+            .collect::<Result<Vec<_>>>()?
+    };
     let elapsed = elapsed_ms(started);
     for (state, samples) in states.iter_mut().zip(&out) {
         if samples.is_some() {
