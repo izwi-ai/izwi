@@ -704,9 +704,16 @@ pub(super) struct RumbleAsrExecutionAdapter {
     pub(super) max_batch_size: usize,
     /// The continuous decode's width, at least `max_batch_size`.
     pub(super) decode_batch_size: usize,
+    /// The encoder preparation's width: on CUDA the decode width up to
+    /// [`RUMBLE_CUDA_ENCODER_MAX_WIDTH`] (a wide tower pass costs little
+    /// more than a narrow one there), elsewhere the engine rows.
+    pub(super) encoder_batch_size: usize,
     pub(super) retained_route: bool,
     pub(super) seal: OnceLock<RumbleAsrExecutionSeal>,
 }
+
+/// The widest Rumble encoder pass on CUDA.
+pub(super) const RUMBLE_CUDA_ENCODER_MAX_WIDTH: usize = 32;
 
 impl RumbleAsrExecutionAdapter {
     pub(super) fn new(
@@ -726,6 +733,7 @@ impl RumbleAsrExecutionAdapter {
             backend_kind,
             max_batch_size: max_batch_size.max(1),
             decode_batch_size: max_batch_size.max(1),
+            encoder_batch_size: max_batch_size.max(1),
             retained_route: crate::models::architectures::rumble::rumble_retained_decode_enabled(
                 backend_kind,
             ),
@@ -733,10 +741,16 @@ impl RumbleAsrExecutionAdapter {
         }
     }
 
-    /// Decode up to `rows` rows per step; the encoder preparation keeps the
-    /// width the adapter was built with.
+    /// Decode up to `rows` rows per step. On CUDA the encoder preparation
+    /// widens with it, up to [`RUMBLE_CUDA_ENCODER_MAX_WIDTH`]; elsewhere it
+    /// keeps the width the adapter was built with.
     pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
         self.decode_batch_size = rows.max(self.max_batch_size);
+        self.encoder_batch_size = if self.backend_kind == BackendKind::Cuda {
+            rows.min(RUMBLE_CUDA_ENCODER_MAX_WIDTH).max(self.max_batch_size)
+        } else {
+            self.max_batch_size
+        };
         self
     }
 
@@ -854,6 +868,7 @@ impl LoadedExecutionAdapter for RumbleAsrExecutionAdapter {
                     max_work_units: 10_000,
                     max_materialized_tensor_elements_per_row: 2_000_000,
                     max_workspace_bytes: 1024 * 1024 * 1024,
+                    workspace_base_bytes: 0,
                 },
             decode_workspace_per_row_bytes: 8_192,
         })
@@ -915,11 +930,12 @@ impl LoadedExecutionAdapter for RumbleAsrExecutionAdapter {
         profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
-        // Concurrent requests' audio encodes in one tower pass at the engine
-        // rows. The tower packs every row's conv chunks and attends inside
-        // each row's own windows, so rows of any length share a pass with
-        // no padding: a ragged batch, each row priced at its own geometry.
-        let native_preparation = self.max_batch_size > 1;
+        // Concurrent requests' audio encodes in one tower pass at the
+        // encoder width. The tower packs every row's conv chunks and attends
+        // inside each row's own windows, so rows of any length share a pass
+        // with no padding: a ragged batch, each row priced at its own
+        // geometry beside the pass's base.
+        let native_preparation = self.encoder_batch_size > 1;
         let mut preparation = StageDescriptor::from_execution_profile(
             StageId::new(0),
             "asr.encoder.rumble",
@@ -933,24 +949,30 @@ impl LoadedExecutionAdapter for RumbleAsrExecutionAdapter {
         preparation.selector = StageWorkSelector::PreSequencePreparation;
         preparation.progress = StageProgressKind::Atomic;
         preparation.membership_safe_point = MembershipSafePoint::OperationBoundary;
+        let base_workspace = seal.preparation.workspace_base_bytes;
+        let with_base = |rows: u64| {
+            rows.checked_add(base_workspace)
+                .ok_or_else(|| Error::Overloaded("Rumble ASR workspace ceiling overflow".into()))
+        };
+        preparation.workspace_base_bytes = base_workspace;
         if native_preparation {
-            let width = u64::try_from(self.max_batch_size)
+            let width = u64::try_from(self.encoder_batch_size)
                 .map_err(|_| Error::Overloaded("Rumble ASR batch width exceeds u64".into()))?;
             let ceiling = |value: u64, what: &str| {
                 value.checked_mul(width).ok_or_else(|| {
                     Error::Overloaded(format!("Rumble ASR batch {what} ceiling overflow"))
                 })
             };
-            preparation.max_batch_size = self.max_batch_size;
+            preparation.max_batch_size = self.encoder_batch_size;
             preparation.max_work_units = ceiling(seal.preparation.max_work_units, "work")?;
             preparation.max_workspace_bytes =
-                ceiling(seal.preparation.max_workspace_bytes, "workspace")?;
+                with_base(ceiling(seal.preparation.max_workspace_bytes, "workspace")?)?;
             preparation.shape_policy = StageShapePolicy::Ragged;
             preparation.max_padding_basis_points = 0;
         } else {
             preparation.max_batch_size = 1;
             preparation.max_work_units = seal.preparation.max_work_units;
-            preparation.max_workspace_bytes = seal.preparation.max_workspace_bytes;
+            preparation.max_workspace_bytes = with_base(seal.preparation.max_workspace_bytes)?;
             preparation.concurrency = ConcurrencyClass::Exclusive;
             preparation.shape_policy = StageShapePolicy::Exact;
         }

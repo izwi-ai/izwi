@@ -3202,6 +3202,87 @@ fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
     }
 }
 
+/// On CUDA Rumble's encoder preparation widens with its decode, up to 32
+/// rows and never below the engine rows; elsewhere it keeps the engine
+/// rows. Its workspace ceiling is every row's beside the pass's base (the
+/// conv stem's slices on CUDA), which the stage carries as its base.
+#[test]
+fn rumble_encoder_widens_with_the_cuda_decode_and_prices_its_base_once() {
+    use super::sequence_asr::{
+        RumbleAsrExecutionAdapter, RumbleAsrExecutionSeal, RUMBLE_CUDA_ENCODER_MAX_WIDTH,
+    };
+    let metadata = |backend| {
+        LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap(),
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            ModelVariant::Rumble2Flash,
+            backend,
+        )
+        .unwrap()
+        .capabilities
+        .get(&CapabilityKind::Asr)
+        .unwrap()
+        .metadata()
+    };
+    let adapter = |backend, rows, decode| {
+        RumbleAsrExecutionAdapter::new(
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            metadata(backend),
+            backend,
+            rows,
+        )
+        .with_decode_batch_size(decode)
+    };
+    for (backend, rows, decode, encoder) in [
+        (BackendKind::Cuda, 4, 64, RUMBLE_CUDA_ENCODER_MAX_WIDTH),
+        (BackendKind::Cuda, 4, 16, 16),
+        (BackendKind::Cuda, 40, 64, 40),
+        (BackendKind::Metal, 4, 32, 4),
+        (BackendKind::Cpu, 1, 8, 1),
+    ] {
+        assert_eq!(
+            adapter(backend, rows, decode).encoder_batch_size,
+            encoder,
+            "{backend:?} rows {rows} decode {decode}"
+        );
+    }
+
+    let cuda = adapter(BackendKind::Cuda, 4, 64);
+    if !cuda.retained_route {
+        return;
+    }
+    let (per_row, base) = (300 * 1024 * 1024, 512 * 1024 * 1024);
+    cuda.install_preparation_seal(RumbleAsrExecutionSeal {
+        preparation: crate::models::architectures::rumble::RumbleAsrPreparationStageSeal {
+            backend: BackendKind::Cuda,
+            dtype: "bf16".into(),
+            max_work_units: 390,
+            max_materialized_tensor_elements_per_row: 2_000_000,
+            max_workspace_bytes: per_row,
+            workspace_base_bytes: base,
+        },
+        decode_workspace_per_row_bytes: 8_192,
+    })
+    .unwrap();
+    let contract = cuda.contract(StreamingRequirements::NONE).unwrap();
+    let preparation = &contract.stages[0];
+    assert_eq!(preparation.max_batch_size, 32);
+    assert_eq!(preparation.max_work_units, 390 * 32);
+    assert_eq!(preparation.workspace_base_bytes, base);
+    assert_eq!(preparation.max_workspace_bytes, per_row * 32 + base);
+    // A full pass of the longest rows fits the ceiling.
+    let rows = 32;
+    let full = crate::runtime::coordinator::native_preparation_workspace(
+        preparation,
+        crate::engine::WorkCost::new(390 * rows, 1, per_row * rows),
+        rows as usize,
+    )
+    .unwrap();
+    assert_eq!(full.workspace_bytes().unwrap(), per_row * rows + base);
+}
+
 /// Granite Speech 5.0's normal requirement (with or without native
 /// streaming) binds its retained sequence graph: scalar encoder
 /// preparation, scalar exact prefill, and continuous decode priced per row.

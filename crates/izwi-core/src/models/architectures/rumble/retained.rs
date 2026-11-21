@@ -139,7 +139,11 @@ pub(crate) struct RumbleAsrPreparationStageSeal {
     pub(crate) dtype: String,
     pub(crate) max_work_units: u64,
     pub(crate) max_materialized_tensor_elements_per_row: u64,
+    /// One row's workspace ceiling, beside the pass's base.
     pub(crate) max_workspace_bytes: u64,
+    /// Workspace one pass holds whatever its rows
+    /// ([`RumbleAsrModel::preparation_workspace_base_bytes`]).
+    pub(crate) workspace_base_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,6 +560,12 @@ impl RumbleAsrModel {
     /// MLP rows per token plus its windowed attention scores for every
     /// head, the projector, and the prompt's assembly. The same formula
     /// prices a request's reservation and the loaded model's ceiling.
+    ///
+    /// On CUDA the stem's slices serve every row of a pass, so their
+    /// transient is the stage's base ([`Self::preparation_workspace_base_bytes`])
+    /// rather than each row's, and the encoder's attention runs over whole
+    /// padded windows (`audio_tower::WindowPlan`), so its per-token terms
+    /// cover the row's tokens rounded up to whole windows.
     fn preparation_workspace_bytes(
         &self,
         mel_frames: usize,
@@ -575,11 +585,24 @@ impl RumbleAsrModel {
             * 2;
         let chunks = mel_frames.div_ceil(chunk_frames.max(1));
         let element_bytes = std::mem::size_of::<f32>() as u64;
-        let conv_bytes = to_u64(chunks, "conv workspace")?
-            .checked_mul(to_u64(conv_chunk_elements, "conv workspace")?)
-            .and_then(|elements| elements.checked_mul(element_bytes))
-            .ok_or_else(|| overflow("conv workspace"))?
-            .min(2 * RUMBLE_AUDIO_CNN_SLICE_BUDGET_BYTES);
+        let per_pass_stem = self.device().kind.is_cuda();
+        let conv_bytes = if per_pass_stem {
+            0
+        } else {
+            to_u64(chunks, "conv workspace")?
+                .checked_mul(to_u64(conv_chunk_elements, "conv workspace")?)
+                .and_then(|elements| elements.checked_mul(element_bytes))
+                .ok_or_else(|| overflow("conv workspace"))?
+                .min(2 * RUMBLE_AUDIO_CNN_SLICE_BUDGET_BYTES)
+        };
+        let encoder_tokens = if per_pass_stem {
+            audio_tokens
+                .div_ceil(window_tokens.max(1))
+                .checked_mul(window_tokens.max(1))
+                .ok_or_else(|| overflow("encoder workspace"))?
+        } else {
+            audio_tokens
+        };
         let per_token = [
             audio.d_model * 10,
             audio.encoder_ffn_dim * 2,
@@ -592,7 +615,7 @@ impl RumbleAsrModel {
         let elements = mel_frames
             .checked_mul(audio.num_mel_bins * 2)
             .and_then(|features| {
-                audio_tokens
+                encoder_tokens
                     .checked_mul(per_token)
                     .and_then(|encoder| features.checked_add(encoder))
             })
@@ -607,6 +630,18 @@ impl RumbleAsrModel {
             .and_then(|bytes| bytes.checked_add(conv_bytes))
             .filter(|bytes| *bytes > 0)
             .ok_or_else(|| overflow("preparation workspace"))
+    }
+
+    /// Bytes one preparation pass holds whatever its rows: on CUDA the conv
+    /// stem's slices (each under its byte budget, priced at two in flight),
+    /// which [`Self::preparation_workspace_bytes`] then leaves out of every
+    /// row; elsewhere 0, each row pricing the stem itself.
+    pub(crate) fn preparation_workspace_base_bytes(&self) -> u64 {
+        if self.device().kind.is_cuda() {
+            2 * RUMBLE_AUDIO_CNN_SLICE_BUDGET_BYTES
+        } else {
+            0
+        }
     }
 
     /// The ceilings of one request's preparation on `backend`: 30 s of audio
@@ -649,6 +684,7 @@ impl RumbleAsrModel {
                 audio_tokens,
                 prompt_tokens,
             )?,
+            workspace_base_bytes: self.preparation_workspace_base_bytes(),
         })
     }
 
