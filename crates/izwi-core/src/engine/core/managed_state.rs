@@ -512,18 +512,13 @@ impl EngineCore {
                 Error::InvalidInput("managed state transaction limit exceeds u32".into())
             })?,
         };
-        if backend == BackendKind::Cuda && !pre_pooled {
-            if let Some(per_sequence) = logical_token_reach {
-                capacity.logical_token_reach =
-                    Some(self.managed_kv_cache.fit_cuda_retained_pool_tokens(
-                        model_instance,
-                        retained_state,
-                        per_sequence,
-                        capacity,
-                        self.config.block_size,
-                        self.config.cuda_state_budget_fraction,
-                    )?);
-            }
+        if !pre_pooled {
+            self.pool_cuda_retained_capacity(
+                backend,
+                model_instance,
+                retained_state,
+                &mut capacity,
+            )?;
         }
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
@@ -545,6 +540,35 @@ impl EngineCore {
         }
         runtime.synchronize_backing()?;
         Ok(runtime)
+    }
+
+    /// On CUDA, widen `capacity`'s one-context reach to a context per
+    /// retained row the memory holds (`fit_cuda_retained_pool_tokens`). Every
+    /// retained-state loader that has not pooled its contexts already calls
+    /// this; the caller then holds each request to one context with
+    /// `set_maximum_sequence_tokens`.
+    fn pool_cuda_retained_capacity(
+        &self,
+        backend: BackendKind,
+        model_instance: super::super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        capacity: &mut ManagedStateCapacityRequest,
+    ) -> Result<()> {
+        if backend != BackendKind::Cuda {
+            return Ok(());
+        }
+        if let Some(per_sequence) = capacity.logical_token_reach {
+            capacity.logical_token_reach =
+                Some(self.managed_kv_cache.fit_cuda_retained_pool_tokens(
+                    model_instance,
+                    retained_state,
+                    per_sequence,
+                    *capacity,
+                    self.config.block_size,
+                    self.config.cuda_state_budget_fraction,
+                )?);
+        }
+        Ok(())
     }
 
     /// Resolve one loaded model against its sealed row ceilings without changing
@@ -590,24 +614,38 @@ impl EngineCore {
             (retained_rows, staged_rows),
             PortableFitHeadroom::Planning { minimum_tokens: 0 },
         )?;
+        let mut capacity = ManagedStateCapacityRequest {
+            total_paged_pages: u32::try_from(self.config.max_blocks)
+                .map_err(|_| Error::InvalidInput("managed KV page budget exceeds u32".into()))?,
+            logical_token_reach,
+            retained_sequence_rows: u32::try_from(retained_rows).map_err(|_| {
+                Error::InvalidInput("managed state sequence limit exceeds u32".into())
+            })?,
+            staged_transaction_rows: u32::try_from(staged_rows).map_err(|_| {
+                Error::InvalidInput("managed state transaction limit exceeds u32".into())
+            })?,
+        };
+        // The reach above is one context, and the arena's pages are that
+        // reach shared by every row: each TTS row claims its prompt plus its
+        // whole output budget for its life, so a one-context arena decoded
+        // Audio8 and Fish S2 three or four requests at a time however many
+        // rows were sealed. On CUDA the arena pools a context per row the
+        // memory holds, as `load_retained_state_with_rows` does, and each
+        // request stays held to one context (below).
+        self.pool_cuda_retained_capacity(backend, model_instance, retained_state, &mut capacity)?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
             backend,
-            ManagedStateCapacityRequest {
-                total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
-                    Error::InvalidInput("managed KV page budget exceeds u32".into())
-                })?,
-                logical_token_reach,
-                retained_sequence_rows: u32::try_from(retained_rows).map_err(|_| {
-                    Error::InvalidInput("managed state sequence limit exceeds u32".into())
-                })?,
-                staged_transaction_rows: u32::try_from(staged_rows).map_err(|_| {
-                    Error::InvalidInput("managed state transaction limit exceeds u32".into())
-                })?,
-            },
+            capacity,
             self.config.block_size,
             retained_state,
         )?;
+        if backend == BackendKind::Cuda {
+            if let Some(per_sequence) = logical_token_reach {
+                runtime
+                    .set_maximum_sequence_tokens(per_sequence.min(runtime.logical_token_reach()));
+            }
+        }
         runtime.synchronize_backing()?;
         Ok(runtime)
     }
