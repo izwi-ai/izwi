@@ -126,69 +126,6 @@ impl Audio8RotaryCache {
             .contiguous()
             .map_err(Error::from)
     }
-
-    /// The tables for rows of `len` positions, row `b` starting at absolute
-    /// position `starts[b]`: `[rows, len, head_dim / 2]` cos and sin
-    /// gathered from the rows [`Self::apply`] narrows, for
-    /// [`Self::apply_rows`]. Build once and share across a stack's layers.
-    pub(crate) fn row_tables(&self, starts: &[usize], len: usize) -> Result<(Tensor, Tensor)> {
-        if starts.is_empty() || len == 0 {
-            return Err(Error::InvalidInput(
-                "Audio8 rotary row tables require rows and positions".into(),
-            ));
-        }
-        let mut ids = Vec::with_capacity(starts.len() * len);
-        for &start in starts {
-            let end = start
-                .checked_add(len)
-                .filter(|end| *end <= self.max_seq_len)
-                .ok_or_else(|| {
-                    Error::InvalidInput(format!(
-                        "Audio8 rotary row positions {start}..+{len} exceed cache capacity {}",
-                        self.max_seq_len
-                    ))
-                })?;
-            ids.extend((start..end).map(|position| position as u32));
-        }
-        let ids = Tensor::from_vec(ids, starts.len() * len, self.cos.device())?;
-        let shape = (starts.len(), len, self.head_dim / 2);
-        Ok((
-            self.cos.index_select(&ids, 0)?.reshape(shape)?,
-            self.sin.index_select(&ids, 0)?.reshape(shape)?,
-        ))
-    }
-
-    /// [`Self::apply`] with each row at its own positions: `x` is
-    /// `[rows, len, heads, head_dim]` and the tables come from
-    /// [`Self::row_tables`].
-    pub(crate) fn apply_rows(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let (batch_size, seq_len, num_heads, head_dim) = x.dims4()?;
-        let table = [batch_size, seq_len, self.head_dim / 2];
-        if num_heads == 0 || head_dim != self.head_dim || cos.dims() != table || sin.dims() != table
-        {
-            return Err(Error::InvalidInput(format!(
-                "Audio8 rotary rows require [rows,len,heads,{}] input and [rows,len,{}] tables, \
-                 got {:?} and {:?}",
-                self.head_dim,
-                self.head_dim / 2,
-                x.dims(),
-                cos.dims()
-            )));
-        }
-        if !matches!(x.dtype(), DType::BF16 | DType::F16 | DType::F32) {
-            return Err(Error::InvalidInput(format!(
-                "Audio8 rotary input must be BF16, F16, or F32, got {:?}",
-                x.dtype()
-            )));
-        }
-        let input = x.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
-        let rotated = candle_nn::rotary_emb::rope_i(&input, cos, sin)?;
-        rotated
-            .transpose(1, 2)?
-            .to_dtype(x.dtype())?
-            .contiguous()
-            .map_err(Error::from)
-    }
 }
 
 #[cfg(test)]
@@ -410,41 +347,6 @@ mod tests {
             chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap()
         );
         assert_eq!(cache.storage_bytes(), 64 * 128 * 4);
-    }
-
-    /// Rows rotated together, each at its own start, come out bit for bit
-    /// as each row rotated alone at its start.
-    #[test]
-    fn row_positions_rotate_each_row_as_alone() {
-        let device = Device::Cpu;
-        let cache = Audio8RotaryCache::new(64, 8, 1e4, DType::BF16, &device).unwrap();
-        let values = (0..3 * 5 * 2 * 8)
-            .map(|i| (i % 29) as f32 / 7.0 - 2.0)
-            .collect::<Vec<_>>();
-        let input = Tensor::from_vec(values, (3, 5, 2, 8), &device).unwrap();
-        let starts = [0, 17, 59];
-        let (cos, sin) = cache.row_tables(&starts, 5).unwrap();
-        let together = cache.apply_rows(&input, &cos, &sin).unwrap();
-        for (row, start) in starts.into_iter().enumerate() {
-            let alone = cache
-                .apply(&input.narrow(0, row, 1).unwrap(), start)
-                .unwrap();
-            assert_eq!(
-                together
-                    .narrow(0, row, 1)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap(),
-                alone.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-                "row {row}"
-            );
-        }
-        assert!(cache.row_tables(&[60], 5).is_err());
-        assert!(cache
-            .apply_rows(&input, &sin.narrow(0, 0, 2).unwrap(), &sin)
-            .is_err());
     }
 
     #[test]

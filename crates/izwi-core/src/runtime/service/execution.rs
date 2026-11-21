@@ -320,9 +320,7 @@ impl RuntimeService {
             {
                 (
                     ModelVariant::AUDIO8_MAX_OUTPUT_FRAMES,
-                    // A streamed quantum's PCM: its whole chunks, at most
-                    // one quantum's.
-                    crate::models::architectures::audio8::AUDIO8_CODEC_QUANTUM_FRAMES,
+                    crate::models::architectures::audio8::AUDIO8_AUDIO_CHUNK_FRAMES,
                     crate::models::architectures::audio8::dac::Audio8DacConfig::current()
                         .streaming_history_bound_bytes()?,
                 )

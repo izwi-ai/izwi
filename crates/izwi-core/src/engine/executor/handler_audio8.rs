@@ -257,28 +257,7 @@ impl NativeExecutor {
             ) {
                 crate::engine::metrics::record_engine_model_call(call);
             }
-            // Codec frames due this step, gathered over every row.
-            let due = audio8_due_frames(
-                &rows
-                    .iter()
-                    .map(|row| {
-                        let active = row
-                            .lease
-                            .as_ref()
-                            .and_then(|lease| lease.state())
-                            .ok_or_else(|| {
-                                Error::InferenceError("Audio8 batch lost state".into())
-                            })?;
-                        Ok(Audio8CodecProgress {
-                            decoded: active.codec.decoded_frames(),
-                            generated: active.state.frames_generated(),
-                            finished: active.state.finished(),
-                            streamed: requests[row.index].streaming,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            );
-            for ((row, step), due) in rows.iter_mut().zip(steps).zip(due) {
+            for (row, step) in rows.iter_mut().zip(steps) {
                 let index = row.index;
                 let request = requests[index];
                 let scheduled_row = &scheduled[index];
@@ -307,6 +286,12 @@ impl NativeExecutor {
                 }
                 let frames = active.state.frames_generated();
                 let generated = frames.saturating_sub(active.last_frames_generated);
+                let pending = frames.saturating_sub(active.codec.decoded_frames());
+                let threshold = if active.codec.decoded_frames() == 0 {
+                    crate::models::architectures::audio8::AUDIO8_FIRST_AUDIO_FRAMES
+                } else {
+                    crate::models::architectures::audio8::AUDIO8_AUDIO_CHUNK_FRAMES
+                };
                 let timing = audio8_execution_timing(
                     active,
                     0.0,
@@ -329,10 +314,14 @@ impl NativeExecutor {
                     error: None,
                     logprobs: Vec::new(),
                 };
-                let result = if due > 0 {
+                let result = if pending >= threshold || (active.state.finished() && pending > 0) {
                     ModelSessionResult::yielded(
                         output,
-                        crate::engine::YieldReason::AwaitingAudioDecode { max_frames: due },
+                        crate::engine::YieldReason::AwaitingAudioDecode {
+                            max_frames: pending.min(
+                                crate::models::architectures::audio8::AUDIO8_AUDIO_CHUNK_FRAMES,
+                            ),
+                        },
                     )
                 } else if active.state.finished() {
                     ModelSessionResult::yielded(
@@ -528,15 +517,11 @@ impl NativeExecutor {
                         false,
                     )?;
                 }
+                let pending = active
+                    .state
+                    .frames_generated()
+                    .saturating_sub(codec.decoded_frames());
                 let done = active.state.finished();
-                // More whole chunks than one quantum decodes, or the tail.
-                let due = Audio8CodecProgress {
-                    decoded: codec.decoded_frames(),
-                    generated: active.state.frames_generated(),
-                    finished: done,
-                    streamed: request.streaming,
-                }
-                .due_frames();
                 let first_audio_ms = active
                     .first_audio_ms
                     .or_else(|| Some(active.execution_started.elapsed().as_secs_f64() * 1000.0));
@@ -566,8 +551,11 @@ impl NativeExecutor {
                     error: None,
                     logprobs: Vec::new(),
                 };
-                let reason = if due > 0 {
-                    crate::engine::YieldReason::AwaitingAudioDecode { max_frames: due }
+                let reason = if pending > 0 {
+                    crate::engine::YieldReason::AwaitingAudioDecode {
+                        max_frames: pending
+                            .min(crate::models::architectures::audio8::AUDIO8_AUDIO_CHUNK_FRAMES),
+                    }
                 } else if done {
                     crate::engine::YieldReason::AwaitingFinalization
                 } else {
@@ -714,60 +702,6 @@ fn audio8_row_terminal(
     Some(result)
 }
 
-/// One row's codec progress after a decode step.
-#[derive(Debug, Clone, Copy)]
-struct Audio8CodecProgress {
-    decoded: usize,
-    generated: usize,
-    finished: bool,
-    /// Whether the request streams its audio.
-    streamed: bool,
-}
-
-impl Audio8CodecProgress {
-    /// Whether this row calls its step's rows to the codec: it finished
-    /// with frames pending, its first audio is due, or it has a chunk
-    /// (streamed) or [`AUDIO8_BUFFERED_AUDIO_FRAMES`] pending.
-    ///
-    /// [`AUDIO8_BUFFERED_AUDIO_FRAMES`]: crate::models::architectures::audio8::AUDIO8_BUFFERED_AUDIO_FRAMES
-    fn calls_codec(self) -> bool {
-        use crate::models::architectures::audio8::{
-            AUDIO8_AUDIO_CHUNK_FRAMES, AUDIO8_BUFFERED_AUDIO_FRAMES, AUDIO8_FIRST_AUDIO_FRAMES,
-        };
-        let pending = self.generated.saturating_sub(self.decoded);
-        (self.finished && pending > 0)
-            || (self.decoded == 0 && pending >= AUDIO8_FIRST_AUDIO_FRAMES)
-            || pending
-                >= if self.streamed {
-                    AUDIO8_AUDIO_CHUNK_FRAMES
-                } else {
-                    AUDIO8_BUFFERED_AUDIO_FRAMES
-                }
-    }
-
-    /// The frames this row decodes in its next audio quantum: its whole
-    /// pending chunks, at most one quantum's, or a finished row's tail.
-    fn due_frames(self) -> usize {
-        crate::models::architectures::audio8::audio8_codec_quantum_end(
-            self.decoded,
-            self.generated,
-            self.finished,
-            crate::models::architectures::audio8::AUDIO8_CODEC_QUANTUM_FRAMES,
-        )
-        .saturating_sub(self.decoded)
-    }
-}
-
-/// Each row's frames due after a decode step. When any row calls the codec
-/// every row with a whole chunk pending yields it, so one audio quantum
-/// gathers the step's rows instead of each row's chunk running alone.
-fn audio8_due_frames(rows: &[Audio8CodecProgress]) -> Vec<usize> {
-    let called = rows.iter().any(|row| row.calls_codec());
-    rows.iter()
-        .map(|row| if called { row.due_frames() } else { 0 })
-        .collect()
-}
-
 fn check_audio8_codec_request(request: &EngineCoreRequest) -> Result<()> {
     if request.is_cancelled() {
         return Err(Error::Cancelled(request.id.clone()));
@@ -803,59 +737,6 @@ fn audio8_execution_timing(
 
 #[cfg(test)]
 mod tests {
-    use super::{audio8_due_frames, Audio8CodecProgress};
-
-    fn row(decoded: usize, generated: usize, finished: bool, streamed: bool) -> Audio8CodecProgress {
-        Audio8CodecProgress {
-            decoded,
-            generated,
-            finished,
-            streamed,
-        }
-    }
-
-    /// A row's first audio, a streamed row's chunk, a buffered row's 48
-    /// frames or a finished row's tail call the codec; then every row with a
-    /// whole chunk pending yields its whole chunks (one quantum's at most),
-    /// and rows short of a chunk keep decoding.
-    #[test]
-    fn audio8_codec_gathers_every_row_with_a_whole_chunk() {
-        // Nothing due: a buffered row's 47 frames and a streamed row's 15.
-        assert_eq!(
-            audio8_due_frames(&[row(4, 51, false, false), row(20, 35, false, true)]),
-            [0, 0]
-        );
-        // A new row's first four frames call the codec for everyone.
-        assert_eq!(
-            audio8_due_frames(&[
-                row(0, 4, false, true),
-                row(4, 51, false, false),
-                row(20, 35, false, true),
-                row(0, 3, false, false),
-            ]),
-            [4, 32, 0, 0]
-        );
-        // A streamed row's chunk calls; a buffered row with 100 pending
-        // decodes one quantum's whole chunks (4 + 3 * 16 from frame 0).
-        assert_eq!(
-            audio8_due_frames(&[row(20, 36, false, true), row(0, 100, false, false)]),
-            [16, 52]
-        );
-        assert_eq!(audio8_due_frames(&[row(52, 100, false, false)]), [48]);
-        // A buffered row calls at 48 pending.
-        assert_eq!(audio8_due_frames(&[row(20, 68, false, false)]), [48]);
-        // A finished row's tail calls and is decoded whole; past one
-        // quantum it decodes whole chunks first.
-        assert_eq!(
-            audio8_due_frames(&[row(20, 27, true, false), row(4, 30, false, true)]),
-            [7, 16]
-        );
-        assert_eq!(audio8_due_frames(&[row(20, 100, true, false)]), [64]);
-        assert_eq!(audio8_due_frames(&[row(84, 100, true, false)]), [16]);
-        // Finished with nothing pending: nothing due.
-        assert_eq!(audio8_due_frames(&[row(27, 27, true, false)]), [0]);
-    }
-
     #[test]
     fn audio8_fresh_terminal_row_discards_state_without_poisoning_lease() {
         use crate::engine::executor::PendingQuantumFinalizer;

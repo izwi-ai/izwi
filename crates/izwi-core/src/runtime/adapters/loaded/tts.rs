@@ -1880,17 +1880,14 @@ impl LoadedExecutionAdapter for Audio8TtsExecutionAdapter {
         audio_decode.max_batch_size = capacity.codec_rows;
         audio_decode.selector = StageWorkSelector::SequenceAudioDecode;
         audio_decode.progress = StageProgressKind::Iterative;
-        // Rows of any frame count share a quantum: the codec splits each
-        // row at its own chunk boundaries and runs every chunk in a call of
-        // fixed shape on CUDA, so a row's PCM never depends on its peers.
-        audio_decode.shape_policy = StageShapePolicy::Ragged;
+        audio_decode.shape_policy = StageShapePolicy::Exact;
         audio_decode.concurrency = if capacity.native_batching {
             ConcurrencyClass::Batchable
         } else {
             ConcurrencyClass::Exclusive
         };
         audio_decode.max_work_units =
-            (crate::models::architectures::audio8::AUDIO8_CODEC_QUANTUM_FRAMES as u64)
+            (crate::models::architectures::audio8::AUDIO8_AUDIO_CHUNK_FRAMES as u64)
                 .saturating_mul(capacity.codec_rows as u64);
         audio_decode.workspace_per_row_bytes = capacity.codec_workspace_per_row;
         audio_decode.max_workspace_bytes = capacity

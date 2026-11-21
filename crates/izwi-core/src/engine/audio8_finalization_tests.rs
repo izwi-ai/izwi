@@ -1,7 +1,8 @@
 use super::*;
 use crate::engine::{ExecutionAdapterBinding, StageDescriptor, StageWorkSelector};
 use crate::models::architectures::audio8::{
-    Audio8GenerationParams, Audio8PreparedArtifact, Audio8TtsModel,
+    codec::streaming_decode_workspace_bytes, Audio8GenerationParams, Audio8PreparedArtifact,
+    Audio8TtsModel,
 };
 use crate::models::registry::Audio8TtsModelLease;
 use crate::runtime::{CapabilityKind, LoadedModelBundleDraft, RuntimeAdapterRegistry};
@@ -62,14 +63,6 @@ fn finalize_cost(
     )
 }
 
-/// A codec row's sealed share of its audio quantum, never below its own
-/// history and PCM.
-fn quantum_row_bytes(stage: &StageDescriptor, frames: usize) -> u64 {
-    stage.workspace_per_row_bytes.max(
-        crate::models::architectures::audio8::codec::streaming_row_workspace_bytes(frames).unwrap(),
-    )
-}
-
 #[test]
 fn audio8_preparation_binds_then_prices_scalar_codec_on_each_backend() {
     for backend in [BackendKind::Cpu, BackendKind::Cuda, BackendKind::Metal] {
@@ -82,8 +75,7 @@ fn audio8_preparation_binds_then_prices_scalar_codec_on_each_backend() {
             request.bind_execution_adapter(binding).unwrap();
             request.validate_execution_preparation().unwrap();
             let cost = finalize_cost(&request, Some(&stage), backend).unwrap();
-            // A row's sealed share of its audio quantum.
-            let bytes = quantum_row_bytes(&stage, 1);
+            let bytes = streaming_decode_workspace_bytes(1).unwrap();
             let mut expected = ResourceVector::zero();
             match backend {
                 BackendKind::Cpu => expected.host_bytes = ResourceAmount::Known(bytes),
@@ -169,9 +161,7 @@ fn audio8_codec_cost_rejects_unsupported_frame_and_work_bounds() {
     request.bind_execution_adapter(binding).unwrap();
     assert!(EngineCore::work_cost(
         &request,
-        &WorkUnit::SequenceAudioDecode {
-            max_frames: crate::models::architectures::audio8::AUDIO8_CODEC_QUANTUM_FRAMES + 1,
-        },
+        &WorkUnit::SequenceAudioDecode { max_frames: 17 },
         Some(&stage),
         BackendKind::Cpu,
     )
@@ -240,7 +230,7 @@ fn audio8_exact_prompt_fits_admission_generation_and_codec_budget() {
     request.validate_execution_preparation().unwrap();
     let cost = finalize_cost(&request, Some(&stage), BackendKind::Cuda).unwrap();
     let mut workspace = ResourceVector::zero();
-    workspace.device_bytes = ResourceAmount::Known(quantum_row_bytes(&stage, 1));
+    workspace.device_bytes = ResourceAmount::Known(streaming_decode_workspace_bytes(1).unwrap());
     assert_eq!(cost, WorkCost::with_workspace(1, 1, workspace));
 }
 

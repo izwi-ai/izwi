@@ -45,43 +45,6 @@ pub(crate) fn streaming_decode_workspace_bytes(frames: usize) -> Result<u64> {
     )
 }
 
-/// The transient workspace of one streaming codec call of `slots` rows,
-/// each pushing at most one chunk (a quantum's pushes never cross a chunk
-/// boundary).
-pub(crate) fn streaming_call_workspace_bytes(slots: usize) -> Result<u64> {
-    streaming_decode_workspace_bytes(super::AUDIO8_AUDIO_CHUNK_FRAMES)?
-        .checked_mul(slots as u64)
-        .ok_or_else(|| Error::ConfigError("Audio8 codec call workspace overflow".into()))
-}
-
-/// What one row of an audio quantum holds beyond its calls: its candidate
-/// stream history and its PCM for up to `frames` frames.
-pub(crate) fn streaming_row_workspace_bytes(frames: usize) -> Result<u64> {
-    let config = super::dac::Audio8DacConfig::current();
-    (frames as u64)
-        .checked_mul(config.samples_per_frame()? as u64 * 4)
-        .and_then(|pcm| pcm.checked_add(config.streaming_history_bound_bytes().ok()?))
-        .ok_or_else(|| Error::ConfigError("Audio8 codec row workspace overflow".into()))
-}
-
-/// One row's share of an audio quantum of up to `rows` rows (each up to
-/// [`super::AUDIO8_CODEC_QUANTUM_FRAMES`]) whose calls run `slots` rows
-/// (CUDA's fixed slots; `None`, a call of at most every row): an even share
-/// of one call, which run one at a time, plus the row's own history and
-/// PCM. `rows` shares cover the quantum, as a per-row lease requires.
-pub(crate) fn streaming_quantum_workspace_per_row(
-    rows: usize,
-    slots: Option<usize>,
-) -> Result<u64> {
-    let rows = rows.max(1);
-    streaming_call_workspace_bytes(slots.unwrap_or(rows))?
-        .div_ceil(rows as u64)
-        .checked_add(streaming_row_workspace_bytes(
-            super::AUDIO8_CODEC_QUANTUM_FRAMES,
-        )?)
-        .ok_or_else(|| Error::ConfigError("Audio8 codec quantum workspace overflow".into()))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Audio8CodecSupport {
     NativePthStateDict,
@@ -468,27 +431,6 @@ mod tests {
         );
         assert!(streaming_decode_workspace_bytes(0).is_err());
         assert!(streaming_decode_workspace_bytes(4097).is_err());
-    }
-
-    /// A quantum's rows share one call of fixed slots (CUDA) or of every
-    /// row, and each holds its own history and PCM.
-    #[test]
-    fn quantum_workspace_shares_one_call_between_its_rows() {
-        let chunk = streaming_decode_workspace_bytes(16).unwrap();
-        let row = streaming_row_workspace_bytes(64).unwrap();
-        assert!(row > 64 * 2048 * 4);
-        assert_eq!(streaming_call_workspace_bytes(8).unwrap(), 8 * chunk);
-        for (rows, slots) in [(1, Some(8)), (3, Some(8)), (20, Some(8)), (20, None)] {
-            let share = streaming_quantum_workspace_per_row(rows, slots).unwrap();
-            let call = streaming_call_workspace_bytes(slots.unwrap_or(rows)).unwrap();
-            assert!(share * rows as u64 >= call + row * rows as u64);
-            assert!(share * rows as u64 - (call + row * rows as u64) < rows as u64);
-        }
-        // Calls of every row cost each row one chunk's workspace.
-        assert_eq!(
-            streaming_quantum_workspace_per_row(20, None).unwrap(),
-            chunk + row
-        );
     }
 
     #[test]

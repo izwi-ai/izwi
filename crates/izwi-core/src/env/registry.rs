@@ -140,13 +140,6 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "JSON file of real codebook frames for the ignored Audio8 CUDA codec stream test.",
     ),
     CoreEnvVar::new(
-        "IZWI_AUDIO8_CODEC_CALL_SLOTS",
-        Int,
-        "8",
-        Load,
-        "On CUDA, sets how many Audio8 codec streams one shared codec call carries (1 to 64), fixed per load: every call has that many slots, spare slots zero, so a request decodes the same audio alone and beside others. A load-time check decodes that many random streams together and alone; if they differ every request runs in its own call. Fewer slots lower a lone request's codec time; more share each call across more requests.",
-    ),
-    CoreEnvVar::new(
         "IZWI_AUDIO8_CODEC_PATH",
         Path,
         "unset (test fails)",

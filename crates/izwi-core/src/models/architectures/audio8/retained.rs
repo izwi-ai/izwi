@@ -797,64 +797,38 @@ impl Audio8TtsModel {
                 "Audio8 retained codec batch rows do not match".into(),
             ));
         }
-        // Each row's frames as its chunks ([`super::audio8_codec_chunks`]):
-        // a row stops at a chunk boundary unless it is finished, and every
-        // chunk is its own push, so a request's pushes, and so its PCM, are
-        // the same whenever and beside whichever rows its quanta run.
-        let mut chunks = Vec::with_capacity(states.len());
+        let mut codes = Vec::with_capacity(states.len());
         let mut counts = Vec::with_capacity(states.len());
         for ((state, codec), &max) in states.iter().zip(codecs.iter()).zip(max_frames) {
             check()?;
             self.validate_retained_state(state)?;
-            if state.active_quantum.is_some()
-                || max == 0
-                || max > super::AUDIO8_CODEC_QUANTUM_FRAMES
+            if state.active_quantum.is_some() || max == 0 || max > super::AUDIO8_AUDIO_CHUNK_FRAMES
             {
                 return Err(Error::InvalidInput(
                     "Audio8 codec batch requires committed bounded rows".into(),
                 ));
             }
             let start = codec.decoded_frames();
-            let generated = state.frames_generated();
-            // Never ends mid-chunk before the request's last frame.
-            let end = super::audio8_codec_quantum_end(start, generated, state.finished, max);
+            let end = start.saturating_add(max).min(state.frames_generated());
             if start >= end {
                 return Err(Error::InvalidInput(
                     "Audio8 codec batch row has no pending frames".into(),
                 ));
             }
-            chunks.push(super::audio8_codec_chunks(start, end));
+            codes.push(
+                state
+                    .generated_codebooks
+                    .iter()
+                    .map(|row| row[start..end].to_vec())
+                    .collect::<Vec<_>>(),
+            );
             counts.push(end - start);
         }
-        let dac = &self.native_runtime()?.dac;
         let mut next = codecs.to_vec();
-        let mut outputs = vec![Vec::new(); states.len()];
-        // Round `r` pushes every row's `r`-th chunk together.
-        for round in 0..chunks.iter().map(Vec::len).max().unwrap_or(0) {
-            let rows = (0..states.len())
-                .filter(|&row| chunks[row].len() > round)
-                .collect::<Vec<_>>();
-            let mut round_states = rows
-                .iter()
-                .map(|&row| next[row].clone())
-                .collect::<Vec<_>>();
-            let codes = rows
-                .iter()
-                .map(|&row| {
-                    let (from, to) = chunks[row][round];
-                    states[row]
-                        .generated_codebooks
-                        .iter()
-                        .map(|book| book[from..to].to_vec())
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            let pcm = dac.push_frames_batch(&mut round_states, &codes, check)?;
-            for ((&row, state), pcm) in rows.iter().zip(round_states).zip(pcm) {
-                next[row] = state;
-                outputs[row].extend(pcm);
-            }
-        }
+        let outputs = self
+            .native_runtime()?
+            .dac
+            .push_frames_batch(&mut next, &codes, check)?;
         let history_bound =
             super::dac::Audio8DacConfig::current().streaming_history_bound_bytes()?;
         for ((output, codec), count) in outputs.iter().zip(&next).zip(counts) {

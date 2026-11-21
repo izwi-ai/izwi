@@ -44,40 +44,12 @@ impl Audio8ServingCapacity {
 
     /// `kv_element_bytes`: one retained KV element at the loaded precision
     /// (2 for F16/BF16, 4 for F32, including a load-time F32 fallback).
-    /// `codec_call_slots`: the rows every codec call runs (CUDA's fixed
-    /// slots, [`crate::models::architectures::audio8::Audio8TtsModel::codec_call_slots`]).
     pub(crate) fn resolve(
         model: &Audio8Config,
         config: &EngineConfig,
         headroom: Option<u64>,
         native_batching: bool,
         kv_element_bytes: usize,
-        codec_call_slots: Option<usize>,
-    ) -> Result<ResolvedFishServingCapacity> {
-        let mut profile = Self::resolve_rows(
-            model,
-            config,
-            headroom,
-            native_batching,
-            kv_element_bytes,
-            codec_call_slots,
-        )?;
-        // One row's share of an audio quantum of every codec row.
-        profile.codec_workspace_per_row =
-            crate::models::architectures::audio8::codec::streaming_quantum_workspace_per_row(
-                profile.codec_rows,
-                codec_call_slots,
-            )?;
-        Ok(profile)
-    }
-
-    fn resolve_rows(
-        model: &Audio8Config,
-        config: &EngineConfig,
-        headroom: Option<u64>,
-        native_batching: bool,
-        kv_element_bytes: usize,
-        codec_call_slots: Option<usize>,
     ) -> Result<ResolvedFishServingCapacity> {
         let mut profile = Self::scalar()?;
         profile.planning_headroom_bytes = headroom;
@@ -152,22 +124,17 @@ impl Audio8ServingCapacity {
                 .min(profile.active_rows);
             return Ok(profile);
         }
-        // A codec row holds its candidate history (one copy beyond the
-        // request-owned rollback pair) and its PCM; calls of fixed slots
-        // run one at a time, so their workspace is charged once below, and
-        // calls of every row cost each row one chunk's.
-        let codec_row = crate::models::architectures::audio8::codec::streaming_row_workspace_bytes(
-            crate::models::architectures::audio8::AUDIO8_CODEC_QUANTUM_FRAMES,
-        )?
-        .checked_add(match codec_call_slots {
-            Some(_) => 0,
-            None => crate::models::architectures::audio8::codec::streaming_call_workspace_bytes(1)?,
-        })
-        .ok_or_else(|| Error::ModelLoadError("Audio8 codec row workspace overflow".into()))?;
-        let codec_call = codec_call_slots
-            .map(crate::models::architectures::audio8::codec::streaming_call_workspace_bytes)
-            .transpose()?
-            .unwrap_or(0);
+        // Native codec packing retains one additional history copy beyond the
+        // ordinary request-owned rollback pair.
+        profile.codec_workspace_per_row = profile
+            .codec_workspace_per_row
+            .checked_add(
+                crate::models::architectures::audio8::dac::Audio8DacConfig::current()
+                    .streaming_history_bound_bytes()?,
+            )
+            .ok_or_else(|| {
+                Error::ModelLoadError("Audio8 codec packing workspace overflow".into())
+            })?;
         // One request's retained slow KV at the loaded precision.
         let slow_bytes = checked_product(&[
             2,
@@ -199,7 +166,7 @@ impl Audio8ServingCapacity {
             slow_bytes,
             fast_bytes,
             profile.ar_workspace_per_row,
-            codec_row,
+            profile.codec_workspace_per_row,
             codec_histories,
         ]
         .into_iter()
@@ -226,7 +193,6 @@ impl Audio8ServingCapacity {
                 crate::models::architectures::audio8::codec::maximum_preparation_workspace_bytes()?,
             )
             .checked_mul(2)
-            .and_then(|bytes| bytes.checked_add(codec_call))
             .ok_or_else(|| Error::ModelLoadError("Audio8 preparation budget overflow".into()))?;
         let available = headroom.unwrap_or(0);
         // Keep 20% untouched for allocator/transient uncertainty. The resource
@@ -287,7 +253,7 @@ mod tests {
         let config = EngineConfig::default();
         for (memory, enabled) in [(None, true), (Some(u64::MAX / 2), false)] {
             let profile =
-                Audio8ServingCapacity::resolve(model.config(), &config, memory, enabled, 4, None)
+                Audio8ServingCapacity::resolve(model.config(), &config, memory, enabled, 4)
                     .unwrap();
             assert_eq!(profile.ar_rows, 1);
             assert!(!profile.native_batching);
@@ -299,11 +265,11 @@ mod tests {
         let model = Audio8TtsModel::for_test();
         let mut config = EngineConfig::default();
         let native =
-            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4, None)
+            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
                 .unwrap();
         config.max_sequence_length = crate::config::ContextLengthPreference::explicit(32).unwrap();
         let shorter =
-            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4, None)
+            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
                 .unwrap();
         // Paged prefill works per query, so a token costs the same at any
         // context; the shorter context still frees KV for more rows.
@@ -325,8 +291,7 @@ mod tests {
         };
         for memory in [None, Some(256 << 30)] {
             let profile =
-                Audio8ServingCapacity::resolve(model.config(), &config, memory, false, 4, None)
-                    .unwrap();
+                Audio8ServingCapacity::resolve(model.config(), &config, memory, false, 4).unwrap();
             assert_eq!(profile.ar_rows, 1);
             assert!(profile.active_rows > 1);
             assert!(profile.active_rows <= 12);
@@ -343,7 +308,6 @@ mod tests {
             None,
             false,
             4,
-            None,
         )
         .unwrap();
         assert!(capacity.prefill_tokens > 0);
@@ -368,7 +332,6 @@ mod tests {
             Some(64 << 30),
             false,
             4,
-            None,
         )
         .unwrap();
         assert!(
@@ -402,7 +365,6 @@ mod tests {
                 Some(headroom_gib << 30),
                 true,
                 kv_bytes,
-                None,
             )
             .unwrap()
             .active_rows
@@ -421,7 +383,6 @@ mod tests {
             Some(68 << 30),
             true,
             2,
-            None,
         )
         .unwrap();
         assert_eq!((staged.ar_rows, staged.codec_rows), (8, 8));
@@ -433,35 +394,6 @@ mod tests {
         assert!(audio8_request_tokens() >= crate::model::ModelVariant::AUDIO8_CONTEXT_POSITIONS);
     }
 
-    /// CUDA's fixed-slot codec calls run one at a time: their workspace is
-    /// charged once, each row adds its history and PCM, and the codec
-    /// stage's rows' shares cover a quantum of every row.
-    #[test]
-    fn fixed_slot_codec_calls_are_charged_once() {
-        use crate::models::architectures::audio8::codec::{
-            streaming_call_workspace_bytes, streaming_row_workspace_bytes,
-        };
-        let model = Audio8TtsModel::for_test();
-        let config = EngineConfig {
-            max_scheduler_batch_size: 0,
-            max_retained_sequences: 0,
-            max_staged_transactions: 0,
-            ..Default::default()
-        };
-        let resolve = |slots| {
-            Audio8ServingCapacity::resolve(model.config(), &config, Some(68 << 30), true, 2, slots)
-                .unwrap()
-        };
-        let fixed = resolve(Some(8));
-        assert!(fixed.active_rows >= 16, "{} rows", fixed.active_rows);
-        assert!(fixed.active_rows >= resolve(None).active_rows);
-        let rows = fixed.codec_rows as u64;
-        let quantum = streaming_call_workspace_bytes(8).unwrap()
-            + rows * streaming_row_workspace_bytes(64).unwrap();
-        assert!(fixed.codec_workspace_per_row * rows >= quantum);
-        assert!(fixed.codec_workspace_per_row * rows - quantum < rows);
-    }
-
     #[test]
     fn capacity_scales_with_memory_and_preserves_operator_ceilings() {
         let model = Audio8TtsModel::for_test();
@@ -471,22 +403,21 @@ mod tests {
             max_staged_transactions: 0,
             ..Default::default()
         };
-        let small =
-            Audio8ServingCapacity::resolve(model.config(), &config, Some(8 << 30), true, 4, None)
-                .unwrap();
+        let small = Audio8ServingCapacity::resolve(model.config(), &config, Some(8 << 30), true, 4)
+            .unwrap();
         let large =
-            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4, None)
+            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
                 .unwrap();
         assert!(large.ar_rows > small.ar_rows);
         assert!(large.ar_rows > 5);
         config.max_batch_size = crate::config::BatchSizePreference::fixed(3).unwrap();
         let capped =
-            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4, None)
+            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
                 .unwrap();
         assert_eq!(capped.ar_rows, 3);
         config.max_staged_transactions = 2;
         assert_eq!(
-            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4, None)
+            Audio8ServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
                 .unwrap()
                 .ar_rows,
             2
