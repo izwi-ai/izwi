@@ -780,20 +780,35 @@ impl MingRuntime {
     /// calls ([`flow_group`] at a time). A request's latent depends on its
     /// own inputs only: it is the one it gets alone.
     pub(crate) fn sample_latents(&self, rows: &[MingLatentInput<'_>]) -> Result<Vec<Vec<f32>>> {
+        let latents = self
+            .sample_latents_device(rows)?
+            .to_device(&Device::Cpu)?
+            .to_vec2::<f32>()?;
+        if latents.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(Error::InferenceError(
+                "Ming flow head produced a non-finite latent".into(),
+            ));
+        }
+        Ok(latents)
+    }
+
+    /// [`Self::sample_latents`] left on the device, unchecked: [rows, 64]
+    /// F32, the caller reads it back (and checks it) when it needs it. Each
+    /// call's inputs go up as one upload.
+    pub(crate) fn sample_latents_device(&self, rows: &[MingLatentInput<'_>]) -> Result<Tensor> {
         let hidden_size = self.cfg.llm.hidden_size;
         let group = flow_group(&self.device);
-        let mut out = Vec::with_capacity(rows.len());
+        let columns = hidden_size + 2 * LATENT_DIM + 1;
+        let mut out = Vec::with_capacity(rows.len().div_ceil(group.requests));
         for chunk in rows.chunks(group.requests) {
             let width = if group.padded {
                 group.requests
             } else {
                 chunk.len()
             };
-            let mut hidden = vec![0f32; width * hidden_size];
-            let mut history = vec![0f32; width * LATENT_DIM];
-            let mut noise = vec![0f32; width * LATENT_DIM];
-            let mut guidance = vec![0f32; width];
-            for (index, row) in chunk.iter().enumerate() {
+            // Per request: hidden | history | noise | guidance.
+            let mut packed = vec![0f32; width * columns];
+            for (row, values) in chunk.iter().zip(packed.chunks_exact_mut(columns)) {
                 if row.hidden.len() != hidden_size
                     || row.history.len() != LATENT_DIM
                     || row.noise.len() != LATENT_DIM
@@ -804,35 +819,34 @@ impl MingRuntime {
                             .into(),
                     ));
                 }
-                hidden[index * hidden_size..(index + 1) * hidden_size].copy_from_slice(row.hidden);
-                history[index * LATENT_DIM..(index + 1) * LATENT_DIM].copy_from_slice(row.history);
-                noise[index * LATENT_DIM..(index + 1) * LATENT_DIM].copy_from_slice(row.noise);
-                guidance[index] = row.guidance;
+                let (hidden, rest) = values.split_at_mut(hidden_size);
+                let (history, rest) = rest.split_at_mut(LATENT_DIM);
+                let (noise, guidance) = rest.split_at_mut(LATENT_DIM);
+                hidden.copy_from_slice(row.hidden);
+                history.copy_from_slice(row.history);
+                noise.copy_from_slice(row.noise);
+                guidance[0] = row.guidance;
             }
-            let device = |values: Vec<f32>, cols: usize| -> Result<Tensor> {
-                Ok(Tensor::from_vec(values, (width, cols), &self.device)?)
+            let packed = Tensor::from_vec(packed, (width, columns), &self.device)?;
+            let part = |from: usize, cols: usize| -> Result<Tensor> {
+                Ok(packed.narrow(1, from, cols)?.contiguous()?)
             };
             let inputs = [
-                device(hidden, hidden_size)?,
-                device(history, LATENT_DIM)?,
-                device(noise, LATENT_DIM)?,
-                device(guidance, 1)?,
+                part(0, hidden_size)?,
+                part(hidden_size, LATENT_DIM)?,
+                part(hidden_size + LATENT_DIM, LATENT_DIM)?,
+                part(hidden_size + 2 * LATENT_DIM, 1)?,
             ];
-            let latents = self
-                .run_sampler(&self.graphs, &inputs)?
-                .narrow(0, 0, chunk.len())?
-                .to_device(&Device::Cpu)?
-                .to_vec2::<f32>()?;
-            for latent in latents {
-                if latent.iter().any(|value| !value.is_finite()) {
-                    return Err(Error::InferenceError(
-                        "Ming flow head produced a non-finite latent".into(),
-                    ));
-                }
-                out.push(latent);
-            }
+            out.push(
+                self.run_sampler(&self.graphs, &inputs)?
+                    .narrow(0, 0, chunk.len())?,
+            );
         }
-        Ok(out)
+        Ok(if out.len() == 1 {
+            out.pop().expect("one group")
+        } else {
+            Tensor::cat(&out, 0)?
+        })
     }
 
     /// The embeddings the language model reads for `latents` [rows * 64],
@@ -845,19 +859,40 @@ impl MingRuntime {
                 "Ming aggregator input must be whole 64-wide latents".into(),
             ));
         }
+        self.latent_embeddings_device(&Tensor::from_vec(
+            latents.to_vec(),
+            (rows, LATENT_DIM),
+            &self.device,
+        )?)
+    }
+
+    /// [`Self::latent_embeddings`] of `latents` [rows, 64] F32 already on
+    /// the device (a flow-head call's output): each group zero-padded on the
+    /// device as [`Self::latent_embeddings`] pads it on the host, so the
+    /// values are the same.
+    pub(crate) fn latent_embeddings_device(&self, latents: &Tensor) -> Result<Tensor> {
+        let (rows, width) = latents.dims2()?;
+        if rows == 0 || width != LATENT_DIM {
+            return Err(Error::InvalidInput(
+                "Ming aggregator input must be whole 64-wide latents".into(),
+            ));
+        }
         let group = flow_group(&self.device);
         let mut parts = Vec::with_capacity(rows.div_ceil(group.requests));
-        for chunk in latents.chunks(group.requests * LATENT_DIM) {
-            let count = chunk.len() / LATENT_DIM;
+        let mut start = 0;
+        while start < rows {
+            let count = group.requests.min(rows - start);
             let width =
                 if group.padded { group.requests } else { count }.max(group.min_aggregator_rows);
-            let mut padded = chunk.to_vec();
-            padded.resize(width * LATENT_DIM, 0.0);
-            let padded = Tensor::from_vec(padded, (width, LATENT_DIM), &self.device)?;
+            let padded = latents
+                .narrow(0, start, count)?
+                .pad_with_zeros(0, 0, width - count)?
+                .contiguous()?;
             parts.push(
                 self.run_aggregator(&self.graphs, &padded)?
                     .narrow(0, 0, count)?,
             );
+            start += count;
         }
         Ok(if parts.len() == 1 {
             parts.pop().expect("one group")

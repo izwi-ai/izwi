@@ -363,6 +363,13 @@ pub(crate) fn ming_prefill_batch(
 /// One decode step for each row: sample a latent from its pending hidden
 /// state, then run every row that has not stopped through the language
 /// model in one call.
+///
+/// The device is waited on once. Whether a row stops needs only its pending
+/// hidden state (the stop head runs on the host) and its step, so that is
+/// decided first; the sampled latents stay on the device and feed the
+/// aggregator directly, the language model runs, and one readback brings
+/// the latents and the new hidden states back together. Nothing is
+/// committed before that readback's checks pass.
 pub(crate) fn ming_decode_batch(
     runtime: &MingRuntime,
     rows: &mut [MingStepRow<'_>],
@@ -371,10 +378,11 @@ pub(crate) fn ming_decode_batch(
         return Err(Error::InvalidInput("Ming decode batch has no rows".into()));
     }
     // Every row's inputs first: its hidden state, history and its own
-    // seeded noise. Then one flow-head call for all of them, and one
-    // aggregator call for the rows that go on: each row's values are the
-    // ones it gets alone (see `flow_group`).
+    // seeded noise, and whether this latent is its last. Then one flow-head
+    // call for all of them, and one aggregator call for the rows that go
+    // on: each row's values are the ones it gets alone (see `flow_group`).
     let mut inputs = Vec::with_capacity(rows.len());
+    let mut stops = Vec::with_capacity(rows.len());
     for row in rows.iter_mut() {
         let state = &mut *row.state;
         if state.phase != MingPhase::Decode {
@@ -385,11 +393,19 @@ pub(crate) fn ming_decode_batch(
         let hidden = state.pending.take().ok_or_else(|| {
             Error::InferenceError("Ming decode step has no pending hidden state".into())
         })?;
+        let step = state.latents_generated();
+        stops.push(if runtime.stops_at(&hidden, step) {
+            Some(MingStopReason::EndOfSpeech)
+        } else if step + 1 >= state.budget {
+            Some(MingStopReason::LatentBudget)
+        } else {
+            None
+        });
         let mut noise = state.rng.standard_normals(LATENT_DIM);
         noise.truncate(LATENT_DIM);
         inputs.push((hidden, noise));
     }
-    let latents = runtime.sample_latents(
+    let latents = runtime.sample_latents_device(
         &rows
             .iter()
             .zip(&inputs)
@@ -401,71 +417,80 @@ pub(crate) fn ming_decode_batch(
             })
             .collect::<Vec<_>>(),
     )?;
-    let mut steps = Vec::with_capacity(rows.len());
-    let mut going_on = Vec::with_capacity(rows.len());
-    let mut fed_back = Vec::with_capacity(rows.len() * LATENT_DIM);
-    for ((row, (hidden, _)), latent) in rows.iter_mut().zip(&inputs).zip(latents) {
-        let state = &mut *row.state;
-        let step = state.latents_generated();
-        state.latents.extend_from_slice(&latent);
-        let stop = if runtime.stops_at(hidden, step) {
-            Some(MingStopReason::EndOfSpeech)
-        } else if step + 1 >= state.budget {
-            Some(MingStopReason::LatentBudget)
+    let going_on = stops
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stop)| stop.is_none().then_some(index as u32))
+        .collect::<Vec<_>>();
+    // The latents of the rows that go on, through the aggregator and the
+    // language model; the last latent is kept and never fed back.
+    let hidden = if going_on.is_empty() {
+        None
+    } else {
+        let fed_back = if going_on.len() == rows.len() {
+            latents.clone()
         } else {
-            None
+            let picked = Tensor::from_vec(going_on.clone(), going_on.len(), runtime.device())?;
+            latents.index_select(&picked, 0)?
         };
+        let embeds = runtime.latent_embeddings_device(&fed_back)?;
+        let next = (0..going_on.len())
+            .map(|index| embeds.narrow(0, index, 1))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let mut forward = rows
+            .iter_mut()
+            .zip(&stops)
+            .filter(|(_, stop)| stop.is_none())
+            .zip(&next)
+            .map(|((row, _), embeds)| MingForwardRow {
+                embeds,
+                cache: &mut *row.cache,
+            })
+            .collect::<Vec<_>>();
+        Some(runtime.trunk().forward_batch(&mut forward)?)
+    };
+    // The one readback: every latent, then every new hidden state.
+    let flat = latents.flatten_all()?;
+    let values = match &hidden {
+        Some(hidden) => Tensor::cat(&[&flat, &hidden.to_dtype(DType::F32)?.flatten_all()?], 0)?,
+        None => flat,
+    }
+    .to_device(&Device::Cpu)?
+    .to_vec1::<f32>()?;
+    let (sampled, states) = values.split_at(rows.len() * LATENT_DIM);
+    if sampled.iter().any(|value| !value.is_finite()) {
+        return Err(Error::InferenceError(
+            "Ming flow head produced a non-finite latent".into(),
+        ));
+    }
+    let hidden_size = runtime.config().llm.hidden_size;
+    if states.len() != going_on.len() * hidden_size {
+        return Err(Error::InferenceError(
+            "Ming decode step lost a row's hidden state".into(),
+        ));
+    }
+    let mut states = states.chunks_exact(hidden_size);
+    let mut steps = Vec::with_capacity(rows.len());
+    for ((row, latent), stop) in rows
+        .iter_mut()
+        .zip(sampled.as_chunks::<LATENT_DIM>().0)
+        .zip(stops)
+    {
+        let state = &mut *row.state;
+        state.latents.extend_from_slice(latent);
         match stop {
             Some(reason) => {
-                // The last latent is kept and never fed back.
                 state.phase = MingPhase::Audio;
                 state.stop_reason = Some(reason);
             }
             None => {
-                fed_back.extend_from_slice(&latent);
-                state.history = latent;
+                state.history = latent.to_vec();
+                state.pending = states.next().map(<[f32]>::to_vec);
             }
         }
-        going_on.push(stop.is_none());
         steps.push(MingDecodeStep {
             finished: stop.is_some(),
         });
-    }
-    let embeds = if fed_back.is_empty() {
-        None
-    } else {
-        Some(runtime.latent_embeddings(&fed_back)?)
-    };
-    let mut next = Vec::with_capacity(rows.len());
-    let mut fed = 0usize;
-    for &goes_on in &going_on {
-        next.push(match (&embeds, goes_on) {
-            (Some(embeds), true) => {
-                fed += 1;
-                Some(embeds.narrow(0, fed - 1, 1)?)
-            }
-            _ => None,
-        });
-    }
-    let mut forward = rows
-        .iter_mut()
-        .zip(&next)
-        .filter_map(|(row, embeds)| {
-            embeds.as_ref().map(|embeds| MingForwardRow {
-                embeds,
-                cache: &mut *row.cache,
-            })
-        })
-        .collect::<Vec<_>>();
-    if !forward.is_empty() {
-        let states = hidden_rows(&runtime.trunk().forward_batch(&mut forward)?)?;
-        drop(forward);
-        let mut states = states.into_iter();
-        for (row, embeds) in rows.iter_mut().zip(&next) {
-            if embeds.is_some() {
-                row.state.pending = states.next();
-            }
-        }
     }
     Ok(steps)
 }
