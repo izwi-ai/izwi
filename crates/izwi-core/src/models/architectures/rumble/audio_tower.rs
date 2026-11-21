@@ -1151,9 +1151,26 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 
 /// `layer` over `x`, then the exact GELU when `gelu`: Candle's ops, except
 /// that on CUDA the bias and GELU run in one in-place launch with the same
-/// bits ([`crate::kernels::cuda::bias_rows`]).
+/// bits ([`crate::kernels::cuda::bias_rows`]), and an F32 product runs in
+/// TF32 on tensor cores unless `IZWI_RUMBLE_AUDIO_TF32` is off.
 fn linear(layer: &Linear, x: &Tensor, gelu: bool) -> Result<Tensor> {
-    crate::kernels::cuda::bias_rows::linear_forward(layer, x, gelu).map_err(Error::from)
+    use crate::kernels::cuda::{bias_rows, tf32_gemm};
+    if let Some(bias) = layer.bias() {
+        if tf32_gemm::serves(x.device(), x.dtype())
+            && bias_rows::serves(x.device(), x.dtype())
+            && super::precision::audio_tf32_requested()
+        {
+            let dims = x.dims().to_vec();
+            let input = *dims.last().expect("a linear input has a last dim");
+            let rows = x.elem_count() / input;
+            let y = tf32_gemm::matmul_t(&x.reshape((rows, input))?, layer.weight())?;
+            bias_rows::add_bias(&y, bias, gelu)?;
+            let mut shape = dims;
+            *shape.last_mut().expect("a last dim") = y.dim(1)?;
+            return Ok(y.reshape(shape)?);
+        }
+    }
+    bias_rows::linear_forward(layer, x, gelu).map_err(Error::from)
 }
 
 #[cfg(test)]

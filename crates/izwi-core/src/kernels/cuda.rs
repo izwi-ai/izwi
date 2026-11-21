@@ -36,6 +36,7 @@ pub mod shape_graphs;
 pub mod small_attention;
 pub mod split_decode;
 pub mod stretch_graphs;
+pub mod tf32_gemm;
 pub mod timing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

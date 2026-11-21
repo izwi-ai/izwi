@@ -2840,6 +2840,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the dtype of Rumble's audio tower and projector (f32, f16, bf16); a lowered dtype must pass a load-time probe or the component reloads in F32.",
     ),
     CoreEnvVar::new(
+        "IZWI_RUMBLE_AUDIO_TF32",
+        Flag,
+        "true",
+        Load,
+        "Runs Rumble's F32 audio-tower linear layers on CUDA tensor cores in TF32 (F32 tensors, inputs rounded to a 10-bit mantissa inside the multiply).",
+    ),
+    CoreEnvVar::new(
         "IZWI_RUMBLE_DECODE_GRAPHS",
         Flag,
         "true",

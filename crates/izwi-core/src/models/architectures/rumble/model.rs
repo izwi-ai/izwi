@@ -627,6 +627,9 @@ impl RumbleAsrModel {
             "device_kind": format!("{:?}", self.device.kind),
             "dtype": format!("{:?}", self.text_dtype()),
             "audio_dtype": format!("{:?}", self.audio_dtype()),
+            "audio_tf32": self.audio_dtype() == DType::F32
+                && self.device.device.is_cuda()
+                && super::precision::audio_tf32_requested(),
             "audio_seconds": features.audio_seconds,
             "input_sample_rate": features.input_sample_rate,
             "input_samples": features.input_samples,
@@ -679,6 +682,9 @@ impl RumbleAsrModel {
             "device_kind": format!("{:?}", self.device.kind),
             "dtype": format!("{:?}", self.text_dtype()),
             "audio_dtype": format!("{:?}", self.audio_dtype()),
+            "audio_tf32": self.audio_dtype() == DType::F32
+                && self.device.device.is_cuda()
+                && super::precision::audio_tf32_requested(),
             "checkpoint_format": "safetensors",
             "audio_layers": audio.encoder_layers,
             "decoder_layers": text.num_hidden_layers,

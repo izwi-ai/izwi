@@ -17,6 +17,19 @@ use crate::error::Result;
 pub(crate) const RUMBLE_TEXT_DTYPE_ENV: &str = "IZWI_RUMBLE_TEXT_DTYPE";
 /// Overrides the audio tower and projector dtype.
 pub(crate) const RUMBLE_AUDIO_DTYPE_ENV: &str = "IZWI_RUMBLE_AUDIO_DTYPE";
+/// Runs the F32 audio tower's linear layers on tensor cores in TF32 on CUDA
+/// (a boolean; on when unset).
+pub(crate) const RUMBLE_AUDIO_TF32_ENV: &str = "IZWI_RUMBLE_AUDIO_TF32";
+
+/// Whether the F32 audio tower's linears multiply in TF32 on CUDA. On the
+/// H100 a BF16 tower was slower than F32 (its casts and BF16 convolutions
+/// cost more than its GEMMs saved); TF32 keeps the F32 tensors and range and
+/// only rounds the multiply's inputs to a 10-bit mantissa.
+pub(crate) fn audio_tf32_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(RUMBLE_AUDIO_TF32_ENV, true));
+    ON.get()
+}
 
 fn env_override(name: &str) -> Option<String> {
     std::env::var(name)
