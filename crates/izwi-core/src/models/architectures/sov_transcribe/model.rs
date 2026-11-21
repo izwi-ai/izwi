@@ -88,16 +88,21 @@ pub const BATCHED_PREFILL_ENV: &str = "IZWI_SOV_TRANSCRIBE_BATCHED_PREFILL";
 /// one engine quantum (1 to 64).
 pub const DECODE_QUANTUM_ENV: &str = "IZWI_SOV_TRANSCRIBE_DECODE_QUANTUM";
 
-/// Decode steps per engine quantum while nothing waits: 8 on CUDA, 4 on the
-/// CPU test reference, or the environment's.
+/// Decode steps per engine quantum: 1 on CUDA, 8 on Metal, 4 on the CPU
+/// test reference, or the environment's. On the H100 an 8-step quantum held
+/// each row's steps to itself, so rows arriving meanwhile could not join a
+/// step: at 8 and 32 concurrent requests one step a quantum served 22.8 and
+/// 25.3 audio-s/s against 16.0 and 16.2 (the decode step is a CUDA graph, so
+/// a single step costs no extra launches).
 pub fn decode_quantum(backend: BackendKind) -> usize {
     std::env::var(DECODE_QUANTUM_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|steps| (1..=64).contains(steps))
         .unwrap_or(match backend {
+            BackendKind::Cuda => 1,
             BackendKind::Cpu => 4,
-            BackendKind::Cuda | BackendKind::Metal => 8,
+            BackendKind::Metal => 8,
         })
 }
 
