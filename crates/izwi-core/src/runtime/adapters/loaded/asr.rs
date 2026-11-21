@@ -1283,6 +1283,9 @@ pub(super) struct SovTranscribeAsrExecutionAdapter {
     pub(super) metadata: AdapterMetadata,
     pub(super) backend_kind: BackendKind,
     pub(super) max_batch_size: usize,
+    /// Rows a continuous decode step runs: the fitted ASR decode width
+    /// (32 on an H100), never fewer than the other stages' rows.
+    pub(super) decode_batch_size: usize,
     /// Prompt tokens per row and prefill quantum, read once so every
     /// contract the adapter returns describes the same stage graph.
     pub(super) prefill_span: usize,
@@ -1305,8 +1308,17 @@ impl SovTranscribeAsrExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            decode_batch_size: max_batch_size.max(1),
             prefill_span: crate::models::architectures::sov_transcribe::prefill_span(backend_kind),
         }
+    }
+
+    /// Decode `rows` per continuous step (never fewer than the other
+    /// stages' rows). Without it the decode ran at the engine's tensor width
+    /// (eight rows) however wide the load fitted it.
+    pub(super) fn with_decode_batch_size(mut self, rows: usize) -> Self {
+        self.decode_batch_size = rows.max(self.max_batch_size);
+        self
     }
 }
 
@@ -1351,9 +1363,10 @@ impl LoadedExecutionAdapter for SovTranscribeAsrExecutionAdapter {
         profile.recompute_safe = false;
         profile.cache_release_safe = true;
         profile.prefix_reuse_safe = false;
-        profile.max_batch_size = self.max_batch_size;
+        profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
         let rows = self.max_batch_size as u64;
+        let decode_rows = self.decode_batch_size as u64;
         let span = self.prefill_span as u64;
 
         let mut prefill = StageDescriptor::from_execution_profile(
@@ -1366,6 +1379,7 @@ impl LoadedExecutionAdapter for SovTranscribeAsrExecutionAdapter {
         prefill.progress = StageProgressKind::Iterative;
         prefill.shape_policy = StageShapePolicy::Ragged;
         prefill.max_padding_basis_points = 0;
+        prefill.max_batch_size = self.max_batch_size;
         prefill.max_work_units = span.saturating_mul(rows);
         // A span's activations (about 200 KiB per token across the
         // residual, the widest attention projections, the dense MLP and
@@ -1390,10 +1404,11 @@ impl LoadedExecutionAdapter for SovTranscribeAsrExecutionAdapter {
         decode.selector = StageWorkSelector::SequenceDecode;
         decode.progress = StageProgressKind::Iterative;
         decode.shape_policy = StageShapePolicy::Ragged;
-        decode.max_work_units = 64_u64.saturating_mul(rows);
+        decode.max_batch_size = self.decode_batch_size;
+        decode.max_work_units = 64_u64.saturating_mul(decode_rows);
         // A row's activations and its F32 logits over the 262,144-token
         // vocabulary, before and after the softcap.
-        decode.max_workspace_bytes = (8_u64 * 1024 * 1024).saturating_mul(rows);
+        decode.max_workspace_bytes = (8_u64 * 1024 * 1024).saturating_mul(decode_rows);
         for stage in [&mut prefill, &mut decode] {
             stage.output_visibility = OutputVisibility::AfterQuantumCommit;
             stage.validate()?;

@@ -527,7 +527,25 @@ impl SovDecoder {
             .map(|row| row.embeds.to_dtype(self.dtype))
             .collect::<candle_core::Result<Vec<_>>>()?;
         let mut x = Tensor::cat(&embeds, 0)?;
-        let step = self.step_rope(positions)?;
+        // With graphs on, the step pads its rows to the next captured width
+        // (zero rows, at position 0) so every width replays a graph; the
+        // paged attention reads the real rows only, and the output keeps
+        // them alone.
+        let graphed = self.graphs.is_ok()
+            && self
+                .moe_backend
+                .routes_on_device(&self.device, count, self.config.top_k);
+        let width = if graphed {
+            super::graphs::decode_graph_width(count).unwrap_or(count)
+        } else {
+            count
+        };
+        let mut padded_positions = positions.to_vec();
+        if width > count {
+            x = x.pad_with_zeros(0, 0, width - count)?;
+            padded_positions.resize(width, 0);
+        }
+        let step = self.step_rope(&padded_positions)?;
         let rope = [
             step.sliding.0.clone(),
             step.sliding.1.clone(),
@@ -535,14 +553,22 @@ impl SovDecoder {
             step.full.1.clone(),
         ];
         let mut run = match &self.graphs {
-            Ok(graphs)
-                if self
-                    .moe_backend
-                    .routes_on_device(&self.device, count, self.config.top_k) =>
-            {
-                graphs.begin(count)
-            }
+            Ok(graphs) if graphed => graphs.begin(width),
             _ => None,
+        };
+        let real = |t: &Tensor| -> Result<Tensor> {
+            Ok(if width > count {
+                t.narrow(0, 0, count)?
+            } else {
+                t.clone()
+            })
+        };
+        let pad = |t: Tensor| -> Result<Tensor> {
+            Ok(if width > count {
+                t.pad_with_zeros(0, 0, width - count)?
+            } else {
+                t
+            })
         };
         let mut stretch = |index: usize,
                            inputs: Vec<Tensor>,
@@ -565,20 +591,20 @@ impl SovDecoder {
         let last = self.layers.len() - 1;
         for index in 0..self.layers.len() {
             let attention = &self.layers[index].attention;
-            let attended = attention.attend_batch(
+            let attended = pad(attention.attend_batch(
                 batch,
                 rows[0].cache,
                 index,
-                [&qkv[0], &qkv[1], &qkv[2]],
+                [&real(&qkv[0])?, &real(&qkv[1])?, &real(&qkv[2])?],
                 self.dtype,
-            )?;
+            )?)?;
             profile.mark(&self.device, PrefillPhase::Attention)?;
             if index == last {
                 let tail = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
                     let x = self.post_attention(index, &inputs[0], &inputs[1])?;
                     Ok(vec![self.final_norm.forward_f32(&x)?])
                 };
-                let out = stretch(index + 1, vec![x, attended], &tail)?.remove(0);
+                let out = real(&stretch(index + 1, vec![x, attended], &tail)?.remove(0))?;
                 profile.mark(&self.device, PrefillPhase::Experts)?;
                 profile.finish_named("decode", count, count);
                 return Ok(out);

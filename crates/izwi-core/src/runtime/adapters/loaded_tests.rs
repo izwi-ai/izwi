@@ -1059,6 +1059,24 @@ fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows()
             );
         }
     }
+    // SOV-Transcribe decodes at the fitted width; its prefill keeps the
+    // engine rows. It decoded eight rows on the H100 however wide the load
+    // fitted it, because its adapter never received the decode width.
+    for (fitted, decode_rows) in [(None, 32), (Some(32), 32), (Some(16), 16)] {
+        let contract = sequence_graph(ModelVariant::SovTranscribe1, fitted);
+        let decode = stage(&contract, StageWorkSelector::SequenceDecode);
+        assert_eq!(decode.max_batch_size, decode_rows, "SOV {fitted:?}");
+        assert_eq!(
+            decode.max_workspace_bytes,
+            decode.max_workspace_bytes / decode_rows as u64 * decode_rows as u64
+        );
+        assert_eq!(contract.execution_profile.max_batch_size, decode_rows);
+        assert_eq!(
+            stage(&contract, StageWorkSelector::SequencePrefill).max_batch_size,
+            8,
+            "SOV {fitted:?}"
+        );
+    }
     // Rumble decodes up to 64 rows on CUDA, and its encoder and batched
     // prefill widen with the decode up to 32 rows.
     if crate::models::architectures::rumble::rumble_retained_decode_enabled(BackendKind::Cuda) {

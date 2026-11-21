@@ -539,13 +539,16 @@ impl LoadedExecutionAdapterFactory for SovTranscribeAsrAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(SovTranscribeAsrExecutionAdapter::new(
-            context.execution_group_id,
-            context.model_instance_id,
-            metadata,
-            context.backend_kind,
-            context.max_tensor_batch_size,
-        )))
+        Ok(Arc::new(
+            SovTranscribeAsrExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+            )
+            .with_decode_batch_size(context.max_decode_batch_size),
+        ))
     }
 }
 
