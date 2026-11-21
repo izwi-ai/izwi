@@ -1775,24 +1775,21 @@ impl LoadedExecutionAdapter for Audio8TtsExecutionAdapter {
         preparation.max_workspace_bytes =
             crate::models::architectures::audio8::codec::maximum_preparation_workspace_bytes()?;
 
+        // Prompts prefill one request at a time, on the model's grid on CUDA
+        // (`Audio8TtsModel::prefill_grid_tokens`): packed prompts shared their
+        // projections' rows, so a request's first frames, and every frame
+        // after through its KV, depended on what it was prefilled beside.
+        // A prompt is usually one span of a few milliseconds.
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
             AUDIO8_TTS_PREFILL_STAGE,
             &profile,
-            if capacity.native_batching {
-                NativeBatchMode::Static
-            } else {
-                NativeBatchMode::None
-            },
+            NativeBatchMode::None,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
-        prefill.concurrency = if capacity.native_batching {
-            ConcurrencyClass::Batchable
-        } else {
-            ConcurrencyClass::Exclusive
-        };
+        prefill.concurrency = ConcurrencyClass::Exclusive;
         prefill.shape_policy = StageShapePolicy::Ragged;
-        prefill.max_batch_size = capacity.ar_rows.min(capacity.prefill_tokens as usize);
+        prefill.max_batch_size = 1;
         prefill.max_work_units = capacity.prefill_tokens;
         prefill.workspace_per_row_bytes = 0;
         prefill.workspace_per_work_unit_bytes = capacity.prefill_workspace_per_token;

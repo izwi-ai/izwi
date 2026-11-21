@@ -80,6 +80,12 @@ pub(crate) const AUDIO8_TTS_PREPARATION_STAGE: &str = "tts.prepare.audio8";
 pub(crate) const AUDIO8_TTS_PREFILL_STAGE: &str = "tts.prefill.audio8";
 pub(crate) const AUDIO8_TTS_DECODE_STAGE: &str = "tts.decode.audio8";
 pub(crate) const AUDIO8_AUDIO_CHUNK_FRAMES: usize = 16;
+
+/// The prompt tokens of one Audio8 prefill span on CUDA. Every span but a
+/// prompt's last is exactly this long whatever else the step runs: a span's
+/// length is its projections' row count, so a span cut to a step's leftover
+/// budget changed the prompt's bits under load. Most prompts are one span.
+pub(crate) const AUDIO8_CUDA_PREFILL_SPAN: usize = 256;
 pub(crate) const AUDIO8_FIRST_AUDIO_FRAMES: usize = 4;
 pub(crate) const AUDIO8_TTS_AUDIO_DECODE_STAGE: &str = "tts.audio_decode.audio8";
 pub(crate) const AUDIO8_TTS_FINALIZE_STAGE: &str = "tts.codec.audio8.scalar";
@@ -206,6 +212,17 @@ const RAS_HIGH_TOP_P: f32 = 0.9;
 static NEXT_AUDIO8_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 impl Audio8TtsModel {
+    /// The cell of the scheduler's prefill grid for this model's prompts:
+    /// [`AUDIO8_CUDA_PREFILL_SPAN`] on CUDA, where decode runs row-invariant
+    /// (`slow::decode_rows`) and prefill one request alone; 0 (no grid) on
+    /// the CPU and Metal, and before the weights load.
+    pub fn prefill_grid_tokens(&self) -> usize {
+        match &self.runtime {
+            Some(runtime) if runtime.slow.device().is_cuda() => AUDIO8_CUDA_PREFILL_SPAN,
+            _ => 0,
+        }
+    }
+
     /// Metadata-only fixture for request preparation and admission tests.
     /// Native inference remains unavailable, as for `load_metadata`.
     #[cfg(test)]

@@ -228,6 +228,11 @@ impl Audio8SlowTransformer {
         &self.cfg
     }
 
+    /// The device the transformer's weights live on.
+    pub(crate) fn device(&self) -> &candle_core::Device {
+        self.lm_head.weight().device()
+    }
+
     /// Persistent RoPE table bytes, shared by every slow layer.
     pub fn rotary_cache_bytes(&self) -> u64 {
         self.layers
@@ -407,13 +412,22 @@ impl Audio8SlowTransformer {
         }
         let mut batch =
             super::batch::Audio8PhysicalBatch::new(caches, &counts, self.cfg.num_hidden_layers)?;
+        let rows = counts.len();
+        // A decode step on CUDA runs its dense work at a fixed row count, so
+        // cuBLAS picks one kernel whatever the step's width and a request
+        // decodes the same alone and beside others (see `decode_rows`).
+        let padded = decode_rows(inputs[0].device(), &counts);
         let execution = (|| {
             let mut hidden = Tensor::cat(inputs, 1)?;
+            if let Some(padded) = padded {
+                hidden = hidden.pad_with_zeros(1, 0, padded - rows)?;
+            }
+            let real = counts.iter().sum::<usize>();
             for (index, layer) in self.layers.iter().enumerate() {
                 let norm = layer.input_layernorm.forward(&hidden)?;
                 let attn = layer
                     .self_attn
-                    .forward_batch(&norm, &starts, &counts, caches[0], &mut batch, index)?;
+                    .forward_batch(&norm, real, &starts, &counts, caches[0], &mut batch, index)?;
                 hidden = hidden.broadcast_add(&attn)?;
                 let ff = layer
                     .mlp
@@ -430,7 +444,12 @@ impl Audio8SlowTransformer {
                 })
                 .collect::<candle_core::Result<Vec<_>>>()?;
             let packed_tails = Tensor::cat(&tails, 0)?;
-            let logits = self.project_logits(&packed_tails)?;
+            let logits = match padded {
+                Some(padded) => self
+                    .project_logits(&packed_tails.pad_with_zeros(0, 0, padded - rows)?)?
+                    .narrow(0, 0, rows)?,
+                None => self.project_logits(&packed_tails)?,
+            };
             (0..counts.len())
                 .map(|row| {
                     Ok(Audio8SlowOutput {
@@ -596,20 +615,24 @@ impl Audio8PackedAttention {
         })
     }
 
+    /// Attention of the packed rows in `x`: its first `total` positions are
+    /// the rows' tokens; any after them are zero padding that the dense
+    /// projections run over and attention skips.
     #[allow(clippy::too_many_arguments)]
     fn forward_batch(
         &self,
         x: &Tensor,
+        total: usize,
         starts: &[usize],
         counts: &[usize],
         cache: &PhysicalPagedKvCache,
         batch: &mut super::batch::Audio8PhysicalBatch,
         layer: usize,
     ) -> Result<Tensor> {
-        let total = x.dim(1)?;
+        let width = x.dim(1)?;
         let qsize = self.num_heads * self.head_dim;
         let kvsize = self.num_kv_heads * self.head_dim;
-        let qkv = self.qkv_proj.forward(x)?;
+        let qkv = self.qkv_proj.forward(x)?.narrow(1, 0, total)?;
         let q = qkv
             .narrow(2, 0, qsize)?
             .reshape((1, total, self.num_heads, self.head_dim))?;
@@ -647,9 +670,13 @@ impl Audio8PackedAttention {
             &v.contiguous()?,
             1.0 / (self.head_dim as f32).sqrt(),
         )?;
-        self.o_proj
-            .forward(&out.reshape((1, total, qsize))?)
-            .map_err(Error::from)
+        let out = out.reshape((1, total, qsize))?;
+        let out = if width > total {
+            out.pad_with_zeros(1, 0, width - total)?
+        } else {
+            out
+        };
+        self.o_proj.forward(&out).map_err(Error::from)
     }
 
     fn forward(
@@ -739,6 +766,24 @@ fn load_rms_norm_alias(dim: usize, eps: f64, vb: &VarBuilder, aliases: &[&str]) 
 #[cfg(test)]
 pub(super) fn tiny_for_batch_tests() -> Audio8SlowTransformer {
     tests::tiny_model(&candle_core::Device::Cpu)
+}
+
+/// Rows a decode step's dense work runs at on CUDA.
+pub(crate) const AUDIO8_DECODE_ROWS: usize = 32;
+
+/// The fixed row count a step's dense work runs at, or `None` to run the
+/// rows as they are. On CUDA a decode step (every row one token) of at most
+/// [`AUDIO8_DECODE_ROWS`] rows pads to that count: cuBLAS chooses its kernel,
+/// tiles and split by the row count, so a row's bits depended on how many
+/// requests shared its step. Norms, residuals and activations are row-wise
+/// and attention runs per row, so the padding changes no real row. Prefill
+/// spans (one request alone, on its grid) and the CPU and Metal run as they
+/// are.
+fn decode_rows(device: &candle_core::Device, counts: &[usize]) -> Option<usize> {
+    (device.is_cuda()
+        && counts.len() <= AUDIO8_DECODE_ROWS
+        && counts.iter().all(|&count| count == 1))
+    .then_some(AUDIO8_DECODE_ROWS)
 }
 
 #[cfg(test)]
