@@ -139,9 +139,11 @@ impl Linear {
     }
 }
 
-/// An attention's q/k/v projections: one stacked layer on CUDA (one GEMM
-/// whose output the small-attention kernel reads in place), three layers
-/// elsewhere (Metal's mat-vec kernel takes each).
+/// An attention's q/k/v projections: one stacked layer on CUDA and Metal
+/// (one GEMM, or one call of Metal's mat-vec kernel, whose output the
+/// small-attention kernel reads in place), three layers on the CPU. The
+/// mat-vec kernel sums each output over its row of the weight alone, so the
+/// stacked call gives Metal the bits of the three separate ones.
 enum QkvProjection {
     Stacked(Linear),
     Split { q: Linear, k: Linear, v: Linear },
@@ -169,7 +171,7 @@ impl FlowBlock {
         let q = Linear::load(attn.pp("to_q"), hidden, hidden, true)?;
         let k = Linear::load(attn.pp("to_k"), hidden, hidden, true)?;
         let v = Linear::load(attn.pp("to_v"), hidden, hidden, true)?;
-        let qkv = if vb.device().is_cuda() {
+        let qkv = if vb.device().is_cuda() || vb.device().is_metal() {
             QkvProjection::Stacked(Linear::stacked(&[q, k, v])?)
         } else {
             QkvProjection::Split { q, k, v }
@@ -190,10 +192,11 @@ impl FlowBlock {
     /// Each norm is one fused launch with F32 statistics, the second fused
     /// with the attention's residual add; the rotation is Candle's fused
     /// interleaved RoPE; attention over the few positions is the fused
-    /// kernel where the backend has one. On CUDA q, k and v are one GEMM,
-    /// the rotation and attention one small kernel reading its output, and
-    /// every bias (and the MLP's GELU) rides in its GEMM's epilogue. Every
-    /// op keeps a batch row's values independent of the rows beside it.
+    /// kernel where the backend has one. On CUDA and Metal q, k and v are
+    /// one projection and the rotation and attention one small kernel
+    /// reading its output; on CUDA every bias (and the MLP's GELU) rides in
+    /// its GEMM's epilogue. Every op keeps a batch row's values independent
+    /// of the rows beside it.
     fn forward(
         &self,
         x: &Tensor,
