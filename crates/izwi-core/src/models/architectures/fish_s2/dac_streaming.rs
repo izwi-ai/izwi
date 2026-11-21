@@ -180,7 +180,11 @@ impl FishS2DacDecoder {
                 "Fish codec batch rows do not match".into(),
             ));
         }
-        let mut groups = std::collections::BTreeMap::<(usize, usize), Vec<usize>>::new();
+        // On CUDA each row is its own group: cuBLAS and cuDNN choose kernels
+        // by the batch's size, so a row pushed beside others decoded to
+        // different PCM rounding than alone.
+        let row_invariant = self.decoder_device()?.is_cuda();
+        let mut groups = std::collections::BTreeMap::<(usize, usize, usize), Vec<usize>>::new();
         let mut tensors = Vec::with_capacity(states.len());
         for (row, (state, codes)) in states.iter().zip(codebooks).enumerate() {
             check_cancelled()?;
@@ -201,8 +205,9 @@ impl FishS2DacDecoder {
                 &self.config,
                 self.decoder_device()?,
             )?);
+            let lane = if row_invariant { row } else { 0 };
             groups
-                .entry((state.frames, incoming))
+                .entry((state.frames, incoming, lane))
                 .or_default()
                 .push(row);
         }
