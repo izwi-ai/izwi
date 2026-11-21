@@ -998,6 +998,22 @@ mod tests {
         }
     }
 
+    /// The kernels decode E4M3 by moving its bits into FP16 (seee.emmm to
+    /// s0eeee.mmm0000000), the code's value times 2^-8 for every finite code.
+    #[test]
+    fn e4m3_bits_moved_into_fp16_are_the_value_over_256() {
+        for byte in 0..=255u8 {
+            let value = e4m3_to_f32(byte);
+            if !value.is_finite() {
+                continue;
+            }
+            let b = u16::from(byte);
+            let bits = ((b & 0x80) << 8) | ((b & 0x7F) << 7);
+            let moved = half::f16::from_bits(bits).to_f32() * 256.0;
+            assert_eq!(moved, value, "{byte:#04x}");
+        }
+    }
+
     #[test]
     fn fp8_rows_round_trip_within_e4m3_precision() {
         let w = bf16_tensor(&[3, 8, 64], 5, 1.0, &Device::Cpu);

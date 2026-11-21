@@ -1,4 +1,5 @@
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -241,45 +242,50 @@ extern "C" __global__ void izwi_mgl_combine(
 // ---------------------------------------------------------------------------
 // FP8 experts: E4M3 weights with one F32 scale per output row
 // (`kernels::moe_gelu::Fp8Weights`). The same grouping, routing and combine;
-// the up and down kernels read half the bytes. A block decodes E4M3 through
-// a 256-entry table in shared memory; each lane loads 16 weights (16 bytes)
-// a sweep of 512, and a row's dot product is scaled once at the end. Widths
-// must be multiples of 16.
+// the up and down kernels read half the bytes. Each lane loads 16 weights
+// (16 bytes) a sweep of 512 and decodes them by moving bits into FP16; a
+// row's dot product is scaled once at the end. Widths must be multiples of
+// 16.
 
-// Exact finite E4M3FN decoding (as kernels/cuda/fp8.cu).
-__device__ __forceinline__ float mgl_e4m3(unsigned int b) {
-  const int e = (b >> 3) & 15, m = b & 7;
-  const float v = e == 0 ? ldexpf((float)m, -9)
-                         : (e == 15 && m == 7 ? NAN : ldexpf(1.f + (float)m * .125f, e - 7));
-  return (b & 128) ? -v : v;
+
+
+// E4M3 -> FP16 by moving bits: seee.emmm becomes the FP16 s0eeee.mmm0000000,
+// exactly the E4M3 value times 2^-8 for every finite code (subnormals
+// included), so the 2^8 rides in the row scale (`MGL_E4M3_UNSCALE`). Bytes 0
+// and 2 of `word` land in one half2, bytes 1 and 3 in the other.
+#define MGL_E4M3_UNSCALE 256.0f
+
+__device__ __forceinline__ float2 mgl_e4m3x2_even(unsigned int word) {
+  const unsigned int bits = ((word & 0x00800080u) << 8) | ((word & 0x007F007Fu) << 7);
+  return __half22float2(*reinterpret_cast<const __half2*>(&bits));
 }
 
-__device__ __forceinline__ void mgl_fill_lut(float* lut) {
-  for (int i = threadIdx.x; i < 256; i += blockDim.x) lut[i] = mgl_e4m3((unsigned)i);
-  __syncthreads();
+__device__ __forceinline__ float2 mgl_e4m3x2_odd(unsigned int word) {
+  return mgl_e4m3x2_even(word >> 8);
 }
 
-// Four E4M3 bytes of `word` times four F32 activations.
-__device__ __forceinline__ float mgl_dot4_fp8(unsigned int word, float4 a, const float* lut,
-                                              float acc) {
-  acc = fmaf(lut[word & 0xFFu], a.x, acc);
-  acc = fmaf(lut[(word >> 8) & 0xFFu], a.y, acc);
-  acc = fmaf(lut[(word >> 16) & 0xFFu], a.z, acc);
-  return fmaf(lut[word >> 24], a.w, acc);
+// Four E4M3 bytes of `word` times four F32 activations (unscaled by 2^-8).
+__device__ __forceinline__ float mgl_dot4_fp8(unsigned int word, float4 a, float acc) {
+  const float2 even = mgl_e4m3x2_even(word), odd = mgl_e4m3x2_odd(word);
+  acc = fmaf(even.x, a.x, acc);
+  acc = fmaf(odd.x, a.y, acc);
+  acc = fmaf(even.y, a.z, acc);
+  return fmaf(odd.y, a.w, acc);
 }
 
-// A lane's share of an E4M3 row . x over `len` values (len % 16 == 0).
+// A lane's share of an E4M3 row . x over `len` values (len % 16 == 0), in
+// units of 2^-8 (callers multiply by scale * MGL_E4M3_UNSCALE).
 __device__ __forceinline__ float mgl_row_dot_fp8(const unsigned char* __restrict__ row,
                                                  const float* __restrict__ x, int len,
-                                                 int lane, const float* lut) {
+                                                 int lane) {
   float acc = 0.0f;
   for (int k0 = lane * 16; k0 < len; k0 += 512) {
     const uint4 q = *reinterpret_cast<const uint4*>(row + k0);
     const float4* xv = reinterpret_cast<const float4*>(x + k0);
-    acc = mgl_dot4_fp8(q.x, xv[0], lut, acc);
-    acc = mgl_dot4_fp8(q.y, xv[1], lut, acc);
-    acc = mgl_dot4_fp8(q.z, xv[2], lut, acc);
-    acc = mgl_dot4_fp8(q.w, xv[3], lut, acc);
+    acc = mgl_dot4_fp8(q.x, xv[0], acc);
+    acc = mgl_dot4_fp8(q.y, xv[1], acc);
+    acc = mgl_dot4_fp8(q.z, xv[2], acc);
+    acc = mgl_dot4_fp8(q.w, xv[3], acc);
   }
   return acc;
 }
@@ -291,8 +297,6 @@ extern "C" __global__ void izwi_mgl_up_grouped_fp8(
     const int* __restrict__ sorted_pairs, const unsigned char* __restrict__ gate_up,
     const float* __restrict__ scale, float* __restrict__ act, int slots, int hidden,
     int inter) {
-  __shared__ float lut[256];
-  mgl_fill_lut(lut);
   const int lane = threadIdx.x & 31;
   const int e = blockIdx.x;
   const int begin = offsets[e];
@@ -303,12 +307,13 @@ extern "C" __global__ void izwi_mgl_up_grouped_fp8(
   const int64_t up_row = gate_row + inter;
   const unsigned char* gate = gate_up + gate_row * hidden;
   const unsigned char* up = gate_up + up_row * hidden;
-  const float gate_scale = scale[gate_row], up_scale = scale[up_row];
+  const float gate_scale = scale[gate_row] * MGL_E4M3_UNSCALE;
+  const float up_scale = scale[up_row] * MGL_E4M3_UNSCALE;
   for (int i = begin; i < end; ++i) {
     const int pair = sorted_pairs[i];
     const float* xt = x + (int64_t)(pair / slots) * hidden;
-    const float g = mgl_warp_sum(mgl_row_dot_fp8(gate, xt, hidden, lane, lut)) * gate_scale;
-    const float u = mgl_warp_sum(mgl_row_dot_fp8(up, xt, hidden, lane, lut)) * up_scale;
+    const float g = mgl_warp_sum(mgl_row_dot_fp8(gate, xt, hidden, lane)) * gate_scale;
+    const float u = mgl_warp_sum(mgl_row_dot_fp8(up, xt, hidden, lane)) * up_scale;
     if (lane == 0) act[(int64_t)pair * inter + n] = mgl_gelu_tanh(g) * u;
   }
 }
@@ -319,8 +324,6 @@ extern "C" __global__ void izwi_mgl_down_grouped_fp8(
     const float* __restrict__ act, const int* __restrict__ offsets,
     const int* __restrict__ sorted_pairs, const unsigned char* __restrict__ down,
     const float* __restrict__ scale, float* __restrict__ partial, int hidden, int inter) {
-  __shared__ float lut[256];
-  mgl_fill_lut(lut);
   const int lane = threadIdx.x & 31;
   const int e = blockIdx.x;
   const int begin = offsets[e];
@@ -329,11 +332,11 @@ extern "C" __global__ void izwi_mgl_down_grouped_fp8(
   if (begin == end || h >= hidden) return;
   const int64_t r = (int64_t)e * hidden + h;
   const unsigned char* row = down + r * inter;
-  const float s = scale[r];
+  const float s = scale[r] * MGL_E4M3_UNSCALE;
   for (int i = begin; i < end; ++i) {
     const int pair = sorted_pairs[i];
     const float p =
-        mgl_warp_sum(mgl_row_dot_fp8(row, act + (int64_t)pair * inter, inter, lane, lut)) * s;
+        mgl_warp_sum(mgl_row_dot_fp8(row, act + (int64_t)pair * inter, inter, lane)) * s;
     if (lane == 0) partial[(int64_t)pair * hidden + h] = p;
   }
 }
@@ -392,8 +395,6 @@ extern "C" __global__ void izwi_mgl_fp8_dequant_experts(
     const unsigned char* __restrict__ q, const float* __restrict__ scale,
     const int* __restrict__ experts, __nv_bfloat16* __restrict__ out, int count, int rows,
     int cols) {
-  __shared__ float lut[256];
-  mgl_fill_lut(lut);
   const int64_t per = (int64_t)rows * cols;
   const int64_t total = per * count;
   for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < total;
@@ -402,6 +403,9 @@ extern "C" __global__ void izwi_mgl_fp8_dequant_experts(
     const int64_t within = i - g * per;
     const int64_t r = within / cols;
     const int64_t e = experts[g];
-    out[i] = __float2bfloat16(lut[q[e * per + within]] * scale[e * rows + r]);
+    const unsigned int b = q[e * per + within];
+    const unsigned short bits = (unsigned short)(((b & 0x80u) << 8) | ((b & 0x7Fu) << 7));
+    out[i] = __float2bfloat16(__half2float(*reinterpret_cast<const __half*>(&bits)) *
+                              (scale[e * rows + r] * MGL_E4M3_UNSCALE));
   }
 }
