@@ -50,10 +50,17 @@ const POSTERIOR_SCALE_FLOOR: f32 = 1e-4;
 
 /// `x` [rows, in] through `weight` [out, in] as stored (transposed as a
 /// view, so no transposed copy is written on the device).
-fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+/// With `tf32` (the decoder's head, see [`MingWindowStack::with_tf32`]) an
+/// F32 product runs in TF32 on CUDA.
+fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, tf32: bool) -> Result<Tensor> {
     // Metal's matmul takes a left operand only with unit row stride: the
     // encoder's group tokens are a strided view.
-    super::stack::product(&x.contiguous()?, weight, bias)
+    super::stack::product(&x.contiguous()?, weight, bias, tf32)
+}
+
+/// Whether the decoder's own linears run in TF32 (as its stack does).
+fn decoder_tf32() -> bool {
+    super::stack::f32_tf32_requested()
 }
 
 fn weight_t(vb: &VarBuilder, output: usize, input: usize) -> Result<Tensor> {
@@ -220,7 +227,8 @@ impl MingVaeDecoder {
         let hidden = cfg.vae_stack.hidden_size;
         let fc1 = vb.pp("fc1");
         let head = vb.pp("head").pp("out");
-        let stack = MingWindowStack::load(cfg.vae_stack.clone(), vb.pp("decoder"), window_keys)?;
+        let stack = MingWindowStack::load(cfg.vae_stack.clone(), vb.pp("decoder"), window_keys)?
+            .with_tf32();
         let fixed = if fixed {
             let kept = stack.fixed_kept() as u32;
             let gathers = (1..=FIXED_WINDOW_FRAMES as u32)
@@ -370,9 +378,10 @@ impl MingVaeDecoder {
                     let device = self.stack.device();
                     let x = Tensor::from_vec(frames, (new, LATENT_DIM), device)?
                         .to_dtype(self.dtype())?;
-                    let x = linear(&x, &self.fc1_t, Some(&self.fc1_bias))?;
+                    let x = linear(&x, &self.fc1_t, Some(&self.fc1_bias), decoder_tf32())?;
                     let hidden = self.stack.forward(&x, &mut state.stack)?;
-                    linear(&hidden, &self.head_t, Some(&self.head_bias))?.to_dtype(DType::F32)?
+                    linear(&hidden, &self.head_t, Some(&self.head_bias), decoder_tf32())?
+                        .to_dtype(DType::F32)?
                 }
             })
         } else {
@@ -409,11 +418,11 @@ impl MingVaeDecoder {
                 .narrow(1, 0, LATENT_DIM)?
                 .contiguous()?
                 .to_dtype(self.dtype())?;
-            let x = linear(&x, &self.fc1_t, Some(&self.fc1_bias))?;
+            let x = linear(&x, &self.fc1_t, Some(&self.fc1_bias), decoder_tf32())?;
             let tables = packed.narrow(1, LATENT_DIM, tables)?;
             let (hidden, kept) = self.stack.fixed_forward(&x, &tables, gather, kept)?;
-            let head =
-                linear(&hidden, &self.head_t, Some(&self.head_bias))?.to_dtype(DType::F32)?;
+            let head = linear(&hidden, &self.head_t, Some(&self.head_bias), decoder_tf32())?
+                .to_dtype(DType::F32)?;
             Ok(vec![head, kept])
         };
         let bytes = |tensor: &Tensor| (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64;
@@ -638,9 +647,10 @@ impl MingVaeEncoder {
         let x =
             Tensor::from_vec(samples.to_vec(), (frames, FRAME_SAMPLES), device)?.to_dtype(dtype)?;
         let x = linear(
-            &linear(&x, &self.fc1_t, None)?,
+            &linear(&x, &self.fc1_t, None, false)?,
             &self.fc2_t,
             Some(&self.fc2_bias),
+            false,
         )?;
         let hidden = self.stack.forward(&x, &mut MingWindowState::default())?;
         // The group token after every four frames.
@@ -663,7 +673,7 @@ impl MingVaeEncoder {
             .narrow(1, FRAMES_PER_LATENT, 1)?
             .squeeze(1)?
             .contiguous()?;
-        let moments = linear(&tokens, &self.fc3_t, Some(&self.fc3_bias))?
+        let moments = linear(&tokens, &self.fc3_t, Some(&self.fc3_bias), false)?
             .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?;
         let mean = moments

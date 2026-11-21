@@ -69,12 +69,13 @@ pub(crate) fn project_rows(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -
     add_bias(product, bias)
 }
 
-/// Multiplies Ming's F32 matmuls (the VAE's; the language model's only when
-/// it falls back to F32) on CUDA tensor cores in TF32 (a boolean; on when
-/// unset). Read once.
+/// Multiplies the F32 matmuls of Ming's VAE decoder on CUDA tensor cores in
+/// TF32 (a boolean; on when unset). Read once. The VAE encoder (a voice
+/// prompt's latents, which steer generation) and the language model keep
+/// their own precision.
 pub(crate) const MING_TTS_F32_TF32_ENV: &str = "IZWI_MING_TTS_F32_TF32";
 
-fn f32_tf32_requested() -> bool {
+pub(crate) fn f32_tf32_requested() -> bool {
     static ON: crate::env::ReadOnce<bool> =
         crate::env::ReadOnce::new(|| crate::env::flag_or(MING_TTS_F32_TF32_ENV, true));
     ON.get()
@@ -96,20 +97,23 @@ fn add_bias(product: Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     }
 }
 
-/// `x` [rows, in] · `weight` [out, in]ᵀ (+ `bias`): an F32 product runs in
-/// TF32 on CUDA tensor cores (F32 tensors and sums, the multiply's inputs
-/// rounded to a 10-bit mantissa) unless `IZWI_MING_TTS_F32_TF32` is off;
-/// everything else is Candle's matmul. The bias goes through [`add_bias`].
-pub(crate) fn product(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+/// `x` [rows, in] · `weight` [out, in]ᵀ (+ `bias`): with `tf32`, an F32
+/// product runs in TF32 on CUDA tensor cores (F32 tensors and sums, the
+/// multiply's inputs rounded to a 10-bit mantissa); everything else is
+/// Candle's matmul. The bias goes through [`add_bias`].
+pub(crate) fn product(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    tf32: bool,
+) -> Result<Tensor> {
     use crate::kernels::cuda::tf32_gemm;
-    let product = if tf32_gemm::serves(x.device(), x.dtype())
-        && weight.dtype() == DType::F32
-        && f32_tf32_requested()
-    {
-        tf32_gemm::matmul_t(x, weight)?
-    } else {
-        x.matmul(&weight.t()?)?
-    };
+    let product =
+        if tf32 && tf32_gemm::serves(x.device(), x.dtype()) && weight.dtype() == DType::F32 {
+            tf32_gemm::matmul_t(x, weight)?
+        } else {
+            x.matmul(&weight.t()?)?
+        };
     add_bias(product, bias)
 }
 
@@ -127,7 +131,7 @@ fn norm_f32(x: &Tensor, gain: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 fn project(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-    product(x, weight, bias)
+    product(x, weight, bias, false)
 }
 
 /// One layer's weights, each as the checkpoint stores it (the two norm
@@ -149,6 +153,9 @@ pub(crate) struct MingLayer {
     up: Tensor,
     /// The down projection, F32 under F16 weights (see [`Self::finish`]).
     down: Tensor,
+    /// Whether an F32 product runs in TF32 on CUDA (the VAE decoder's
+    /// layers; see [`MingWindowStack::with_tf32`]).
+    tf32: bool,
 }
 
 impl MingLayer {
@@ -185,6 +192,7 @@ impl MingLayer {
                     weight(down, hidden, cfg.intermediate_size)?
                 }
             },
+            tf32: false,
         })
     }
 
@@ -210,7 +218,7 @@ impl MingLayer {
             if rows_independent {
                 project_rows(&normed, weight, Some(bias))
             } else {
-                project(&normed, weight, Some(bias))
+                product(&normed, weight, Some(bias), self.tf32)
             }
         };
         // Callers build the tables in the layer's dtype; a cast is a no-op.
@@ -243,7 +251,7 @@ impl MingLayer {
             if rows_independent {
                 project_rows(x, weight, None)
             } else {
-                project(x, weight, None)
+                product(x, weight, None, self.tf32)
             }
         };
         let wide = x.dtype();
@@ -772,6 +780,17 @@ impl MingWindowStack {
         })
     }
 
+    /// This stack's F32 products in TF32 on CUDA unless
+    /// `IZWI_MING_TTS_F32_TF32` is off: for the VAE decoder, whose output is
+    /// audio only and never feeds generation back.
+    pub fn with_tf32(mut self) -> Self {
+        let tf32 = f32_tf32_requested();
+        for layer in &mut self.layers {
+            layer.tf32 = tf32;
+        }
+        self
+    }
+
     pub fn dtype(&self) -> DType {
         self.dtype
     }
@@ -1044,15 +1063,15 @@ impl MingWindowStack {
                 .contiguous()?
                 .reshape((count, cfg.q_out()))?;
             let attn_in = max(&q)?;
-            let o = project(&attn, &layer.o_proj, None)?;
+            let o = product(&attn, &layer.o_proj, None, layer.tf32)?;
             let mid = hidden.add(&o.to_dtype(DType::F32)?)?;
             let normed =
                 rms_norm(&mid, &layer.post_norm, cfg.rms_norm_eps)?.to_dtype(self.dtype)?;
             let down_dtype = layer.down.dtype();
-            let gate = project(&normed, &layer.gate, None)?.to_dtype(down_dtype)?;
-            let up = project(&normed, &layer.up, None)?.to_dtype(down_dtype)?;
+            let gate = product(&normed, &layer.gate, None, layer.tf32)?.to_dtype(down_dtype)?;
+            let up = product(&normed, &layer.up, None, layer.tf32)?.to_dtype(down_dtype)?;
             let act = candle_nn::ops::silu(&gate)?.mul(&up)?;
-            let mlp = project(&act, &layer.down, None)?;
+            let mlp = product(&act, &layer.down, None, layer.tf32)?;
             hidden = mid.add(&mlp.to_dtype(DType::F32)?)?;
             rows.push([
                 attn_in,

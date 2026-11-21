@@ -1612,7 +1612,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Flag,
         "true",
         Load,
-        "Runs Ming's F32 matmuls (the VAE's; the language model's only after an F32 fallback) on CUDA tensor cores in TF32 (F32 tensors and sums, the multiply's inputs rounded to a 10-bit mantissa).",
+        "Runs the F32 matmuls of Ming's VAE decoder on CUDA tensor cores in TF32 (F32 tensors and sums, the multiply's inputs rounded to a 10-bit mantissa); the VAE encoder and the language model keep their precision.",
     ),
     CoreEnvVar::new(
         "IZWI_MING_TTS_FLOW_GRAPHS",
