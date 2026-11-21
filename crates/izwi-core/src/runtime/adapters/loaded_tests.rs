@@ -4244,6 +4244,21 @@ fn batched_tts_families_decode_at_the_tts_width_and_prefill_at_the_engine_rows()
             "{variant} on Metal"
         );
     }
+    // Ming's CUDA graph (its batched audio stage included) satisfies the
+    // per-row invocation descriptor a load validates it against: a shared
+    // workspace amount on top of the per-row one failed every CUDA load.
+    {
+        use crate::models::architectures::ming_tts::{config::MingTtsConfig, physical};
+        let ming = sequence_graph(ModelVariant::Ming30Tts05B, BackendKind::Cuda);
+        let retained = physical::ming_retained_contract(
+            &MingTtsConfig::pinned().llm,
+            candle_core::DType::BF16,
+            64,
+        )
+        .unwrap();
+        physical::ming_physical_state_spec(&[ming.stages.as_ref()], retained, 1024)
+            .expect("Ming's CUDA stages satisfy their invocation descriptor");
+    }
     for variant in [
         ModelVariant::Kokoro82M,
         ModelVariant::FishAudioS2Pro,

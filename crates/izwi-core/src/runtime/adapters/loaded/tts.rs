@@ -1098,11 +1098,14 @@ impl LoadedExecutionAdapter for MingTtsExecutionAdapter {
             // a layer); each queued row holds its head output (0.5 MB),
             // its kept keys in and out (1.5 MB each) and its inputs until
             // it is read back.
+            // Ming's invocation workspace is leased per row (the state
+            // descriptor requires the per-row amount times the rows to equal
+            // the stage's maximum), so each row carries an even share of the
+            // one window running at a time.
             let shared = 64 * 1024 * 1024_u64;
-            let per_row = 8 * 1024 * 1024_u64;
-            acoustic.workspace_base_bytes = shared;
+            let per_row = 8 * 1024 * 1024_u64 + shared.div_ceil(rows as u64);
             acoustic.workspace_per_row_bytes = per_row;
-            acoustic.max_workspace_bytes = per_row.saturating_mul(rows as u64) + shared;
+            acoustic.max_workspace_bytes = per_row.saturating_mul(rows as u64);
         } else {
             acoustic.max_batch_size = 1;
             acoustic.concurrency = ConcurrencyClass::Exclusive;
@@ -1881,14 +1884,17 @@ impl LoadedExecutionAdapter for Audio8TtsExecutionAdapter {
         audio_decode.max_batch_size = capacity.codec_rows;
         audio_decode.selector = StageWorkSelector::SequenceAudioDecode;
         audio_decode.progress = StageProgressKind::Iterative;
-        audio_decode.shape_policy = StageShapePolicy::Exact;
+        // Rows of any frame count share a quantum: the codec splits each
+        // row at its own chunk boundaries and runs every chunk in a call of
+        // fixed shape on CUDA, so a row's PCM never depends on its peers.
+        audio_decode.shape_policy = StageShapePolicy::Ragged;
         audio_decode.concurrency = if capacity.native_batching {
             ConcurrencyClass::Batchable
         } else {
             ConcurrencyClass::Exclusive
         };
         audio_decode.max_work_units =
-            (crate::models::architectures::audio8::AUDIO8_AUDIO_CHUNK_FRAMES as u64)
+            (crate::models::architectures::audio8::AUDIO8_CODEC_QUANTUM_FRAMES as u64)
                 .saturating_mul(capacity.codec_rows as u64);
         audio_decode.workspace_per_row_bytes = capacity.codec_workspace_per_row;
         audio_decode.max_workspace_bytes = capacity

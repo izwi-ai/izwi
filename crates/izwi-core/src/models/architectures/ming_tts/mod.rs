@@ -24,7 +24,7 @@ pub mod config;
 pub mod flow;
 mod graphs;
 mod model;
-mod physical;
+pub(crate) mod physical;
 pub mod prompt;
 pub(crate) mod retained;
 pub mod speaker;
