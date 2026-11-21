@@ -82,6 +82,16 @@ impl Linear {
                 )?);
             }
         }
+        if let Some(bias) = &self.bias {
+            if crate::kernels::cuda::lt_linear::serves(x.device(), x.dtype()) {
+                return Ok(crate::kernels::cuda::lt_linear::linear_bias(
+                    x,
+                    &self.weight,
+                    bias,
+                    false,
+                )?);
+            }
+        }
         let dims = x.dims().to_vec();
         let input = *dims.last().expect("a linear input has a last dim");
         let rows = dims[..dims.len() - 1].iter().product::<usize>();
@@ -93,6 +103,48 @@ impl Linear {
         *shape.last_mut().expect("a last dim") = y.dim(1)?;
         Ok(y.reshape(shape)?)
     }
+
+    /// [`Self::forward`] then Candle's (tanh) GELU; on CUDA the GELU runs in
+    /// the GEMM's epilogue with the bias.
+    fn forward_gelu(&self, x: &Tensor) -> Result<Tensor> {
+        if let Some(bias) = &self.bias {
+            if crate::kernels::cuda::lt_linear::serves(x.device(), x.dtype()) {
+                return Ok(crate::kernels::cuda::lt_linear::linear_bias(
+                    x,
+                    &self.weight,
+                    bias,
+                    true,
+                )?);
+            }
+        }
+        Ok(self.forward(x)?.gelu()?)
+    }
+
+    /// One layer computing `parts` side by side: their weights stacked on
+    /// the output dimension, their biases (all or none) concatenated.
+    fn stacked(parts: &[Linear]) -> Result<Self> {
+        let weights = parts.iter().map(|p| &p.weight).collect::<Vec<_>>();
+        let biases = parts
+            .iter()
+            .filter_map(|p| p.bias.as_ref())
+            .collect::<Vec<_>>();
+        Ok(Self {
+            weight: Tensor::cat(&weights, 0)?,
+            bias: if biases.len() == parts.len() {
+                Some(Tensor::cat(&biases, 0)?)
+            } else {
+                None
+            },
+        })
+    }
+}
+
+/// An attention's q/k/v projections: one stacked layer on CUDA (one GEMM
+/// whose output the small-attention kernel reads in place), three layers
+/// elsewhere (Metal's mat-vec kernel takes each).
+enum QkvProjection {
+    Stacked(Linear),
+    Split { q: Linear, k: Linear, v: Linear },
 }
 
 /// An RMSNorm gain, kept in F32 for the fused norm (`residual_norm`).
@@ -102,9 +154,7 @@ fn norm_gain(vb: VarBuilder, hidden: usize) -> Result<Tensor> {
 
 struct FlowBlock {
     norm1: Tensor,
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
+    qkv: QkvProjection,
     to_out: Linear,
     norm2: Tensor,
     mlp_in: Linear,
@@ -116,11 +166,17 @@ impl FlowBlock {
         let hidden = cfg.hidden_size;
         let attn = vb.pp("attn");
         let ff = vb.pp("mlp").pp("ff");
+        let q = Linear::load(attn.pp("to_q"), hidden, hidden, true)?;
+        let k = Linear::load(attn.pp("to_k"), hidden, hidden, true)?;
+        let v = Linear::load(attn.pp("to_v"), hidden, hidden, true)?;
+        let qkv = if vb.device().is_cuda() {
+            QkvProjection::Stacked(Linear::stacked(&[q, k, v])?)
+        } else {
+            QkvProjection::Split { q, k, v }
+        };
         Ok(Self {
             norm1: norm_gain(vb.pp("norm1"), hidden)?,
-            to_q: Linear::load(attn.pp("to_q"), hidden, hidden, true)?,
-            to_k: Linear::load(attn.pp("to_k"), hidden, hidden, true)?,
-            to_v: Linear::load(attn.pp("to_v"), hidden, hidden, true)?,
+            qkv,
             to_out: Linear::load(attn.pp("to_out").pp("0"), hidden, hidden, true)?,
             norm2: norm_gain(vb.pp("norm2"), hidden)?,
             mlp_in: Linear::load(ff.pp("0").pp("0"), hidden, cfg.mlp_size, true)?,
@@ -134,8 +190,10 @@ impl FlowBlock {
     /// Each norm is one fused launch with F32 statistics, the second fused
     /// with the attention's residual add; the rotation is Candle's fused
     /// interleaved RoPE; attention over the few positions is the fused
-    /// kernel where the backend has one. Every op keeps a batch row's
-    /// values independent of the rows beside it.
+    /// kernel where the backend has one. On CUDA q, k and v are one GEMM,
+    /// the rotation and attention one small kernel reading its output, and
+    /// every bias (and the MLP's GELU) rides in its GEMM's epilogue. Every
+    /// op keeps a batch row's values independent of the rows beside it.
     fn forward(
         &self,
         x: &Tensor,
@@ -151,23 +209,56 @@ impl FlowBlock {
                 .transpose(1, 2)?
                 .contiguous()?)
         };
-        let q = candle_nn::rotary_emb::rope_i(&heads(self.to_q.forward(&normed)?)?, cos, sin)?;
-        let k = candle_nn::rotary_emb::rope_i(&heads(self.to_k.forward(&normed)?)?, cos, sin)?;
-        let v = heads(self.to_v.forward(&normed)?)?;
+        let width = cfg.num_heads * cfg.head_dim;
+        let (q, k, v) = match &self.qkv {
+            QkvProjection::Stacked(qkv) => {
+                let qkv = qkv.forward(&normed)?;
+                if crate::kernels::cuda::small_attention::serves(
+                    qkv.device(),
+                    positions,
+                    cfg.head_dim,
+                ) {
+                    let attn = crate::kernels::cuda::small_attention::rope_attention(
+                        &qkv,
+                        cos,
+                        sin,
+                        cfg.num_heads,
+                        cfg.head_dim,
+                    )?;
+                    return self.finish(x, &attn, dtype);
+                }
+                (
+                    qkv.narrow(2, 0, width)?,
+                    qkv.narrow(2, width, width)?,
+                    qkv.narrow(2, 2 * width, width)?,
+                )
+            }
+            QkvProjection::Split { q, k, v } => (
+                q.forward(&normed)?,
+                k.forward(&normed)?,
+                v.forward(&normed)?,
+            ),
+        };
+        let q = candle_nn::rotary_emb::rope_i(&heads(q)?, cos, sin)?;
+        let k = candle_nn::rotary_emb::rope_i(&heads(k)?, cos, sin)?;
+        let v = heads(v)?;
         let attn = attend(&q, &k, &v, cfg.head_dim)?
             .transpose(1, 2)?
             .contiguous()?
             .reshape((batch, positions, hidden))?;
+        self.finish(x, &attn, dtype)
+    }
+
+    /// The attention's output projection and residual, then the MLP.
+    fn finish(&self, x: &Tensor, attn: &Tensor, dtype: DType) -> Result<Tensor> {
         let (x, normed) = residual_norm::add_rms_norm(
             x,
-            &self.to_out.forward(&attn)?,
+            &self.to_out.forward(attn)?,
             &self.norm2,
             NORM_EPS,
             dtype,
         )?;
-        let mlp = self
-            .mlp_out
-            .forward(&self.mlp_in.forward(&normed)?.gelu()?)?;
+        let mlp = self.mlp_out.forward(&self.mlp_in.forward_gelu(&normed)?)?;
         Ok(x.add(&mlp)?)
     }
 }
@@ -323,6 +414,8 @@ impl MingFlowHead {
         let hidden = cfg.hidden_size;
         let dtype = vb.dtype();
         let device = vb.device().clone();
+        // The CUDA linears' cuBLASLt handle exists before any graph capture.
+        crate::kernels::cuda::lt_linear::prepare(&device)?;
         let time = vb.pp("t_embedder").pp("time_mlp");
         let times = flow_times();
         let half = TIME_EMBED_DIM / 2;
