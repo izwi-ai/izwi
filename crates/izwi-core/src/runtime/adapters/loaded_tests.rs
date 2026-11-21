@@ -2760,7 +2760,10 @@ fn fish_capacity_seals_both_routes_and_rejects_rebinding() {
                 .iter()
                 .find(|stage| stage.selector == StageWorkSelector::SequencePrefill)
                 .unwrap();
-            assert_eq!(prefill.batch_mode, NativeBatchMode::Static);
+            // Prompts prefill one request at a time (a request's bits never
+            // depend on what it was prefilled beside).
+            assert_eq!(prefill.batch_mode, NativeBatchMode::None);
+            assert_eq!(prefill.max_batch_size, 1);
             assert_eq!(prefill.max_work_units, capacity.prefill_tokens);
             let codec = contract
                 .stages
@@ -2810,7 +2813,7 @@ fn batched_fish_workspace_matches_every_loaded_stage() {
                 .iter()
                 .find(|stage| stage.selector == StageWorkSelector::SequencePrefill)
                 .unwrap();
-            assert_eq!(prefill.max_batch_size, 4);
+            assert_eq!(prefill.max_batch_size, 1);
             let spec = crate::models::architectures::fish_s2::fish_s2_physical_state_spec(
                 &config,
                 candle_core::DType::BF16,

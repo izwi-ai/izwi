@@ -1580,24 +1580,20 @@ impl LoadedExecutionAdapter for FishS2TtsExecutionAdapter {
         preparation.max_workspace_bytes =
             crate::models::architectures::fish_s2::codec::maximum_preparation_workspace_bytes()?;
 
+        // Prompts prefill one request at a time, on the model's grid on CUDA
+        // (`FishS2TtsModel::prefill_grid_tokens`): packed prompts shared their
+        // projections' rows, so a request's frames depended on what it was
+        // prefilled beside.
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
             FISH_S2_TTS_PREFILL_STAGE,
             &profile,
-            if capacity.native_batching {
-                NativeBatchMode::Static
-            } else {
-                NativeBatchMode::None
-            },
+            NativeBatchMode::None,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
-        prefill.concurrency = if capacity.native_batching {
-            ConcurrencyClass::Batchable
-        } else {
-            ConcurrencyClass::Exclusive
-        };
+        prefill.concurrency = ConcurrencyClass::Exclusive;
         prefill.shape_policy = StageShapePolicy::Ragged;
-        prefill.max_batch_size = capacity.ar_rows.min(capacity.prefill_tokens as usize);
+        prefill.max_batch_size = 1;
         prefill.max_work_units = capacity.prefill_tokens;
         prefill.workspace_per_row_bytes = 0;
         prefill.workspace_per_work_unit_bytes = capacity.prefill_workspace_per_token;

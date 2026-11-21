@@ -190,7 +190,24 @@ const RAS_HIGH_TEMP: f32 = 1.0;
 const RAS_HIGH_TOP_P: f32 = 0.9;
 static NEXT_FISH_S2_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
+/// The prompt tokens of one Fish S2 prefill span on CUDA. Every span but a
+/// prompt's last is exactly this long whatever else the step runs: a span's
+/// length is its projections' row count, so a span cut to a step's leftover
+/// budget changed the prompt's bits under load.
+pub(crate) const FISH_S2_CUDA_PREFILL_SPAN: usize = 256;
+
 impl FishS2TtsModel {
+    /// The cell of the scheduler's prefill grid for this model's prompts:
+    /// [`FISH_S2_CUDA_PREFILL_SPAN`] on CUDA, where decode runs at fixed rows
+    /// and prefill one request alone; 0 (no grid) on the CPU and Metal, and
+    /// before the weights load.
+    pub fn prefill_grid_tokens(&self) -> usize {
+        match &self.runtime {
+            Some(runtime) if runtime.slow.device().is_cuda() => FISH_S2_CUDA_PREFILL_SPAN,
+            _ => 0,
+        }
+    }
+
     /// Metadata-only fixture for request preparation and admission tests.
     /// Native inference remains unavailable, as for `load_metadata`.
     #[cfg(test)]

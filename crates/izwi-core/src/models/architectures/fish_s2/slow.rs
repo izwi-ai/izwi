@@ -229,6 +229,11 @@ impl FishS2SlowTransformer {
         &self.cfg
     }
 
+    /// The device the transformer's weights live on.
+    pub(crate) fn device(&self) -> &candle_core::Device {
+        self.lm_head.weight().device()
+    }
+
     /// Persistent RoPE table bytes, shared by every slow layer.
     pub fn rotary_cache_bytes(&self) -> u64 {
         self.layers

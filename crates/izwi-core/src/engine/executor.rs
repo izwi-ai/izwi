@@ -3703,9 +3703,13 @@ impl ModelExecutor for NativeExecutor {
             if let Ok(Some(model)) = request.prepared_qwen_tts_model_for_executor() {
                 profile.prefill_grid_tokens = model.prefill_grid_tokens();
             }
-            // Audio8 likewise on CUDA: with its prefill one request alone and
-            // its decode at fixed rows, the grid keeps a request's bits.
+            // Audio8 and Fish S2 likewise on CUDA: with their prefill one
+            // request alone and their decode at fixed rows, the grid keeps a
+            // request's bits.
             if let Ok(Some(model)) = request.prepared_audio8_tts_model_lease_for_executor() {
+                profile.prefill_grid_tokens = model.prefill_grid_tokens();
+            }
+            if let Ok(Some(model)) = request.prepared_fish_s2_tts_model_lease_for_executor() {
                 profile.prefill_grid_tokens = model.prefill_grid_tokens();
             }
             profile.incremental_decode = true;
