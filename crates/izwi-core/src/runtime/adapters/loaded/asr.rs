@@ -1371,14 +1371,15 @@ impl LoadedExecutionAdapter for SovTranscribeAsrExecutionAdapter {
         // residual, the widest attention projections, the dense MLP and
         // the routed experts) and one 30 s encoder window: 1500 frames
         // through the 5120-wide MLP and 20 heads of F32 attention weights.
-        // Plus, once a quantum, the grouped experts' padded blocks on CUDA
-        // (every expert padded to a 512-token chunk: input, activations and
-        // output, about 1 GiB of BF16).
+        // Plus each row's share of the grouped experts' padded blocks on
+        // CUDA, which a quantum holds once (every expert padded to a
+        // 512-token chunk: input, activations and output, about 1 GiB of
+        // BF16); the workspace is leased per row, so it is split evenly.
         prefill.max_workspace_bytes = span
             .saturating_mul(256 * 1024)
             .saturating_add(320 * 1024 * 1024)
-            .saturating_mul(rows)
-            .saturating_add(1 << 30);
+            .saturating_add((1_u64 << 30).div_ceil(rows.max(1)))
+            .saturating_mul(rows);
 
         let mut decode = StageDescriptor::from_execution_profile(
             StageId::new(2),
