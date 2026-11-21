@@ -250,6 +250,13 @@ impl SovDecoder {
         Ok(crate::kernels::numeric_check::relative_l2(&other, &host))
     }
 
+    /// Whether the experts are stored in FP8 (see `moe::ExpertWeights`).
+    pub fn experts_fp8(&self) -> bool {
+        self.layers
+            .first()
+            .is_some_and(|layer| layer.feed_forward.experts_fp8())
+    }
+
     /// Whether every layer's experts fit the fused kernels.
     pub fn fused_experts_supported(&self) -> bool {
         self.layers

@@ -2994,6 +2994,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "On CUDA, SOV-Transcribe-1's encoder and projector over a batch of 30-second windows replay a CUDA graph per batch size (1 to the encoder batch), each checked bit for bit against the eager run on its first two batches; any mismatch or failure turns them off for the process. A load prices up to 1.7 GiB for them. Any false value runs the encoder eagerly; `encoder_graphs` in the diagnostics reports captures and replays.",
     ),
     CoreEnvVar::new(
+        "IZWI_SOV_TRANSCRIBE_FP8_EXPERTS",
+        Flag,
+        "true",
+        Load,
+        "Stores SOV-Transcribe-1's experts on CUDA as E4M3 rows with an F32 scale each, quantized at load (half the bytes a decode step reads); off keeps the checkpoint's BF16.",
+    ),
+    CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_MODEL_DIR",
         Path,
         "unset (test fails)",

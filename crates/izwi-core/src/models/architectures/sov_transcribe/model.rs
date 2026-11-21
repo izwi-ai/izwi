@@ -641,6 +641,7 @@ impl SovTranscribeModel {
             "moe_fused_max_pairs": super::decoder::moe::FUSED_MAX_PAIRS,
             "decode_graphs": self.decoder.graph_diagnostics(),
             "moe_check": d.moe_check,
+            "expert_weights": if self.decoder.experts_fp8() { "fp8" } else { "bf16" },
             "prefill_span": self.prefill_span,
             "decode_quantum": self.decode_quantum,
             "encoder_batch": self.encoder_batch,

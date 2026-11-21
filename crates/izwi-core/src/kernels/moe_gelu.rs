@@ -235,6 +235,200 @@ pub fn weight_dtype_supported(weights: &Tensor) -> bool {
     weights.dtype() == DType::BF16 || (!weights.device().is_cuda() && weights.dtype() == DType::F32)
 }
 
+/// Expert weights as E4M3 bytes with one F32 scale per output row:
+/// `q` U8 `[experts, rows, cols]` and `scale` F32 `[experts, rows]`, a row's
+/// value `e4m3(q) * scale`. Half the bytes of BF16, so a decode step that
+/// reads every expert reads half as much.
+#[derive(Clone, Debug)]
+pub struct Fp8Weights {
+    pub q: Tensor,
+    pub scale: Tensor,
+}
+
+impl Fp8Weights {
+    /// `(experts, rows, cols)`.
+    pub fn dims3(&self) -> Result<(usize, usize, usize)> {
+        self.q.dims3()
+    }
+
+    /// Bytes resident on the device.
+    pub fn resident_bytes(&self) -> usize {
+        self.q.elem_count() + self.scale.elem_count() * 4
+    }
+}
+
+/// The largest finite E4M3FN magnitude, the value a row's peak scales to.
+pub const E4M3_MAX: f32 = 448.0;
+
+/// Whether the FP8 kernels take this geometry: [`supported`], and rows that
+/// split into 16-byte loads.
+pub fn fp8_supported(hidden: usize, inter: usize, experts: usize, top_k: usize) -> bool {
+    supported(hidden, inter, experts, top_k)
+        && hidden.is_multiple_of(16)
+        && inter.is_multiple_of(16)
+}
+
+/// Exact E4M3FN decoding (the kernels' table).
+pub fn e4m3_to_f32(byte: u8) -> f32 {
+    let (e, m) = (i32::from((byte >> 3) & 15), f32::from(byte & 7));
+    let value = if e == 0 {
+        m * 2f32.powi(-9)
+    } else if e == 15 && m == 7.0 {
+        f32::NAN
+    } else {
+        (1.0 + m * 0.125) * 2f32.powi(e - 7)
+    };
+    if byte & 128 != 0 {
+        -value
+    } else {
+        value
+    }
+}
+
+/// Round-to-nearest-even, saturating E4M3FN encoding (the kernels'
+/// `mgl_to_e4m3`); zero and NaN encode as +0.
+pub fn f32_to_e4m3(v: f32) -> u8 {
+    let sign = if v < 0.0 { 128 } else { 0 };
+    let a = v.abs().min(E4M3_MAX);
+    if a.is_nan() || a <= 0.0 {
+        return 0;
+    }
+    // a = f * 2^e with f in [0.5, 1).
+    let e = a.log2().floor() as i32 + 1;
+    let e = if a >= 2f32.powi(e) {
+        e + 1
+    } else if a < 2f32.powi(e - 1) {
+        e - 1
+    } else {
+        e
+    };
+    let exp = e - 1 + 7;
+    let code = if exp <= 0 {
+        (a * 512.0).round_ties_even() as u32
+    } else {
+        let m = ((a / 2f32.powi(e - 1) - 1.0) * 8.0).round_ties_even() as u32;
+        ((exp as u32) << 3).saturating_add(m).min(126)
+    };
+    sign | code as u8
+}
+
+/// `weights` (BF16 `[experts, rows, cols]`) as E4M3 rows, each scaled so its
+/// peak is [`E4M3_MAX`] (an all-zero row keeps scale 1). On CUDA one launch
+/// a call; the CPU runs the same encoding.
+pub fn quantize_rows(weights: &Tensor) -> Result<Fp8Weights> {
+    let (experts, rows, cols) = weights.dims3()?;
+    if weights.dtype() != DType::BF16 || cols == 0 {
+        candle_core::bail!(
+            "FP8 expert quantization takes BF16 [experts, rows, cols], got {:?} {:?}",
+            weights.dims(),
+            weights.dtype()
+        )
+    }
+    match weights.device() {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => cuda_impl::quantize_rows(&weights.contiguous()?, experts, rows, cols),
+        device => {
+            let values = host_f32(weights)?;
+            let mut q = Vec::with_capacity(values.len());
+            let mut scale = Vec::with_capacity(experts * rows);
+            for row in values.chunks_exact(cols) {
+                let peak = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let s = if peak > 0.0 { peak / E4M3_MAX } else { 1.0 };
+                scale.push(s);
+                q.extend(row.iter().map(|v| f32_to_e4m3(v / s)));
+            }
+            Ok(Fp8Weights {
+                q: Tensor::from_vec(q, (experts, rows, cols), &Device::Cpu)?.to_device(device)?,
+                scale: Tensor::from_vec(scale, (experts, rows), &Device::Cpu)?.to_device(device)?,
+            })
+        }
+    }
+}
+
+/// The listed experts of `weights` decoded to BF16 `[experts.len(), rows,
+/// cols]`, in list order.
+pub fn dequantize_experts(weights: &Fp8Weights, experts: &[u32]) -> Result<Tensor> {
+    let (count, rows, cols) = weights.dims3()?;
+    if experts.is_empty() || experts.iter().any(|&e| e as usize >= count) {
+        candle_core::bail!("FP8 expert dequantization of {experts:?} out of {count} experts")
+    }
+    match weights.q.device() {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => cuda_impl::dequantize_experts(weights, experts, rows, cols),
+        device => {
+            let q = weights
+                .q
+                .flatten_all()?
+                .to_device(&Device::Cpu)?
+                .to_vec1::<u8>()?;
+            let scale = host_f32(&weights.scale)?;
+            let mut out = Vec::with_capacity(experts.len() * rows * cols);
+            for &e in experts {
+                let e = e as usize;
+                for r in 0..rows {
+                    let s = scale[e * rows + r];
+                    let row = &q[(e * rows + r) * cols..][..cols];
+                    out.extend(
+                        row.iter()
+                            .map(|&b| half::bf16::from_f32(e4m3_to_f32(b) * s)),
+                    );
+                }
+            }
+            Tensor::from_vec(out, (experts.len(), rows, cols), &Device::Cpu)?.to_device(device)
+        }
+    }
+}
+
+/// [`experts`] over FP8 weights: on CUDA the FP8 up and down kernels (half
+/// the bytes read); elsewhere the BF16 reference over the decoded weights.
+pub fn experts_fp8(
+    x: &Tensor,
+    routing: &Tensor,
+    gate_up: &Fp8Weights,
+    down: &Fp8Weights,
+) -> Result<Tensor> {
+    let (tokens, hidden) = x.dims2()?;
+    let (experts_count, rows, gate_hidden) = gate_up.dims3()?;
+    let inter = rows / 2;
+    let (routing_tokens, routing_width) = routing.dims2()?;
+    let top_k = routing_width / 2;
+    if x.dtype() != DType::F32
+        || routing.dtype() != DType::F32
+        || rows != 2 * inter
+        || gate_hidden != hidden
+        || down.dims3()? != (experts_count, hidden, inter)
+        || routing_tokens != tokens
+        || !fp8_supported(hidden, inter, experts_count, top_k)
+    {
+        candle_core::bail!(
+            "FP8 GELU MoE operands do not agree: x {:?}, routing {:?}, gate_up {:?}, down {:?}",
+            x.dims(),
+            routing.dims(),
+            gate_up.q.dims(),
+            down.q.dims()
+        )
+    }
+    match x.device() {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => cuda_impl::experts_fp8(
+            &x.contiguous()?,
+            &routing.contiguous()?,
+            gate_up,
+            down,
+            top_k,
+        ),
+        _ => {
+            let all = (0..experts_count as u32).collect::<Vec<_>>();
+            experts(
+                x,
+                routing,
+                &dequantize_experts(gate_up, &all)?,
+                &dequantize_experts(down, &all)?,
+            )
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use candle_core::cuda_backend::cudarc::driver::{
@@ -421,6 +615,192 @@ mod cuda_impl {
         unsafe { builder.launch(launch) }.w()?;
         Ok(wrap(out, device, Shape::from((tokens, hidden))))
     }
+
+    fn wrap_as<T: candle_core::cuda_backend::CudaDType + candle_core::WithDType>(
+        slice: CudaSlice<T>,
+        device: &CudaDevice,
+        shape: Shape,
+    ) -> Tensor {
+        Tensor::from_storage(
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(slice, device.clone())),
+            shape,
+            BackpropOp::none(),
+            false,
+        )
+    }
+
+    pub(super) fn quantize_rows(
+        weights: &Tensor,
+        experts: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<super::Fp8Weights> {
+        let device = weights.device().as_cuda_device()?;
+        let (ws, _) = weights.storage_and_layout();
+        let wv = view::<half::bf16>(&ws, weights, "weights")?;
+        let total_rows = experts * rows;
+        // SAFETY: one block per row writes every byte of its row and its
+        // scale.
+        let q = unsafe { device.alloc::<u8>(total_rows * cols)? };
+        let scale = unsafe { device.alloc::<f32>(total_rows)? };
+        let ptx = super::super::cuda::cuda_ptx_moe_gelu();
+        let func = device.get_or_load_custom_func("izwi_mgl_fp8_quantize_rows", MODULE, ptx)?;
+        let mut builder = func.builder();
+        builder.arg(&wv);
+        builder.arg(&q);
+        builder.arg(&scale);
+        candle_core::builder_arg!(builder, i32_arg(cols, "cols")?);
+        // SAFETY: argument order matches `izwi_mgl_fp8_quantize_rows`.
+        unsafe { builder.launch(config((u32_grid(total_rows, "rows")?, 1), 256)) }.w()?;
+        drop(ws);
+        Ok(super::Fp8Weights {
+            q: wrap_as(q, device, Shape::from((experts, rows, cols))),
+            scale: wrap_as(scale, device, Shape::from((experts, rows))),
+        })
+    }
+
+    pub(super) fn dequantize_experts(
+        weights: &super::Fp8Weights,
+        experts: &[u32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Tensor> {
+        let device = weights.q.device().as_cuda_device()?;
+        let (qs, _) = weights.q.storage_and_layout();
+        let (ss, _) = weights.scale.storage_and_layout();
+        let qv = view::<u8>(&qs, &weights.q, "q")?;
+        let sv = view::<f32>(&ss, &weights.scale, "scale")?;
+        let ids = experts.iter().map(|&e| e as i32).collect::<Vec<_>>();
+        let ids = device.clone_htod(&ids)?;
+        let total = experts.len() * rows * cols;
+        // SAFETY: the kernel writes every element.
+        let out = unsafe { device.alloc::<half::bf16>(total)? };
+        let ptx = super::super::cuda::cuda_ptx_moe_gelu();
+        let func = device.get_or_load_custom_func("izwi_mgl_fp8_dequant_experts", MODULE, ptx)?;
+        let mut builder = func.builder();
+        builder.arg(&qv);
+        builder.arg(&sv);
+        builder.arg(&ids);
+        builder.arg(&out);
+        candle_core::builder_arg!(
+            builder,
+            i32_arg(experts.len(), "experts")?,
+            i32_arg(rows, "rows")?,
+            i32_arg(cols, "cols")?
+        );
+        let blocks = u32_grid(total.div_ceil(256).min(65_535), "dequant")?;
+        // SAFETY: argument order matches `izwi_mgl_fp8_dequant_experts`.
+        unsafe { builder.launch(config((blocks, 1), 256)) }.w()?;
+        Ok(wrap_as(
+            out,
+            device,
+            Shape::from((experts.len(), rows, cols)),
+        ))
+    }
+
+    pub(super) fn experts_fp8(
+        x: &Tensor,
+        routing: &Tensor,
+        gate_up: &super::Fp8Weights,
+        down: &super::Fp8Weights,
+        slots: usize,
+    ) -> Result<Tensor> {
+        let device = x.device().as_cuda_device()?;
+        let (tokens, hidden) = x.dims2()?;
+        let (experts, rows, _) = gate_up.dims3()?;
+        let inter = rows / 2;
+        let pairs = tokens * slots;
+        let (xs, _) = x.storage_and_layout();
+        let (rs, _) = routing.storage_and_layout();
+        let (gqs, _) = gate_up.q.storage_and_layout();
+        let (gss, _) = gate_up.scale.storage_and_layout();
+        let (dqs, _) = down.q.storage_and_layout();
+        let (dss, _) = down.scale.storage_and_layout();
+        let xv = view::<f32>(&xs, x, "x")?;
+        let rv = view::<f32>(&rs, routing, "routing")?;
+        let gq = view::<u8>(&gqs, &gate_up.q, "gate_up")?;
+        let gs = view::<f32>(&gss, &gate_up.scale, "gate_up scale")?;
+        let dq = view::<u8>(&dqs, &down.q, "down")?;
+        let ds = view::<f32>(&dss, &down.scale, "down scale")?;
+        let ptx = super::super::cuda::cuda_ptx_moe_gelu();
+        let (slots_i, hidden_i, inter_i, experts_i) = (
+            i32_arg(slots, "slots")?,
+            i32_arg(hidden, "hidden")?,
+            i32_arg(inter, "inter")?,
+            i32_arg(experts, "experts")?,
+        );
+        // SAFETY: as in `experts`: every offset, pair, act row, partial row
+        // and output is written by its kernel.
+        let offsets = unsafe { device.alloc::<i32>(experts + 1)? };
+        let sorted = unsafe { device.alloc::<i32>(pairs)? };
+        let act = unsafe { device.alloc::<f32>(pairs * inter)? };
+        let partial = unsafe { device.alloc::<f32>(pairs * hidden)? };
+        let out = unsafe { device.alloc::<f32>(tokens * hidden)? };
+
+        let group = device.get_or_load_custom_func("izwi_mgl_group_pairs", MODULE, ptx)?;
+        let mut builder = group.builder();
+        builder.arg(&rv);
+        builder.arg(&offsets);
+        builder.arg(&sorted);
+        candle_core::builder_arg!(builder, i32_arg(tokens, "tokens")?, slots_i, experts_i);
+        // SAFETY: argument order matches `izwi_mgl_group_pairs`.
+        unsafe { builder.launch(config((1, 1), 1024)) }.w()?;
+
+        let up = device.get_or_load_custom_func("izwi_mgl_up_grouped_fp8", MODULE, ptx)?;
+        let mut builder = up.builder();
+        builder.arg(&xv);
+        builder.arg(&offsets);
+        builder.arg(&sorted);
+        builder.arg(&gq);
+        builder.arg(&gs);
+        builder.arg(&act);
+        candle_core::builder_arg!(builder, slots_i, hidden_i, inter_i);
+        let launch = config(
+            (
+                u32_grid(experts, "experts")?,
+                u32_grid(inter.div_ceil(8), "inter")?,
+            ),
+            256,
+        );
+        // SAFETY: argument order matches `izwi_mgl_up_grouped_fp8`.
+        unsafe { builder.launch(launch) }.w()?;
+
+        let down_fn = device.get_or_load_custom_func("izwi_mgl_down_grouped_fp8", MODULE, ptx)?;
+        let mut builder = down_fn.builder();
+        builder.arg(&act);
+        builder.arg(&offsets);
+        builder.arg(&sorted);
+        builder.arg(&dq);
+        builder.arg(&ds);
+        builder.arg(&partial);
+        candle_core::builder_arg!(builder, hidden_i, inter_i);
+        let launch = config(
+            (
+                u32_grid(experts, "experts")?,
+                u32_grid(hidden.div_ceil(8), "hidden")?,
+            ),
+            256,
+        );
+        // SAFETY: argument order matches `izwi_mgl_down_grouped_fp8`.
+        unsafe { builder.launch(launch) }.w()?;
+
+        let combine = device.get_or_load_custom_func("izwi_mgl_combine", MODULE, ptx)?;
+        let mut builder = combine.builder();
+        builder.arg(&partial);
+        builder.arg(&rv);
+        builder.arg(&out);
+        candle_core::builder_arg!(builder, slots_i, hidden_i, experts_i);
+        let launch = config(
+            (
+                u32_grid(hidden.div_ceil(256), "hidden")?,
+                u32_grid(tokens, "tokens")?,
+            ),
+            256,
+        );
+        // SAFETY: argument order matches `izwi_mgl_combine`.
+        unsafe { builder.launch(launch) }.w()?;
+        Ok(wrap(out, device, Shape::from((tokens, hidden))))
+    }
 }
 
 #[cfg(test)]
@@ -583,5 +963,161 @@ mod tests {
                 assert_eq!(alone, got[..hidden].to_vec());
             }
         }
+    }
+
+    #[test]
+    fn the_e4m3_encoder_matches_candles_conversion() {
+        let values = xorshift_values(4096, 21, 600.0)
+            .into_iter()
+            .chain([
+                0.0, -0.0, 448.0, -448.0, 1e-4, 0.0019531, 0.00195, 1000.0, 7.5, 0.875,
+            ])
+            .collect::<Vec<_>>();
+        let candle = Tensor::from_vec(values.clone(), values.len(), &Device::Cpu)
+            .unwrap()
+            .clamp(-E4M3_MAX, E4M3_MAX)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (v, want) in values.iter().zip(&candle) {
+            let got = e4m3_to_f32(f32_to_e4m3(*v));
+            assert!(
+                got == *want || (got == 0.0 && *want == 0.0),
+                "{v}: {got} vs {want}"
+            );
+        }
+        for byte in 0..=255u8 {
+            let v = e4m3_to_f32(byte);
+            if v.is_finite() && v != 0.0 {
+                assert_eq!(f32_to_e4m3(v), byte, "{byte}");
+            }
+        }
+    }
+
+    #[test]
+    fn fp8_rows_round_trip_within_e4m3_precision() {
+        let w = bf16_tensor(&[3, 8, 64], 5, 1.0, &Device::Cpu);
+        let q = quantize_rows(&w).unwrap();
+        let back = dequantize_experts(&q, &[0, 1, 2]).unwrap();
+        let error = relative_l2(
+            &back
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            &w.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+        );
+        // E4M3 keeps 3 mantissa bits: about 2-3% relative per element.
+        assert!(error < 0.04, "relative error {error}");
+        let picked = dequantize_experts(&q, &[2, 0]).unwrap();
+        assert_eq!(
+            picked
+                .get(0)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            back.get(2)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fp8_experts_match_the_reference() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let (tokens, hidden, inter, experts_count, top_k) = (6, 512, 64, 8, 3);
+        let gate_up = bf16_tensor(&[experts_count, 2 * inter, hidden], 1, 0.05, &Device::Cpu);
+        let down = bf16_tensor(&[experts_count, hidden, inter], 2, 0.05, &Device::Cpu);
+        // Quantization on the device writes the host encoder's bytes.
+        let host_gate = quantize_rows(&gate_up).unwrap();
+        let cuda_gate = quantize_rows(&gate_up.to_device(&device).unwrap()).unwrap();
+        assert_eq!(
+            cuda_gate
+                .q
+                .flatten_all()
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec1::<u8>()
+                .unwrap(),
+            host_gate.q.flatten_all().unwrap().to_vec1::<u8>().unwrap()
+        );
+        let cuda_down = quantize_rows(&down.to_device(&device).unwrap()).unwrap();
+        let decoded = dequantize_experts(&cuda_gate, &[3, 1]).unwrap();
+        assert_eq!(
+            decoded
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            dequantize_experts(&host_gate, &[3, 1])
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+        let x = Tensor::from_vec(
+            xorshift_values(tokens * hidden, 3, 1.0),
+            (tokens, hidden),
+            &device,
+        )
+        .unwrap();
+        let logits = Tensor::from_vec(
+            xorshift_values(tokens * experts_count, 4, 2.0),
+            (tokens, experts_count),
+            &device,
+        )
+        .unwrap();
+        let scale = Tensor::ones(experts_count, DType::F32, &device).unwrap();
+        let routing = route(&logits, &scale, top_k).unwrap();
+        let got = experts_fp8(&x, &routing, &cuda_gate, &cuda_down).unwrap();
+        let all = (0..experts_count as u32).collect::<Vec<_>>();
+        let want = experts(
+            &x,
+            &routing,
+            &dequantize_experts(&cuda_gate, &all).unwrap(),
+            &dequantize_experts(&cuda_down, &all).unwrap(),
+        )
+        .unwrap();
+        let host = |t: &Tensor| {
+            t.to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let error = relative_l2(&host(&got), &host(&want));
+        assert!(error < 1e-4, "relative error {error}");
     }
 }

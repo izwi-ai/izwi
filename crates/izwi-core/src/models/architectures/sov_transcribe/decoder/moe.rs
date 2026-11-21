@@ -174,11 +174,73 @@ impl Router {
 
 pub struct Experts {
     /// `[experts, 2 * width, hidden]`.
-    gate_up: Tensor,
+    gate_up: ExpertWeights,
     /// `[experts, hidden, width]`.
-    down: Tensor,
+    down: ExpertWeights,
     per_expert_scale: Vec<f32>,
     width: usize,
+}
+
+/// Kill switch for SOV-Transcribe's FP8 experts on CUDA (a boolean; on when
+/// unset). Read once, at load.
+pub const FP8_EXPERTS_ENV: &str = "IZWI_SOV_TRANSCRIBE_FP8_EXPERTS";
+
+fn fp8_experts_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(FP8_EXPERTS_ENV, true));
+    ON.get()
+}
+
+/// One projection of every expert: the checkpoint's BF16, or on CUDA E4M3
+/// rows with an F32 scale each (`kernels::moe_gelu::Fp8Weights`). The
+/// experts are 45.7 GB of SOV's 52 in BF16, and a decode step at 32 rows
+/// reads nearly all of them, so FP8 halves the step's weight traffic.
+pub(crate) enum ExpertWeights {
+    Bf16(Tensor),
+    Fp8(crate::kernels::moe_gelu::Fp8Weights),
+}
+
+impl ExpertWeights {
+    fn dims3(&self) -> Result<(usize, usize, usize)> {
+        Ok(match self {
+            Self::Bf16(w) => w.dims3()?,
+            Self::Fp8(w) => w.dims3()?,
+        })
+    }
+
+    /// Every expert as a dense tensor (FP8 decoded to BF16): the paths that
+    /// read all of them at once (the gathered path, the padded grouped
+    /// path), which CUDA's serving paths do not take.
+    fn dense(&self) -> Result<Tensor> {
+        match self {
+            Self::Bf16(w) => Ok(w.clone()),
+            Self::Fp8(w) => {
+                let all = (0..w.dims3()?.0 as u32).collect::<Vec<_>>();
+                Ok(crate::kernels::moe_gelu::dequantize_experts(w, &all)?)
+            }
+        }
+    }
+
+    /// One expert's `[rows, cols]`.
+    fn expert(&self, expert: usize) -> Result<Tensor> {
+        match self {
+            Self::Bf16(w) => Ok(w.get(expert)?),
+            Self::Fp8(w) => Ok(
+                crate::kernels::moe_gelu::dequantize_experts(w, &[expert as u32])?.squeeze(0)?,
+            ),
+        }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Bf16(w) => w.elem_count() * w.dtype().size_in_bytes(),
+            Self::Fp8(w) => w.resident_bytes(),
+        }
+    }
+
+    pub(crate) fn is_fp8(&self) -> bool {
+        matches!(self, Self::Fp8(_))
+    }
 }
 
 impl ExpertSet for Experts {
@@ -187,10 +249,10 @@ impl ExpertSet for Experts {
     }
 
     fn apply_expert(&self, expert: usize, tokens: &Tensor) -> Result<Tensor> {
-        let gate_up = linear(tokens, &self.gate_up.get(expert)?, None)?;
+        let gate_up = linear(tokens, &self.gate_up.expert(expert)?, None)?;
         let gate = gate_up.narrow(1, 0, self.width)?.gelu()?;
         let up = gate_up.narrow(1, self.width, self.width)?;
-        let out = linear(&(gate * up)?, &self.down.get(expert)?, None)?;
+        let out = linear(&(gate * up)?, &self.down.expert(expert)?, None)?;
         Ok((out * self.per_expert_scale[expert] as f64)?)
     }
 }
@@ -235,16 +297,37 @@ impl SovFeedForward {
             scale: (get("router.scale", DType::F32)? * (d.hidden as f64).powf(-0.5))?,
             proj: get("router.proj.weight", DType::F32)?,
         };
+        // On CUDA the experts are quantized as each layer loads, so the
+        // BF16 copy of one layer is all that is ever resident beside them.
+        let fp8 = device.is_cuda()
+            && dtype == DType::BF16
+            && fp8_experts_requested()
+            && crate::kernels::moe_gelu::fp8_supported(
+                d.hidden,
+                d.expert_width,
+                d.experts,
+                d.top_k,
+            );
+        let weights = |name: &str| -> Result<ExpertWeights> {
+            let w = get(name, dtype)?;
+            Ok(if fp8 {
+                ExpertWeights::Fp8(crate::kernels::moe_gelu::quantize_rows(&w)?)
+            } else {
+                ExpertWeights::Bf16(w)
+            })
+        };
         let experts = Experts {
-            gate_up: get("experts.gate_up_proj", dtype)?,
-            down: get("experts.down_proj", dtype)?,
+            gate_up: weights("experts.gate_up_proj")?,
+            down: weights("experts.down_proj")?,
             per_expert_scale: checkpoint.host_f32(&format!("{l}.router.per_expert_scale"))?,
             width: d.expert_width,
         };
-        let resident_bytes = [&mlp.gate_up, &mlp.down, &experts.gate_up, &experts.down]
+        let resident_bytes = [&mlp.gate_up, &mlp.down]
             .iter()
             .map(|t| t.elem_count() * dtype.size_in_bytes())
             .sum::<usize>()
+            + experts.gate_up.resident_bytes()
+            + experts.down.resident_bytes()
             + (router.scale.elem_count() + router.proj.elem_count()) * 4;
         let per_expert_scale =
             Tensor::from_vec(experts.per_expert_scale.clone(), d.experts, device)?;
@@ -265,6 +348,11 @@ impl SovFeedForward {
 
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+
+    /// Whether this layer's experts are stored in FP8.
+    pub fn experts_fp8(&self) -> bool {
+        self.experts.gate_up.is_fp8()
     }
 
     /// The dense branch over `pre_feedforward_layernorm(h)`.
@@ -306,11 +394,11 @@ impl SovFeedForward {
             .broadcast_as((tokens, k, hidden))?
             .contiguous()?
             .reshape((tokens * k, 1, hidden))?;
-        let gate_up = e.gate_up.index_select(&flat, 0)?;
+        let gate_up = e.gate_up.dense()?.index_select(&flat, 0)?;
         let gate_up = x.matmul(&gate_up.transpose(1, 2)?)?;
         let gate = gate_up.narrow(2, 0, e.width)?.gelu()?;
         let up = gate_up.narrow(2, e.width, e.width)?;
-        let down = e.down.index_select(&flat, 0)?;
+        let down = e.down.dense()?.index_select(&flat, 0)?;
         let out = (gate * up)?.matmul(&down.transpose(1, 2)?)?;
         let out = out.reshape((tokens, k, hidden))?;
         let weighted = out.broadcast_mul(&weights.to_dtype(out.dtype())?.unsqueeze(2)?)?;
@@ -421,11 +509,11 @@ impl SovFeedForward {
         let x = normed
             .index_select(&ids, 0)?
             .reshape((experts, rows, hidden))?;
-        let gate_up = x.matmul(&e.gate_up.transpose(1, 2)?)?;
+        let gate_up = x.matmul(&e.gate_up.dense()?.transpose(1, 2)?)?;
         let gate = gate_up.narrow(2, 0, e.width)?.gelu()?;
         let up = gate_up.narrow(2, e.width, e.width)?;
         let out = (gate * up)?
-            .matmul(&e.down.transpose(1, 2)?)?
+            .matmul(&e.down.dense()?.transpose(1, 2)?)?
             .reshape((experts * rows, hidden))?;
         // Each token gathers its slots' rows and sums them by weight (an
         // index_add over the padded rows scanned every row per column).
@@ -482,10 +570,31 @@ impl SovFeedForward {
         let rows = ids.len();
         let ids = Tensor::from_vec(ids, rows, device)?;
         let x = normed.index_select(&ids, 0)?;
-        let gate_up = grouped_rows_gemm(&x, &e.gate_up, &groups)?;
+        // FP8 experts: the used ones decoded to BF16 once for the call, the
+        // groups renumbered into that compact set.
+        let (gate_up_w, down_w, groups) = match (&e.gate_up, &e.down) {
+            (ExpertWeights::Fp8(gate_up), ExpertWeights::Fp8(down)) => {
+                let used = groups.iter().map(|g| g.expert as u32).collect::<Vec<_>>();
+                let compact = groups
+                    .iter()
+                    .enumerate()
+                    .map(|(index, g)| RowGroup {
+                        expert: index,
+                        ..*g
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    crate::kernels::moe_gelu::dequantize_experts(gate_up, &used)?,
+                    crate::kernels::moe_gelu::dequantize_experts(down, &used)?,
+                    compact,
+                )
+            }
+            _ => (e.gate_up.dense()?, e.down.dense()?, groups),
+        };
+        let gate_up = grouped_rows_gemm(&x, &gate_up_w, &groups)?;
         let gate = gate_up.narrow(1, 0, e.width)?.gelu()?;
         let up = gate_up.narrow(1, e.width, e.width)?;
-        let out = grouped_rows_gemm(&(gate * up)?.contiguous()?, &e.down, &groups)?;
+        let out = grouped_rows_gemm(&(gate * up)?.contiguous()?, &down_w, &groups)?;
         let hidden = out.dim(1)?;
         let gather = Tensor::from_vec(gather, tokens * k, device)?;
         let weights = Tensor::from_vec(weights, (tokens, k, 1), device)?.to_dtype(out.dtype())?;
@@ -504,20 +613,30 @@ impl SovFeedForward {
             &self.per_expert_scale,
             self.top_k,
         )?;
-        let out = crate::kernels::moe_gelu::experts(
-            &normed.to_dtype(DType::F32)?,
-            &routing,
-            &self.experts.gate_up,
-            &self.experts.down,
-        )?;
+        let x = normed.to_dtype(DType::F32)?;
+        let out = match (&self.experts.gate_up, &self.experts.down) {
+            (ExpertWeights::Fp8(gate_up), ExpertWeights::Fp8(down)) => {
+                crate::kernels::moe_gelu::experts_fp8(&x, &routing, gate_up, down)?
+            }
+            (gate_up, down) => {
+                crate::kernels::moe_gelu::experts(&x, &routing, &gate_up.dense()?, &down.dense()?)?
+            }
+        };
         Ok(out.to_dtype(normed.dtype())?)
     }
 
     /// Whether the fused kernels take this layer's geometry and dtype.
     pub fn fused_supported(&self) -> bool {
         let (experts, rows, hidden) = self.experts.gate_up.dims3().unwrap_or((0, 0, 0));
-        crate::kernels::moe_gelu::weight_dtype_supported(&self.experts.gate_up)
-            && crate::kernels::moe_gelu::supported(hidden, rows / 2, experts, self.top_k)
+        match &self.experts.gate_up {
+            ExpertWeights::Fp8(_) => {
+                crate::kernels::moe_gelu::fp8_supported(hidden, rows / 2, experts, self.top_k)
+            }
+            ExpertWeights::Bf16(w) => {
+                crate::kernels::moe_gelu::weight_dtype_supported(w)
+                    && crate::kernels::moe_gelu::supported(hidden, rows / 2, experts, self.top_k)
+            }
+        }
     }
 
     /// Each token's `(expert, weight)` choices, weights as the reference

@@ -237,3 +237,171 @@ extern "C" __global__ void izwi_mgl_combine(
   }
   y[(int64_t)token * hidden + h] = total;
 }
+
+// ---------------------------------------------------------------------------
+// FP8 experts: E4M3 weights with one F32 scale per output row
+// (`kernels::moe_gelu::Fp8Weights`). The same grouping, routing and combine;
+// the up and down kernels read half the bytes. A block decodes E4M3 through
+// a 256-entry table in shared memory; each lane loads 16 weights (16 bytes)
+// a sweep of 512, and a row's dot product is scaled once at the end. Widths
+// must be multiples of 16.
+
+// Exact finite E4M3FN decoding (as kernels/cuda/fp8.cu).
+__device__ __forceinline__ float mgl_e4m3(unsigned int b) {
+  const int e = (b >> 3) & 15, m = b & 7;
+  const float v = e == 0 ? ldexpf((float)m, -9)
+                         : (e == 15 && m == 7 ? NAN : ldexpf(1.f + (float)m * .125f, e - 7));
+  return (b & 128) ? -v : v;
+}
+
+__device__ __forceinline__ void mgl_fill_lut(float* lut) {
+  for (int i = threadIdx.x; i < 256; i += blockDim.x) lut[i] = mgl_e4m3((unsigned)i);
+  __syncthreads();
+}
+
+// Four E4M3 bytes of `word` times four F32 activations.
+__device__ __forceinline__ float mgl_dot4_fp8(unsigned int word, float4 a, const float* lut,
+                                              float acc) {
+  acc = fmaf(lut[word & 0xFFu], a.x, acc);
+  acc = fmaf(lut[(word >> 8) & 0xFFu], a.y, acc);
+  acc = fmaf(lut[(word >> 16) & 0xFFu], a.z, acc);
+  return fmaf(lut[word >> 24], a.w, acc);
+}
+
+// A lane's share of an E4M3 row . x over `len` values (len % 16 == 0).
+__device__ __forceinline__ float mgl_row_dot_fp8(const unsigned char* __restrict__ row,
+                                                 const float* __restrict__ x, int len,
+                                                 int lane, const float* lut) {
+  float acc = 0.0f;
+  for (int k0 = lane * 16; k0 < len; k0 += 512) {
+    const uint4 q = *reinterpret_cast<const uint4*>(row + k0);
+    const float4* xv = reinterpret_cast<const float4*>(x + k0);
+    acc = mgl_dot4_fp8(q.x, xv[0], lut, acc);
+    acc = mgl_dot4_fp8(q.y, xv[1], lut, acc);
+    acc = mgl_dot4_fp8(q.z, xv[2], lut, acc);
+    acc = mgl_dot4_fp8(q.w, xv[3], lut, acc);
+  }
+  return acc;
+}
+
+// izwi_mgl_up_grouped with E4M3 gate_up [experts, 2 * inter, hidden] and
+// scales [experts, 2 * inter].
+extern "C" __global__ void izwi_mgl_up_grouped_fp8(
+    const float* __restrict__ x, const int* __restrict__ offsets,
+    const int* __restrict__ sorted_pairs, const unsigned char* __restrict__ gate_up,
+    const float* __restrict__ scale, float* __restrict__ act, int slots, int hidden,
+    int inter) {
+  __shared__ float lut[256];
+  mgl_fill_lut(lut);
+  const int lane = threadIdx.x & 31;
+  const int e = blockIdx.x;
+  const int begin = offsets[e];
+  const int end = offsets[e + 1];
+  const int n = blockIdx.y * 8 + (threadIdx.x >> 5);
+  if (begin == end || n >= inter) return;
+  const int64_t gate_row = (int64_t)e * 2 * inter + n;
+  const int64_t up_row = gate_row + inter;
+  const unsigned char* gate = gate_up + gate_row * hidden;
+  const unsigned char* up = gate_up + up_row * hidden;
+  const float gate_scale = scale[gate_row], up_scale = scale[up_row];
+  for (int i = begin; i < end; ++i) {
+    const int pair = sorted_pairs[i];
+    const float* xt = x + (int64_t)(pair / slots) * hidden;
+    const float g = mgl_warp_sum(mgl_row_dot_fp8(gate, xt, hidden, lane, lut)) * gate_scale;
+    const float u = mgl_warp_sum(mgl_row_dot_fp8(up, xt, hidden, lane, lut)) * up_scale;
+    if (lane == 0) act[(int64_t)pair * inter + n] = mgl_gelu_tanh(g) * u;
+  }
+}
+
+// izwi_mgl_down_grouped with E4M3 down [experts, hidden, inter] and scales
+// [experts, hidden].
+extern "C" __global__ void izwi_mgl_down_grouped_fp8(
+    const float* __restrict__ act, const int* __restrict__ offsets,
+    const int* __restrict__ sorted_pairs, const unsigned char* __restrict__ down,
+    const float* __restrict__ scale, float* __restrict__ partial, int hidden, int inter) {
+  __shared__ float lut[256];
+  mgl_fill_lut(lut);
+  const int lane = threadIdx.x & 31;
+  const int e = blockIdx.x;
+  const int begin = offsets[e];
+  const int end = offsets[e + 1];
+  const int h = blockIdx.y * 8 + (threadIdx.x >> 5);
+  if (begin == end || h >= hidden) return;
+  const int64_t r = (int64_t)e * hidden + h;
+  const unsigned char* row = down + r * inter;
+  const float s = scale[r];
+  for (int i = begin; i < end; ++i) {
+    const int pair = sorted_pairs[i];
+    const float p =
+        mgl_warp_sum(mgl_row_dot_fp8(row, act + (int64_t)pair * inter, inter, lane, lut)) * s;
+    if (lane == 0) partial[(int64_t)pair * hidden + h] = p;
+  }
+}
+
+// Round-to-nearest-even, saturating F32 -> E4M3FN (the inverse of mgl_e4m3
+// on its finite values; |v| <= 448 after scaling).
+__device__ __forceinline__ unsigned char mgl_to_e4m3(float v) {
+  const unsigned char sign = v < 0.0f ? 128 : 0;
+  float a = fminf(fabsf(v), 448.0f);
+  if (!(a > 0.0f)) return 0;  // zero and NaN encode as +0
+  int e;
+  frexpf(a, &e);              // a = f * 2^e, f in [0.5, 1)
+  int exp = e - 1 + 7;        // biased exponent of 1.m * 2^(e - 1)
+  unsigned int code;
+  if (exp <= 0) {
+    // Subnormal: value = m * 2^-9, m in 0..7.
+    const float m = rintf(a * 512.0f);
+    code = (unsigned int)m;   // m == 8 rounds up to the smallest normal
+  } else {
+    const float m = rintf((ldexpf(a, -(e - 1)) - 1.0f) * 8.0f);
+    code = ((unsigned int)exp << 3) + (unsigned int)m;  // m == 8 carries
+    if (code > 126) code = 126;                          // 448, largest finite
+  }
+  return sign | (unsigned char)code;
+}
+
+// One block per row of w (BF16, `cols` wide): scale[row] = max|w| / 448 (1
+// for an all-zero row) and q[row] = E4M3(w / scale).
+extern "C" __global__ void izwi_mgl_fp8_quantize_rows(const __nv_bfloat16* __restrict__ w,
+                                                      unsigned char* __restrict__ q,
+                                                      float* __restrict__ scale, int cols) {
+  __shared__ float peaks[32];
+  const int64_t row = blockIdx.x;
+  const __nv_bfloat16* src = w + row * cols;
+  float peak = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x)
+    peak = fmaxf(peak, fabsf(__bfloat162float(src[c])));
+  for (int o = 16; o > 0; o >>= 1) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, o));
+  if ((threadIdx.x & 31) == 0) peaks[threadIdx.x >> 5] = peak;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    peak = threadIdx.x < (blockDim.x >> 5) ? peaks[threadIdx.x] : 0.0f;
+    for (int o = 16; o > 0; o >>= 1) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, o));
+    if (threadIdx.x == 0) peaks[0] = peak > 0.0f ? peak / 448.0f : 1.0f;
+  }
+  __syncthreads();
+  const float s = peaks[0];
+  if (threadIdx.x == 0) scale[row] = s;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x)
+    q[row * cols + c] = mgl_to_e4m3(__bfloat162float(src[c]) / s);
+}
+
+// out[g] = BF16(E4M3(q[experts[g]]) * scale) for `count` experts of `rows` x
+// `cols` (prefill's grouped GEMM reads the used experts in BF16).
+extern "C" __global__ void izwi_mgl_fp8_dequant_experts(
+    const unsigned char* __restrict__ q, const float* __restrict__ scale,
+    const int* __restrict__ experts, __nv_bfloat16* __restrict__ out, int count, int rows,
+    int cols) {
+  __shared__ float lut[256];
+  mgl_fill_lut(lut);
+  const int64_t per = (int64_t)rows * cols;
+  const int64_t total = per * count;
+  for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+       i += (int64_t)blockDim.x * gridDim.x) {
+    const int64_t g = i / per;
+    const int64_t within = i - g * per;
+    const int64_t r = within / cols;
+    const int64_t e = experts[g];
+    out[i] = __float2bfloat16(lut[q[e * per + within]] * scale[e * rows + r]);
+  }
+}
