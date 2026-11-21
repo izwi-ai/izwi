@@ -140,6 +140,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "JSON file of real codebook frames for the ignored Audio8 CUDA codec stream test.",
     ),
     CoreEnvVar::new(
+        "IZWI_AUDIO8_CODEC_CALL_SLOTS",
+        Int,
+        "8",
+        Load,
+        "On CUDA, sets how many Audio8 codec streams one shared codec call carries (1 to 64), fixed per load: every call has that many slots, spare slots zero, so a request decodes the same audio alone and beside others. A load-time check decodes that many random streams together and alone; if they differ every request runs in its own call. Fewer slots lower a lone request's codec time; more share each call across more requests.",
+    ),
+    CoreEnvVar::new(
         "IZWI_AUDIO8_CODEC_PATH",
         Path,
         "unset (test fails)",
@@ -1566,11 +1573,18 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Allows Metal SDPA for masked attention when the mask shape is supported.",
     ),
     CoreEnvVar::new(
+        "IZWI_MING_TTS_AUDIO_BATCH",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, decodes the due VAE windows of up to the engine rows in one audio quantum: every request's fixed-shape window is queued before any is read back, so the host's inverse STFT of one overlaps the device's next window. Any false value keeps one window per quantum.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MING_TTS_DECODE_GRAPHS",
         Flag,
         "true",
         Once,
-        "On CUDA, a Ming-3.0-tts decode step of 1 to 4 or 8 rows runs its language model as CUDA graphs of the work between two layers' paged attention (the residual branches, norms and the next layer's projections and rotation), captured per row count and checked bit for bit against the eager stretch before replaying; attention stays eager. Any graph failure keeps every step eager. Any false value, or cuda.decode_graphs=off, turns them off; `decode_graphs` in the model diagnostics reports why they are off, captures and replays.",
+        "On CUDA, every Ming-3.0-tts decode step runs its language model as CUDA graphs of the work between two layers' paged attention (the residual branches, norms and the next layer's projections and rotation), at the 32 padded rows every CUDA projection already has, checked bit for bit against the eager stretch before replaying; attention stays eager over the real rows. Any graph failure keeps every step eager. Any false value, or cuda.decode_graphs=off, turns them off; `decode_graphs` in the model diagnostics reports why they are off, captures and replays.",
     ),
     CoreEnvVar::new(
         "IZWI_MING_TTS_FLOW_GRAPHS",
@@ -1606,6 +1620,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "cpu",
         TestHarness,
         "Device of the ignored Ming-3.0-tts real-weight tests: cpu (F32), metal (F16 language model and flow path) or metal-f32.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_MING_TTS_VAE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, runs each Ming-3.0-tts VAE window at one fixed shape (34 query slots over 63 kept and 34 new keys) as a CUDA graph, checked bit for bit against the eager window at load. Off, a failure or a graph pool past its budget runs the same fixed shape eagerly with the same bits; `vae_graphs` in the model diagnostics reports why they are off, captures and replays.",
     ),
     CoreEnvVar::new(
         "IZWI_MING_TTS_VAE_WINDOW_KEYS",
@@ -2919,9 +2940,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_DECODE_QUANTUM",
         Int,
-        "8 on CUDA",
+        "1 on CUDA, 8 on Metal, 4 on CPU",
         Load,
-        "Decode steps one SOV-Transcribe-1 row runs per engine step while no request waits (1 to 64), fixed per load; the scheduler drops to one step as soon as a request waits. Greedy decoding makes the transcript the same at any value; values outside that range are ignored.",
+        "Decode steps one SOV-Transcribe-1 row runs per engine step (1 to 64), fixed per load. On CUDA one step a quantum lets rows that arrive meanwhile join the next step; longer quanta held each row's steps to itself. Greedy decoding makes the transcript the same at any value; values outside that range are ignored.",
     ),
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_ENCODER_BATCH",
@@ -2949,7 +2970,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Choice,
         "auto",
         Load,
-        "How SOV-Transcribe-1 computes its routed experts: `auto` (the default) runs the fused CUDA kernels (`kernels::moe_gelu`: device routing, each used expert's BF16 rows read once, no host readback) for calls of up to 512 routed pairs, so every decode step, and routes prefill spans on the host (each used expert's tokens as one GEMM); `fused` always takes the fused kernels (their CPU reference off CUDA); `host` always routes on the host; `device` takes the portable gathered path. A device path serves only after a load-time check against the host path; `moe_backend` and `moe_check` in the diagnostics report it.",
+        "How SOV-Transcribe-1 computes its routed experts: `auto` (the default) runs the fused CUDA kernels (`kernels::moe_gelu`: device routing, each used expert's BF16 rows read once, no host readback) for calls of up to 512 routed pairs, so every decode step, and prefill spans on the grouped path (every expert's tokens padded into one block and run as two batched GEMMs over the resident weights, in 512-token chunks); off CUDA it routes on the host. `fused` always takes the fused kernels (their CPU reference off CUDA); `grouped` always takes the grouped path; `host` always routes on the host; `device` takes the portable gathered path. A device path serves only after a load-time check against the host path; `moe_backend` and `moe_check` in the diagnostics report it.",
     ),
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_PREFILL_SPAN",
@@ -2957,6 +2978,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "512 on CUDA",
         Load,
         "Prompt tokens one SOV-Transcribe-1 row prefills per engine step (16 to 16384), fixed per load: the scheduler's prefill grid. The default covers the whole prompt of a 30-second request (about 410 tokens) in one step; values outside that range are ignored.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_SOV_TRANSCRIBE_PROFILE",
+        Flag,
+        "false",
+        Once,
+        "Synchronizes the device around each phase of every SOV-Transcribe-1 prefill (projections, attention, dense, experts) and decode step (attention, graphed stretches) and logs where the time went. A diagnostic: the synchronizations slow serving.",
     ),
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_REFERENCE",
