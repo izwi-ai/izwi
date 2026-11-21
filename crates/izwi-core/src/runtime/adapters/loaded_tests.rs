@@ -3093,7 +3093,8 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
 
 /// Rumble's normal requirement (with or without native streaming) binds its
 /// retained sequence graph: encoder preparation batched at the engine rows,
-/// scalar exact prefill, and continuous decode priced per row. A long-form
+/// scalar exact prefill (ragged batched on CUDA), and continuous decode
+/// priced per row. A long-form
 /// requirement binds the atomic stage, which chunks long audio inside its
 /// dispatch; with the retained route off (the default on CPU and Metal) it
 /// is the only graph. The model authors state for both graphs.
@@ -3148,6 +3149,9 @@ fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
                 continue;
             }
             assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+            // CUDA prefills a step's rows together once an encoder pass hands
+            // over more than one row.
+            let static_prefill = backend == BackendKind::Cuda && rows > 1;
             let names = normal
                 .stages
                 .iter()
@@ -3161,7 +3165,11 @@ fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
                         StageWorkSelector::PreSequencePreparation
                     ),
                     (
-                        "asr.rumble.prefill.scalar",
+                        if static_prefill {
+                            crate::models::architectures::rumble::RUMBLE_STATIC_PREFILL_STAGE
+                        } else {
+                            "asr.rumble.prefill.scalar"
+                        },
                         StageWorkSelector::SequencePrefill
                     ),
                     (
@@ -3185,7 +3193,21 @@ fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
                 assert_eq!(preparation.shape_policy, StageShapePolicy::Exact);
                 assert_eq!(preparation.concurrency, ConcurrencyClass::Exclusive);
             }
-            assert_eq!(normal.stages[1].max_batch_size, 1);
+            let prefill = &normal.stages[1];
+            if static_prefill {
+                assert_eq!(prefill.max_batch_size, preparation.max_batch_size);
+                assert_eq!(prefill.batch_mode, NativeBatchMode::Static);
+                assert_eq!(prefill.shape_policy, StageShapePolicy::Ragged);
+                assert_eq!(prefill.concurrency, ConcurrencyClass::Batchable);
+                assert_eq!(prefill.max_padding_basis_points, 0);
+                assert_eq!(
+                    normal.execution_profile.prefill_batch,
+                    NativeBatchMode::Static
+                );
+            } else {
+                assert_eq!(prefill.max_batch_size, 1);
+                assert_eq!(prefill.batch_mode, NativeBatchMode::None);
+            }
             let decode = &normal.stages[2];
             assert_eq!(decode.batch_mode, NativeBatchMode::Continuous);
             assert!(decode.max_batch_size >= rows);

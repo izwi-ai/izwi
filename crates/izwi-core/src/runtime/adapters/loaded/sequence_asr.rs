@@ -754,6 +754,12 @@ impl RumbleAsrExecutionAdapter {
         self
     }
 
+    /// Whether the retained graph prefills rows together: on CUDA, once an
+    /// encoder pass can hand over more than one row.
+    fn static_prefill(&self) -> bool {
+        self.backend_kind == BackendKind::Cuda && self.encoder_batch_size > 1
+    }
+
     pub(super) fn install_preparation_seal(
         &self,
         seal: RumbleAsrExecutionSeal,
@@ -911,7 +917,11 @@ impl LoadedExecutionAdapter for RumbleAsrExecutionAdapter {
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
-        profile.prefill_batch = NativeBatchMode::None;
+        profile.prefill_batch = if self.static_prefill() {
+            NativeBatchMode::Static
+        } else {
+            NativeBatchMode::None
+        };
         profile.decode_batch = NativeBatchMode::Continuous;
         profile.cache_mode = CacheMode::ExternalPaged;
         profile.cache_namespace = Some(format!(
@@ -926,7 +936,7 @@ impl LoadedExecutionAdapter for RumbleAsrExecutionAdapter {
         profile.cache_release_safe = true;
         profile.prefix_reuse_safe = false;
         // The decode batches at its own width; the encoder preparation and
-        // the prompt prefill stay scalar.
+        // (on CUDA) the prompt prefill at the encoder's.
         profile.max_batch_size = self.decode_batch_size;
         profile.resolved_from_loaded_model = true;
 
@@ -978,16 +988,34 @@ impl LoadedExecutionAdapter for RumbleAsrExecutionAdapter {
         }
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
 
-        let mut prefill = StageDescriptor::from_execution_profile(
-            StageId::new(1),
-            "asr.rumble.prefill.scalar",
-            &profile,
-            NativeBatchMode::None,
-        );
-        prefill.selector = StageWorkSelector::SequencePrefill;
-        prefill.max_batch_size = 1;
-        prefill.concurrency = ConcurrencyClass::Exclusive;
-        prefill.shape_policy = StageShapePolicy::Exact;
+        // On CUDA the rows a step prefills run as one mixed trunk step, as
+        // wide as an encoder pass hands over; elsewhere prefill stays scalar.
+        let prefill = if self.static_prefill() {
+            let mut prefill = StageDescriptor::from_execution_profile(
+                StageId::new(1),
+                crate::models::architectures::rumble::RUMBLE_STATIC_PREFILL_STAGE,
+                &profile,
+                NativeBatchMode::Static,
+            );
+            prefill.selector = StageWorkSelector::SequencePrefill;
+            prefill.max_batch_size = self.encoder_batch_size;
+            prefill.concurrency = ConcurrencyClass::Batchable;
+            prefill.shape_policy = StageShapePolicy::Ragged;
+            prefill.max_padding_basis_points = 0;
+            prefill
+        } else {
+            let mut prefill = StageDescriptor::from_execution_profile(
+                StageId::new(1),
+                "asr.rumble.prefill.scalar",
+                &profile,
+                NativeBatchMode::None,
+            );
+            prefill.selector = StageWorkSelector::SequencePrefill;
+            prefill.max_batch_size = 1;
+            prefill.concurrency = ConcurrencyClass::Exclusive;
+            prefill.shape_policy = StageShapePolicy::Exact;
+            prefill
+        };
 
         let mut decode = StageDescriptor::from_execution_profile(
             StageId::new(2),

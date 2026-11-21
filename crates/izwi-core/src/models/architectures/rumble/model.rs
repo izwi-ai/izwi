@@ -834,9 +834,9 @@ fn rumble_retained_contract(
     Ok(contract)
 }
 
-/// The retained sequence graph a load may seal: scalar exact encoder
-/// preparation, scalar exact prefill, and continuous ragged decode priced
-/// per row.
+/// The retained sequence graph a load may seal: scalar exact or ragged
+/// batched encoder preparation, scalar exact or (on CUDA) ragged batched
+/// prefill, and continuous ragged decode priced per row.
 fn rumble_retained_graph(stages: &[StageDescriptor]) -> bool {
     use crate::engine::{ConcurrencyClass, NativeBatchMode, StageShapePolicy, StageWorkSelector};
     let scalar = |stage: &StageDescriptor| {
@@ -858,9 +858,12 @@ fn rumble_retained_graph(stages: &[StageDescriptor]) -> bool {
         stage.selector == StageWorkSelector::PreSequencePreparation
             && (scalar(stage) || ragged_batch(stage))
     });
-    let prefill = stages
-        .iter()
-        .any(|stage| stage.selector == StageWorkSelector::SequencePrefill && scalar(stage));
+    let prefill = stages.iter().any(|stage| {
+        stage.selector == StageWorkSelector::SequencePrefill
+            && (scalar(stage)
+                || (ragged_batch(stage)
+                    && stage.name == super::retained::RUMBLE_STATIC_PREFILL_STAGE))
+    });
     let decode = stages.iter().any(|stage| {
         let batch_workspace = u64::try_from(stage.max_batch_size)
             .ok()
@@ -919,7 +922,7 @@ fn rumble_physical_state_spec(
     };
     if !valid {
         return Err(Error::ModelLoadError(
-            "Rumble ASR runs its atomic graph, beside at most a retained graph of scalar or ragged-batch preparation, scalar exact prefill and continuous ragged decode"
+            "Rumble ASR runs its atomic graph, beside at most a retained graph of scalar or ragged-batch preparation, scalar or ragged-batch prefill and continuous ragged decode"
                 .into(),
         ));
     }

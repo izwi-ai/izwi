@@ -626,6 +626,22 @@ fn asr_decode_stage_width(bundle_draft: &LoadedModelBundleDraft) -> Result<usize
     decode_stage_width(bundle_draft, CapabilityKind::Asr)
 }
 
+/// Rows Rumble's batched prefill stage takes (0 without it): retained rows
+/// beside a full decode, so rows an encoder pass hands over get their pages
+/// while the decode runs instead of waiting for decode rows to finish.
+fn rumble_prefill_stage_width(bundle_draft: &LoadedModelBundleDraft) -> Result<usize> {
+    Ok(bundle_draft
+        .execution_contracts(CapabilityKind::Asr)?
+        .iter()
+        .flat_map(|contract| contract.stages.iter())
+        .filter(|stage| {
+            stage.name == crate::models::architectures::rumble::RUMBLE_STATIC_PREFILL_STAGE
+        })
+        .map(|stage| stage.max_batch_size)
+        .max()
+        .unwrap_or(0))
+}
+
 /// The widest continuous decode stage of a loaded model's `capability`
 /// graphs (1 without one).
 fn decode_stage_width(

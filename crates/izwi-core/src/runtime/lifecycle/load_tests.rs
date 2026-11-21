@@ -2441,6 +2441,23 @@ fn asr_state_rows_cover_the_asr_decode_width() {
         );
     }
 
+    // Rumble on CUDA prefills an encoder pass's rows together, so its
+    // retained rows hold that many beside a full decode.
+    for (width, rows) in [(32, 64), (8, 16)] {
+        let rumble = draft(width, ModelVariant::Rumble2Flash, BackendKind::Cuda);
+        rumble
+            .install_test_preparation_seals(BackendKind::Cuda, width)
+            .unwrap();
+        let expected = if crate::models::architectures::rumble::rumble_retained_decode_enabled(
+            BackendKind::Cuda,
+        ) {
+            (rows, rows)
+        } else {
+            (width, width)
+        };
+        assert_eq!(lifecycle.asr_state_rows(&rumble).unwrap(), expected);
+    }
+
     // A transducer's predictor rows: its realtime sessions (4 on the CPU),
     // and at least its decode width.
     let portable = RuntimeService::new(EngineConfig {

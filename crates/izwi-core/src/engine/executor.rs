@@ -4055,6 +4055,25 @@ impl ModelExecutor for NativeExecutor {
                     mode: NativeBatchMode::Static,
                     ..
                 } if execution.batch.lane.kernel_mode
+                    == crate::models::architectures::rumble::RUMBLE_STATIC_PREFILL_STAGE
+                    && execution.requests.iter().all(|request| {
+                        request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::RumbleAsr
+                        })
+                    }) =>
+                {
+                    self.execute_static_rumble_asr_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.batch.lane.kernel_mode
                     == crate::models::architectures::nemotron::asr::NEMOTRON_RETAINED_PREFILL_STAGE
                     && execution.requests.iter().all(|request| {
                         request.model_variant.is_some_and(|variant| {
@@ -6829,6 +6848,35 @@ mod tests {
             ModelVariant::VibeVoiceAsr,
             StageWorkSelector::SequencePrefill,
             crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE,
+            NativeBatchMode::Static,
+            SequencePhase::Prefill,
+        );
+        let requests = [&request];
+        let scheduled = [scheduled];
+        assert_eq!(
+            NativeBatchRoute::resolve(&PhysicalBatchExecution {
+                batch: &batch,
+                requests: &requests,
+                scheduled: &scheduled,
+            })
+            .unwrap(),
+            NativeBatchRoute::Audio {
+                task: TaskType::ASR,
+                stage: NativeAudioStage::SequencePrefill,
+                mode: NativeBatchMode::Static,
+                stage_id: StageId::new(7),
+            }
+        );
+    }
+
+    #[test]
+    fn native_route_authenticates_rumble_static_prefill() {
+        let (request, scheduled, batch) = native_route_fixture(
+            TaskType::ASR,
+            "asr",
+            ModelVariant::Rumble2Flash,
+            StageWorkSelector::SequencePrefill,
+            crate::models::architectures::rumble::RUMBLE_STATIC_PREFILL_STAGE,
             NativeBatchMode::Static,
             SequencePhase::Prefill,
         );

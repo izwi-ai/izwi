@@ -28,6 +28,11 @@ use super::transcript::split_rumble_output;
 
 static NEXT_DECODE_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The retained graph's batched prefill stage on CUDA: the rows a step
+/// prefills run as one mixed trunk step
+/// ([`RumbleAsrModel::continue_resumable_prefill_batch`]).
+pub(crate) const RUMBLE_STATIC_PREFILL_STAGE: &str = "asr.rumble.prefill.tensor_static";
+
 /// The retained route's switch for Rumble (on by default on CUDA only).
 pub(crate) const RUMBLE_RETAINED_DECODE_ENV: &str = "IZWI_RUMBLE_RETAINED_DECODE";
 

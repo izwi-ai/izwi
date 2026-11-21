@@ -3471,7 +3471,7 @@ impl NativeAsrModel {
                 | Self::VibeVoice(_)
                 | Self::NemotronTranscribe(_)
                 | Self::SovTranscribe(_)
-        )
+        ) || matches!(self, Self::Rumble(model) if model.supports_static_prefill_batch())
     }
 
     pub fn continuous_decode_is_tensor_batched(&self) -> bool {
@@ -4129,6 +4129,31 @@ impl NativeAsrModel {
             }
             _ => Err(Error::InvalidInput(
                 "ASR resumable-prefill state does not match loaded ASR model".to_string(),
+            )),
+        }
+    }
+
+    /// Prefill several retained rows' spans `(state, start, end)` in one
+    /// model call (Rumble on CUDA); whether each row's prefill is complete.
+    pub(crate) fn continue_resumable_prefill_batch(
+        &self,
+        rows: &mut [(&mut NativeAsrDecodeState, usize, usize)],
+    ) -> Result<Vec<bool>> {
+        match self {
+            Self::Rumble(model) => {
+                let mut typed = rows
+                    .iter_mut()
+                    .map(|(state, start, end)| match &mut **state {
+                        NativeAsrDecodeState::Rumble(state) => Ok((state, *start, *end)),
+                        _ => Err(Error::InvalidInput(
+                            "Rumble prefill batch contains a foreign state".to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                model.continue_resumable_prefill_batch(&mut typed)
+            }
+            _ => Err(Error::InvalidInput(
+                "Loaded ASR model does not prefill rows together".to_string(),
             )),
         }
     }
