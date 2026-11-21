@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/kernels/cuda/counter_noise.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/relpos_attention.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/transducer_greedy.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/small_attention.cu");
 
     println!("cargo::rustc-check-cfg=cfg(izwi_cublas_grouped)");
 
@@ -69,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "src/kernels/cuda/counter_noise.cu",
             "src/kernels/cuda/relpos_attention.cu",
             "src/kernels/cuda/transducer_greedy.cu",
+            "src/kernels/cuda/small_attention.cu",
         ])
         .arg("-std=c++17")
         .arg("-O3")
