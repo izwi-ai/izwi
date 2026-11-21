@@ -203,6 +203,10 @@ pub fn write_kv_rows(
         let (heads, dim) = (rows.dim(1)?, rows.dim(2)?);
         let flat = cache.elem_count() / (heads * dim).max(1);
         let cache = cache.reshape((flat, heads, dim))?;
+        if cache.device().is_cuda() {
+            super::kv_rows::write_kv_rows(&cache, rows, slots)?;
+            continue;
+        }
         let indices = slots
             .reshape((slots.elem_count(), 1, 1))?
             .broadcast_as(rows.shape())?
