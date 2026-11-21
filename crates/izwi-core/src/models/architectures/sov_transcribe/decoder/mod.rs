@@ -20,6 +20,7 @@
 //! one-token spans.
 
 pub mod attention;
+mod batch;
 pub mod moe;
 pub mod norm;
 pub mod rope;
@@ -312,6 +313,16 @@ impl SovDecoder {
         if rows.is_empty() {
             return Err(Error::InvalidInput("a decoder forward needs a row".into()));
         }
+        // A decode step (one token a row) attends every row at once and runs
+        // its dense work as stretches between the layers' attention, through
+        // CUDA graphs where they are on.
+        if trace.is_none()
+            && rows
+                .iter()
+                .all(|row| row.embeds.dim(0).is_ok_and(|n| n == 1))
+        {
+            return self.decode_rows(rows);
+        }
         let mut prepared = Vec::with_capacity(rows.len());
         let mut lengths = Vec::with_capacity(rows.len());
         let mut positions = Vec::new();
@@ -338,13 +349,7 @@ impl SovDecoder {
             positions.extend(start..start + tokens);
             lengths.push(tokens);
         }
-        // A decode step (one token a row) runs as stretches between the
-        // layers' attention, through CUDA graphs where they are on.
-        let result = if trace.is_none() && lengths.iter().all(|&len| len == 1) {
-            self.decode_layers(rows, &mut prepared, &positions)
-        } else {
-            self.run_layers(rows, &mut prepared, &lengths, &positions, &mut trace)
-        };
+        let result = self.run_layers(rows, &mut prepared, &lengths, &positions, &mut trace);
         match result {
             Ok(hidden) => {
                 for (row, step) in rows.iter_mut().zip(prepared) {
@@ -480,10 +485,40 @@ impl SovDecoder {
     /// attention between them stays eager. On CUDA, with the experts routed
     /// on the device, each stretch replays its graph for this row count; the
     /// same bodies run directly everywhere else.
+    fn decode_rows(&self, rows: &mut [SpanRow<'_>]) -> Result<Tensor> {
+        let mut positions = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            self.validate_cache(row.cache)?;
+            let hidden = row.embeds.dim(1)?;
+            if hidden != self.config.hidden {
+                return Err(Error::InvalidInput(format!(
+                    "a decoder span is [tokens, {}], got {:?}",
+                    self.config.hidden,
+                    row.embeds.dims()
+                )));
+            }
+            positions.push(row.cache.context_len());
+        }
+        let window = self
+            .layers
+            .iter()
+            .find_map(|layer| layer.attention.geometry().window);
+        let mut batch = {
+            let caches = rows.iter().map(|row| &*row.cache).collect::<Vec<_>>();
+            batch::SovDecodeBatch::new(&caches, window, self.layers.len())?
+        };
+        let result = self.decode_layers(rows, &mut batch, &positions);
+        let mut caches = rows
+            .iter_mut()
+            .map(|row| &mut *row.cache)
+            .collect::<Vec<_>>();
+        batch.finish(&mut caches, result)
+    }
+
     fn decode_layers(
         &self,
         rows: &[SpanRow<'_>],
-        prepared: &mut [PreparedPhysicalPagedStep],
+        batch: &mut batch::SovDecodeBatch,
         positions: &[usize],
     ) -> Result<Tensor> {
         let count = rows.len();
@@ -530,20 +565,13 @@ impl SovDecoder {
         let last = self.layers.len() - 1;
         for index in 0..self.layers.len() {
             let attention = &self.layers[index].attention;
-            let (q, k, v) = (&qkv[0], &qkv[1], &qkv[2]);
-            let mut attended = Vec::with_capacity(count);
-            for (r, row) in rows.iter().enumerate() {
-                attended.push(attention.attend(
-                    row.cache,
-                    &mut prepared[r],
-                    index,
-                    &q.narrow(0, r, 1)?,
-                    &k.narrow(0, r, 1)?,
-                    &v.narrow(0, r, 1)?,
-                    self.dtype,
-                )?);
-            }
-            let attended = Tensor::cat(&attended, 0)?;
+            let attended = attention.attend_batch(
+                batch,
+                rows[0].cache,
+                index,
+                [&qkv[0], &qkv[1], &qkv[2]],
+                self.dtype,
+            )?;
             profile.mark(&self.device, PrefillPhase::Attention)?;
             if index == last {
                 let tail = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {

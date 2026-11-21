@@ -716,7 +716,7 @@ impl PhysicalPagedKvCache {
         })
     }
 
-    fn window_attention_views(
+    pub(crate) fn window_attention_views(
         &self,
         start_pos: usize,
         token_count: usize,
