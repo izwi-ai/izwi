@@ -370,8 +370,7 @@ impl AudioAttention {
         let seq_len = x.dim(1)?;
         let (heads, head_dim) = (self.num_heads, self.head_dim);
         let windowed = |projection: &Linear| -> Result<Tensor> {
-            projection
-                .forward(x)?
+            linear(projection, x, false)?
                 .reshape((seq_len, heads, head_dim))?
                 .index_select(&plan.gather, 0)?
                 .reshape((plan.windows, plan.width, heads, head_dim))?
@@ -391,7 +390,7 @@ impl AudioAttention {
             .reshape((plan.windows * plan.width, heads * head_dim))?
             .index_select(&plan.scatter, 0)?
             .unsqueeze(0)?;
-        self.out_proj.forward(&out).map_err(Error::from)
+        linear(&self.out_proj, &out, false)
     }
 
     fn forward(&self, x: &Tensor, cu_seqlens: &[i64], plan: Option<&WindowPlan>) -> Result<Tensor> {
@@ -400,19 +399,13 @@ impl AudioAttention {
         }
         let seq_len = x.dim(1)?;
 
-        let q = self
-            .q_proj
-            .forward(x)?
+        let q = linear(&self.q_proj, x, false)?
             .reshape((1, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let k = self
-            .k_proj
-            .forward(x)?
+        let k = linear(&self.k_proj, x, false)?
             .reshape((1, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let v = self
-            .v_proj
-            .forward(x)?
+        let v = linear(&self.v_proj, x, false)?
             .reshape((1, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
@@ -444,7 +437,7 @@ impl AudioAttention {
                             seq_len,
                             self.num_heads * self.head_dim,
                         ))?;
-                        return self.out_proj.forward(&out).map_err(Error::from);
+                        return linear(&self.out_proj, &out, false);
                     }
                 }
             }
@@ -480,7 +473,7 @@ impl AudioAttention {
                 let out =
                     out.transpose(1, 2)?
                         .reshape((1, seq_len, self.num_heads * self.head_dim))?;
-                return self.out_proj.forward(&out).map_err(Error::from);
+                return linear(&self.out_proj, &out, false);
             }
 
             let mut outputs = Vec::with_capacity(spans.len());
@@ -513,7 +506,7 @@ impl AudioAttention {
                 seq_len,
                 self.num_heads * self.head_dim,
             ))?;
-            return self.out_proj.forward(&out).map_err(Error::from);
+            return linear(&self.out_proj, &out, false);
         }
 
         // Fallback: retain original masked full-sequence behavior if chunk metadata
@@ -523,7 +516,7 @@ impl AudioAttention {
         let out = attention_unfused_with_mask(&q, &k, &v, &mask, self.num_heads, self.head_dim)?
             .transpose(1, 2)?
             .reshape((1, seq_len, self.num_heads * self.head_dim))?;
-        self.out_proj.forward(&out).map_err(Error::from)
+        linear(&self.out_proj, &out, false)
     }
 }
 
@@ -557,9 +550,8 @@ impl AudioEncoderLayer {
         let x = x.broadcast_add(&attn)?;
 
         let normed = self.final_layer_norm.forward(&x)?;
-        let hidden = self.fc1.forward(&normed)?;
-        let hidden = gelu(&hidden)?;
-        let hidden = self.fc2.forward(&hidden)?;
+        let hidden = linear(&self.fc1, &normed, true)?;
+        let hidden = linear(&self.fc2, &hidden, false)?;
         let x = x.broadcast_add(&hidden)?;
 
         Ok(x)
@@ -880,9 +872,8 @@ impl AudioTower {
             x = layer.forward(&x, cu_seqlens, plan.as_ref())?;
         }
         let x = self.ln_post.forward(&x)?;
-        let x = self.proj1.forward(&x)?;
-        let x = gelu(&x)?;
-        self.proj2.forward(&x).map_err(Error::from)
+        let x = linear(&self.proj1, &x, true)?;
+        linear(&self.proj2, &x, false)
     }
 
     fn forward_ragged_feature_batch(
@@ -1156,6 +1147,13 @@ impl AudioTower {
 /// `ACT2FN["gelu"]` (upstream `F.gelu`), not the tanh approximation.
 fn gelu(x: &Tensor) -> Result<Tensor> {
     x.gelu_erf().map_err(Error::from)
+}
+
+/// `layer` over `x`, then the exact GELU when `gelu`: Candle's ops, except
+/// that on CUDA the bias and GELU run in one in-place launch with the same
+/// bits ([`crate::kernels::cuda::bias_rows`]).
+fn linear(layer: &Linear, x: &Tensor, gelu: bool) -> Result<Tensor> {
+    crate::kernels::cuda::bias_rows::linear_forward(layer, x, gelu).map_err(Error::from)
 }
 
 #[cfg(test)]
