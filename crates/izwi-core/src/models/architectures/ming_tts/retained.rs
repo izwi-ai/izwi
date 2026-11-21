@@ -14,6 +14,7 @@
 //! between quanta ([`super::stream`]); a failed window discards the request.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 
@@ -78,6 +79,29 @@ pub(crate) struct MingRetainedState {
     phase: MingPhase,
     stop_reason: Option<MingStopReason>,
     pub(crate) audio: MingAudioStream,
+    timings: MingTimings,
+}
+
+/// Where a request's host wall time went, for diagnosing plateaus
+/// ([`MingRetainedState::trace_timings`]). A dispatch's time counts for
+/// every row it carried; device work may cross host intervals.
+#[derive(Debug, Clone, Copy, Default)]
+struct MingTimings {
+    prefill_ms: f64,
+    prefill_dispatches: u32,
+    decode_ms: f64,
+    decode_steps: u32,
+    /// Rows of every decode dispatch this request was in, summed.
+    decode_rows: u64,
+    /// Audio dispatches that ran one of this request's windows.
+    vae_ms: f64,
+    /// This request's own inverse STFT (host).
+    istft_ms: f64,
+    windows: u32,
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +153,7 @@ impl MingRetainedState {
             phase: MingPhase::Prefill,
             stop_reason: None,
             audio: MingAudioStream::default(),
+            timings: MingTimings::default(),
         })
     }
 
@@ -260,6 +285,27 @@ impl MingRetainedState {
         Ok(())
     }
 
+    /// One log line of where this request's time went: prefill, decode
+    /// (the shared dispatches' wall time and their mean width), the VAE
+    /// windows and their inverse STFTs, and the latents.
+    pub(crate) fn trace_timings(&self, request_id: &str) {
+        let t = &self.timings;
+        tracing::info!(
+            request_id,
+            timing_clock = "host_wall",
+            prefill_ms = t.prefill_ms,
+            prefill_dispatches = t.prefill_dispatches,
+            decode_ms = t.decode_ms,
+            decode_steps = t.decode_steps,
+            mean_decode_width = t.decode_rows as f64 / f64::from(t.decode_steps.max(1)),
+            vae_ms = t.vae_ms,
+            istft_ms = t.istft_ms,
+            windows = t.windows,
+            latents = self.latents_generated(),
+            "Ming execution timing (dispatch wall time counts for every row; GPU work may cross host intervals)"
+        );
+    }
+
     pub(crate) fn mark_finished(&mut self) -> Result<()> {
         if self.phase != MingPhase::Audio || !self.audio.done() {
             return Err(Error::InferenceError(
@@ -281,6 +327,7 @@ pub(crate) fn ming_audio_batch(
     decoder: &MingVaeDecoder,
     states: &mut [&mut MingRetainedState],
 ) -> Result<Vec<Option<Vec<f32>>>> {
+    let started = Instant::now();
     let mut queued: Vec<Option<(MingWindow, MingVaePending)>> = Vec::with_capacity(states.len());
     for state in states.iter_mut() {
         queued.push(match state.next_window() {
@@ -291,15 +338,26 @@ pub(crate) fn ming_audio_batch(
             None => None,
         });
     }
-    states
-        .iter_mut()
-        .zip(queued)
-        .map(|(state, queued)| {
-            queued
-                .map(|(window, pending)| state.audio.finish(decoder, pending, window))
-                .transpose()
-        })
-        .collect()
+    let mut out = Vec::with_capacity(states.len());
+    for (state, queued) in states.iter_mut().zip(queued) {
+        out.push(match queued {
+            Some((window, pending)) => {
+                let istft = Instant::now();
+                let samples = state.audio.finish(decoder, pending, window)?;
+                state.timings.istft_ms += elapsed_ms(istft);
+                state.timings.windows += 1;
+                Some(samples)
+            }
+            None => None,
+        });
+    }
+    let elapsed = elapsed_ms(started);
+    for (state, samples) in states.iter_mut().zip(&out) {
+        if samples.is_some() {
+            state.timings.vae_ms += elapsed;
+        }
+    }
+    Ok(out)
 }
 
 fn hidden_rows(hidden: &Tensor) -> Result<Vec<Vec<f32>>> {
@@ -320,6 +378,7 @@ pub(crate) fn ming_prefill_batch(
             "Ming prefill batch rows do not match".into(),
         ));
     }
+    let started = Instant::now();
     let hidden = runtime.config().llm.hidden_size;
     let mut steps = Vec::with_capacity(rows.len());
     let mut spans = Vec::with_capacity(rows.len());
@@ -350,7 +409,10 @@ pub(crate) fn ming_prefill_batch(
         .collect::<Vec<_>>();
     let states = hidden_rows(&runtime.trunk().forward_batch(&mut forward)?)?;
     drop(forward);
+    let elapsed = elapsed_ms(started);
     for ((row, step), state) in rows.iter_mut().zip(&steps).zip(states) {
+        row.state.timings.prefill_ms += elapsed;
+        row.state.timings.prefill_dispatches += 1;
         row.state.prefill_cursor += step.consumed_tokens;
         if step.complete {
             row.state.phase = MingPhase::Decode;
@@ -377,6 +439,7 @@ pub(crate) fn ming_decode_batch(
     if rows.is_empty() {
         return Err(Error::InvalidInput("Ming decode batch has no rows".into()));
     }
+    let started = Instant::now();
     // Every row's inputs first: its hidden state, history and its own
     // seeded noise, and whether this latent is its last. Then one flow-head
     // call for all of them, and one aggregator call for the rows that go
@@ -471,12 +534,16 @@ pub(crate) fn ming_decode_batch(
     }
     let mut states = states.chunks_exact(hidden_size);
     let mut steps = Vec::with_capacity(rows.len());
+    let (elapsed, width) = (elapsed_ms(started), rows.len() as u64);
     for ((row, latent), stop) in rows
         .iter_mut()
         .zip(sampled.as_chunks::<LATENT_DIM>().0)
         .zip(stops)
     {
         let state = &mut *row.state;
+        state.timings.decode_ms += elapsed;
+        state.timings.decode_steps += 1;
+        state.timings.decode_rows += width;
         state.latents.extend_from_slice(latent);
         match stop {
             Some(reason) => {

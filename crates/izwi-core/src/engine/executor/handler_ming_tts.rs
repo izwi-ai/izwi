@@ -547,6 +547,7 @@ impl NativeExecutor {
         let (model, mut lease) = self.checkout_ming_tts_audio(request, scheduled)?;
         let active = lease.require_state_mut()?;
         model.retained_finalize(&mut active.state)?;
+        active.state.trace_timings(&request.id);
         let audio = if let Some(tx) = Self::stream_sender(request) {
             Self::stream_audio_with_policy(
                 &tx,
