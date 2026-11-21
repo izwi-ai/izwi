@@ -8,10 +8,10 @@ use std::path::PathBuf;
 
 use crate::style;
 
-/// Izwi - High-performance audio inference engine CLI
+/// Izwi - Open-source voice AI that runs on your machine
 ///
-/// A world-class CLI for text-to-speech and speech-to-text inference
-/// optimized for Apple Silicon and CUDA devices.
+/// Command-line interface for speech-to-text, text-to-speech, voice
+/// cloning, diarization, and chat, accelerated on Apple Silicon and CUDA.
 ///
 /// Examples:
 ///   izwi serve                    # Start the server
@@ -22,8 +22,8 @@ use crate::style;
 #[derive(Parser)]
 #[command(
     name = "izwi",
-    about = "High-performance audio inference engine",
-    long_about = "Izwi is a world-class audio inference engine for text-to-speech (TTS) and automatic speech recognition (ASR). Optimized for Apple Silicon and CUDA devices.",
+    about = "Open-source voice AI that runs on your machine",
+    long_about = "Izwi is open-source voice AI that runs on your machine: speech-to-text, text-to-speech, voice cloning, diarization, and voice chat, with an OpenAI-compatible API. Accelerated on Apple Silicon (Metal) and NVIDIA GPUs (CUDA).",
     version = env!("CARGO_PKG_VERSION"),
     author = "Izwi <hi@izwiai.com>",
     help_template = style::HELP_TEMPLATE,
