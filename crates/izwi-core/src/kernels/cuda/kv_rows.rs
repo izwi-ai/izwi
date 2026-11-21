@@ -325,17 +325,16 @@ mod tests {
         // BF16 rows of 8 bytes take the u32 unit, F32 rows of 32 the u128.
         for dtype in [DType::F32, DType::BF16, DType::F16, DType::F8E4M3] {
             if dtype == DType::F8E4M3 {
-                let destination = Tensor::zeros((6, 3), DType::F32, &device)
-                    .unwrap()
-                    .to_dtype(dtype)
-                    .unwrap();
-                let source = Tensor::ones((2, 3), DType::F32, &device)
-                    .unwrap()
-                    .to_dtype(dtype)
-                    .unwrap();
+                // Candle has no CUDA cast into or out of FP8: build and read
+                // the tensors on the host.
+                let fp8 = |t: Tensor| t.to_dtype(dtype).unwrap().to_device(&device).unwrap();
+                let destination = fp8(Tensor::zeros((6, 3), DType::F32, &Device::Cpu).unwrap());
+                let source = fp8(Tensor::ones((2, 3), DType::F32, &Device::Cpu).unwrap());
                 let slots = Tensor::new(&[5u32, 1], &device).unwrap();
                 write_kv_rows(&destination, &source, &slots).unwrap();
                 let got = destination
+                    .to_device(&Device::Cpu)
+                    .unwrap()
                     .to_dtype(DType::F32)
                     .unwrap()
                     .to_vec2::<f32>()
