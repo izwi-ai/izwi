@@ -60,7 +60,13 @@ pub use contracts::{
     Audio8DacContract, Audio8PromptTensorShape,
 };
 pub use dac::{Audio8DacConfig, Audio8DacDecoder};
-pub(crate) use fast::audio8_fast_graph_device_bytes;
+/// Device bytes a load on `backend` prices for Audio8's CUDA graphs: the
+/// fast AR's frame graphs (which the load's self-check allocates) and the
+/// slow transformer's decode-step graphs (which the first decode steps
+/// allocate). Zero off CUDA or with the graphs switched off.
+pub(crate) fn audio8_graph_device_bytes(backend: crate::backends::BackendKind) -> u64 {
+    fast::audio8_fast_graph_device_bytes(backend) + slow::audio8_slow_graph_device_bytes(backend)
+}
 pub use fast::{Audio8FastConfig, Audio8FastDecoder, Audio8GeneratedFrame, Audio8Sampler};
 pub(crate) use physical::{Audio8PhysicalStateSpec, AUDIO8_SLOW_STATE_GROUP};
 #[allow(unused_imports)]
@@ -162,6 +168,10 @@ pub struct Audio8TtsDiagnostics {
     /// replays, fallbacks and graphed and eager frames; `None` without the
     /// native runtime.
     pub fast_graphs: Option<serde_json::Value>,
+    /// The slow transformer's CUDA decode-step graphs: why they are off, or
+    /// their widths, captures and replays; `None` without the native
+    /// runtime.
+    pub slow_graphs: Option<serde_json::Value>,
 }
 
 /// Model-authored terminal reason. Exhausting a budget is incomplete speech.
@@ -327,6 +337,10 @@ impl Audio8TtsModel {
                 .runtime
                 .as_ref()
                 .map(|runtime| runtime.fast.graphs_diagnostics()),
+            slow_graphs: self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.slow.graphs_diagnostics()),
         }
     }
 

@@ -80,9 +80,10 @@ pub(super) fn checkpoint_resource_plan(
             model_path, device,
         )?;
         let backend = BackendKind::from(device.kind);
-        // The fast AR's CUDA graphs allocate at the load's self-check.
+        // The fast AR's CUDA graphs allocate at the load's self-check, the
+        // slow transformer's on the first decode steps.
         let graphs =
-            crate::models::architectures::fish_s2::fish_s2_fast_graph_device_bytes(backend);
+            crate::models::architectures::fish_s2::fish_s2_graph_device_bytes(backend);
         return fish_s2_resource_plan(backend, memory, graphs).map(Some);
     }
     if variant == ModelVariant::Audio8TtsRealisticAir {
@@ -90,9 +91,10 @@ pub(super) fn checkpoint_resource_plan(
             model_path, device,
         )?;
         let backend = BackendKind::from(device.kind);
-        // The fast AR's CUDA graphs allocate at the load's self-check.
+        // The fast AR's CUDA graphs allocate at the load's self-check, the
+        // slow transformer's on the first decode steps.
         let graphs =
-            crate::models::architectures::audio8::audio8_fast_graph_device_bytes(backend);
+            crate::models::architectures::audio8::audio8_graph_device_bytes(backend);
         return audio8_resource_plan(backend, memory, graphs).map(Some);
     }
     if variant.family() == crate::catalog::ModelFamily::FishDrama3Tts {
@@ -501,7 +503,7 @@ pub(super) fn qwen38_synthetic_fixture_estimate(model_path: &Path) -> Result<Mod
     })
 }
 
-/// `graph_device_bytes`: the fast AR's CUDA graphs, priced resident but kept
+/// `graph_device_bytes`: the model's CUDA graphs, priced resident but kept
 /// pending until they allocate.
 pub(super) fn fish_s2_resource_plan(
     backend: BackendKind,
@@ -559,7 +561,7 @@ pub(super) fn fish_s2_resource_plan(
     }
     Ok(plan)
 }
-/// `graph_device_bytes`: the fast AR's CUDA graphs, priced resident but kept
+/// `graph_device_bytes`: the model's CUDA graphs, priced resident but kept
 /// pending until they allocate.
 pub(super) fn audio8_resource_plan(
     backend: BackendKind,

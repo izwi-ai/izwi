@@ -1927,7 +1927,7 @@ fn audio8_resource_plan_stays_inside_its_catalog_figures() {
             <= f64::from(variant.memory_required_gb_on(BackendKind::Metal)) * GIB
     );
 
-    let graphs = crate::models::architectures::audio8::audio8_fast_graph_device_bytes(
+    let graphs = crate::models::architectures::audio8::audio8_graph_device_bytes(
         BackendKind::Cuda,
     );
     let cuda = audio8_resource_plan(BackendKind::Cuda, half_memory, graphs).unwrap();

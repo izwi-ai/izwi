@@ -189,6 +189,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Reference voice WAV that conditions Audio8 smoke synthesis; `none` speaks with no reference.",
     ),
     CoreEnvVar::new(
+        "IZWI_AUDIO8_SLOW_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, every Audio8 decode step runs its slow transformer as CUDA graphs of the work between two layers' paged attention (the residual branches, norms and the next layer's projections and rotation, and after the last layer the final norm and the semantic logits), at the 32 padded rows every CUDA decode step already has, checked bit for bit against the eager stretch before replaying; attention stays eager over the real rows. Any graph failure keeps every step eager. Loads price 64 MiB for the graphs. Any false value, or cuda.decode_graphs=off, turns them off; `slow_graphs` in the model diagnostics reports why they are off, captures and replays.",
+    ),
+    CoreEnvVar::new(
         "IZWI_AUDIO8_SMOKE_CONTEXT",
         Int,
         "2048",
@@ -712,6 +719,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "data/fox.wav",
         TestHarness,
         "Reference voice WAV that conditions Fish S2 smoke synthesis.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_FISH_S2_SLOW_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, every Fish S2 decode step runs its slow transformer as CUDA graphs of the work between two layers' paged attention (the residual branches, norms and the next layer's projections, Q/K norms and rotation, and after the last layer the final norm and the semantic logits), at the 32 padded rows every CUDA decode step already has, checked bit for bit against the eager stretch before replaying; attention stays eager over the real rows. Any graph failure keeps every step eager. Loads price 64 MiB for the graphs. Any false value, or cuda.decode_graphs=off, turns them off; `slow_graphs` in the model diagnostics reports why they are off, captures and replays.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_S2_SMOKE_CONTEXT",
