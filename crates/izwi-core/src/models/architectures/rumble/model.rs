@@ -373,36 +373,21 @@ impl RumbleAsrModel {
         self.frontend.prepare(audio, sample_rate)
     }
 
-    /// Run the audio tower and projector over one request's features.
+    /// Run the audio tower and projector over one request's features: the
+    /// batched pass with one row, so a request encodes the same way alone
+    /// as beside others.
     pub(crate) fn audio_embeddings(
         &self,
         features: &RumbleAudioFeatures,
     ) -> Result<RumbleAudioEmbeddings> {
         let upload_started = Instant::now();
-        // The padded frames ride along: the tower reads them as its last
-        // chunk's padding and encodes `mel_frames` of them.
-        let input = Tensor::from_slice(
-            &features.flat,
-            (1, features.padded_frames, features.n_mels),
-            &self.device.device,
-        )?
-        .to_dtype(self.audio_dtype())?;
+        let input = self.upload_chunk_rows(&[features])?;
         let upload_ms = elapsed_ms(upload_started);
         let encode_started = Instant::now();
-        let encoded = self
-            .audio_tower
-            .forward_feature_batch(&input, &[features.mel_frames])?;
-        if encoded.output_lengths() != [features.audio_tokens] {
-            return Err(Error::InferenceError(format!(
-                "Rumble audio tower emitted {:?} tokens, expected {}",
-                encoded.output_lengths(),
-                features.audio_tokens
-            )));
-        }
-        let mut embeddings = encoded.row(0)?;
-        if embeddings.dtype() != self.text_dtype() {
-            embeddings = embeddings.to_dtype(self.text_dtype())?;
-        }
+        let embeddings = self
+            .encode_chunk_rows(&input, &[features])?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Rumble audio tower lost its row".into()))?;
         Ok(RumbleAudioEmbeddings {
             embeddings,
             upload_ms,
@@ -412,30 +397,71 @@ impl RumbleAsrModel {
 
     /// Run the audio tower and projector over several requests' features in
     /// one pass: each row's `[1, audio_tokens, hidden]` embeddings at the
-    /// decoder's dtype, in order. Rows are uploaded at their own length and
-    /// none reads another's frames.
+    /// decoder's dtype, in order. Every row's whole conv chunks go up in
+    /// one upload and none reads another's frames.
     pub(crate) fn audio_embeddings_batch(
         &self,
         rows: &[&RumbleAudioFeatures],
     ) -> Result<Vec<Tensor>> {
-        let inputs = rows
+        let input = self.upload_chunk_rows(rows)?;
+        self.encode_chunk_rows(&input, rows)
+    }
+
+    /// Every row's features as one `[all chunks, chunk_frames, n_mels]`
+    /// tensor at the tower's dtype. A row's features already hold whole
+    /// conv chunks (the padded frames are the mel of the silence its
+    /// waveform was padded with), so the rows concatenate on the host.
+    fn upload_chunk_rows(&self, rows: &[&RumbleAudioFeatures]) -> Result<Tensor> {
+        let chunk_frames = self.audio_tower.chunk_frames()?;
+        let n_mels = self.audio_tower.mel_bins();
+        let mut chunks = 0usize;
+        for (row, features) in rows.iter().enumerate() {
+            let row_chunks = features.mel_frames.div_ceil(chunk_frames);
+            if features.mel_frames == 0
+                || features.n_mels != n_mels
+                || features.padded_frames != row_chunks * chunk_frames
+                || features.flat.len() != features.padded_frames * n_mels
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Rumble audio row {row} holds {} of {} frames x {} mel bins; the tower takes whole {chunk_frames}-frame chunks of {n_mels} bins",
+                    features.mel_frames, features.padded_frames, features.n_mels
+                )));
+            }
+            chunks += row_chunks;
+        }
+        if chunks == 0 {
+            return Err(Error::InvalidInput(
+                "No audio features available for ASR batch".into(),
+            ));
+        }
+        let input = if let [features] = rows {
+            Tensor::from_slice(
+                &features.flat,
+                (chunks, chunk_frames, n_mels),
+                &self.device.device,
+            )?
+        } else {
+            let mut flat = Vec::with_capacity(chunks * chunk_frames * n_mels);
+            for features in rows {
+                flat.extend_from_slice(&features.flat);
+            }
+            Tensor::from_vec(flat, (chunks, chunk_frames, n_mels), &self.device.device)?
+        };
+        input.to_dtype(self.audio_dtype()).map_err(Error::from)
+    }
+
+    /// The tower and projector over [`Self::upload_chunk_rows`]' tensor:
+    /// each row's embeddings at the decoder's dtype.
+    fn encode_chunk_rows(
+        &self,
+        input: &Tensor,
+        rows: &[&RumbleAudioFeatures],
+    ) -> Result<Vec<Tensor>> {
+        let lengths = rows
             .iter()
-            .map(|features| {
-                Tensor::from_slice(
-                    &features.flat,
-                    (features.padded_frames, features.n_mels),
-                    &self.device.device,
-                )?
-                .to_dtype(self.audio_dtype())
-                .map_err(Error::from)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let tower_rows = inputs
-            .iter()
-            .zip(rows)
-            .map(|(input, features)| (input, features.mel_frames))
+            .map(|features| features.mel_frames)
             .collect::<Vec<_>>();
-        let encoded = self.audio_tower.forward_feature_rows(&tower_rows)?;
+        let encoded = self.audio_tower.forward_chunk_rows(input, &lengths)?;
         if encoded.len() != rows.len() {
             return Err(Error::InferenceError(
                 "Rumble audio tower returned the wrong row count".into(),
