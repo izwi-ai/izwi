@@ -36,12 +36,14 @@ const GRAPHED_FRAMES: [usize; 2] = [
 /// PCM (128 KiB for 16 frames). The 16-frame push's working set peaks in
 /// the decoder's last stages: 32,768 samples at 96 to 192 channels, 12.6
 /// MiB a tensor, a few alive at once beside each convolution's padded
-/// input. A capture that grows the pool past it runs that length eagerly
-/// at the same shape.
+/// input. On the H100 the 4-frame capture grew the graph pool 96 MiB and
+/// the 16-frame one 224 to 256 MiB more, so the two need about 352 MiB. A
+/// capture that grows the pool past the budget runs that length eagerly at
+/// the same shape.
 const CODEC_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
     max_graphs: 2,
     retained_bytes: 32 * MIB,
-    pool_bytes: 256 * MIB,
+    pool_bytes: 384 * MIB,
 };
 
 /// Device bytes a load on `backend` prices for the streaming codec's
