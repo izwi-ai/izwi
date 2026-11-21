@@ -17,7 +17,7 @@ use crate::models::architectures::audio8::tokenizer::Audio8VqCodes;
 
 #[path = "dac_streaming.rs"]
 mod streaming;
-pub(crate) use streaming::Audio8DacStreamState;
+pub(crate) use streaming::{audio8_codec_graph_device_bytes, Audio8DacStreamState};
 
 pub(crate) const ATTENTION_QUERY_BLOCK: usize = 64;
 
@@ -59,6 +59,9 @@ pub struct Audio8DacDecoder {
     encoder: Audio8DacAudioEncoder,
     quantizer: Audio8DownsampleResidualVectorQuantizer,
     decoder: Audio8DacAudioDecoder,
+    /// On CUDA, streaming pushes at fixed shapes (and their graphs); `None`
+    /// runs them at each stream's own history lengths.
+    stream: Option<streaming::Audio8DacFixedStream>,
 }
 
 struct Audio8DownsampleResidualVectorQuantizer {
@@ -386,12 +389,17 @@ impl Audio8DacDecoder {
         let encoder = Audio8DacAudioEncoder::load(&config, vb.pp("encoder"))?;
         let quantizer = Audio8DownsampleResidualVectorQuantizer::load(&config, vb.pp("quantizer"))?;
         let decoder = Audio8DacAudioDecoder::load(&config, vb.pp("decoder"))?;
-        Ok(Self {
+        let mut codec = Self {
             config,
             encoder,
             quantizer,
             decoder,
-        })
+            stream: None,
+        };
+        if vb.device().is_cuda() {
+            codec.stream = streaming::Audio8DacFixedStream::new(&codec)?;
+        }
+        Ok(codec)
     }
 
     pub fn config(&self) -> &Audio8DacConfig {

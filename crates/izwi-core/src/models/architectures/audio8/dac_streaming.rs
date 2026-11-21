@@ -1,9 +1,260 @@
 //! Exact incremental decoding. Histories are immutable, independently allocated
 //! tensors: cloning a checkpoint shares storage until the next successful push.
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::backends::BackendKind;
+use crate::kernels::cuda::shape_graphs::{ShapeGraphLimits, ShapeGraphs};
+
 type AttentionState = (Tensor, Tensor);
+
+/// Kill switch for the streaming codec's CUDA graphs (a boolean; on when
+/// unset). Off, CUDA pushes still run at their fixed shapes, eagerly, with
+/// the same bits. Read once: load pricing and the runtime read it.
+pub(crate) const AUDIO8_CODEC_GRAPHS_ENV: &str = "IZWI_AUDIO8_CODEC_GRAPHS";
+
+fn codec_graphs_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(AUDIO8_CODEC_GRAPHS_ENV, true));
+    ON.get()
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// The push lengths that replay graphs: a stream's first chunk and every
+/// full chunk after it. A shorter tail runs its fixed shape eagerly.
+const GRAPHED_FRAMES: [usize; 2] = [
+    crate::models::architectures::audio8::AUDIO8_FIRST_AUDIO_FRAMES,
+    crate::models::architectures::audio8::AUDIO8_AUDIO_CHUNK_FRAMES,
+];
+
+/// What the codec graphs may hold: one graph per [`GRAPHED_FRAMES`] length.
+/// Each retains its inputs and outputs: the post-module's kept keys and
+/// values (127 F32 keys a layer, about 4 MiB each way), the convolution
+/// histories (about 0.5 MiB), the codes, tables and mask, and the push's
+/// PCM (128 KiB for 16 frames). The 16-frame push's working set peaks in
+/// the decoder's last stages: 32,768 samples at 96 to 192 channels, 12.6
+/// MiB a tensor, a few alive at once beside each convolution's padded
+/// input. A capture that grows the pool past it runs that length eagerly
+/// at the same shape.
+const CODEC_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 2,
+    retained_bytes: 32 * MIB,
+    pool_bytes: 256 * MIB,
+};
+
+/// Device bytes a load on `backend` prices for the streaming codec's
+/// graphs, which the load's self-check allocates: zero off CUDA or with
+/// the graphs off.
+pub(crate) fn audio8_codec_graph_device_bytes(backend: BackendKind) -> u64 {
+    if backend == BackendKind::Cuda && codec_graphs_requested() {
+        CODEC_GRAPH_LIMITS.device_bytes()
+    } else {
+        0
+    }
+}
+
+/// On CUDA a row's push runs at one shape per incoming frame count, so a
+/// push's kernels never depend on its stream's age: every convolution
+/// history at its full length and the post-module's kept keys and values
+/// at `window - 1`, zero until the stream has them, with a mask over the
+/// keys that are not real or not in a query's window. Zero history is
+/// exactly the causal padding the first push had, and a masked key
+/// weighs nothing, so a fixed push is the push at the stream's own lengths
+/// up to rounding (a softmax over more, masked, keys, and convolutions of
+/// longer inputs), and the same bits at every age and beside any rows: one
+/// row a call, never padded across rows. Each [`GRAPHED_FRAMES`] length is
+/// one CUDA graph, captured and checked bit for bit against the eager push
+/// at load ([`Audio8DacDecoder::resolve_stream_graphs`]), then replayed for
+/// every row and push of that length.
+pub(super) struct Audio8DacFixedStream {
+    /// Each convolution history's channels and kept frames, in push order.
+    histories: Vec<(usize, usize)>,
+    /// The post-module's layers, KV heads, kept keys and head width.
+    layers: usize,
+    kv_heads: usize,
+    kept: usize,
+    head_dim: usize,
+    dtype: DType,
+    graphs: std::result::Result<ShapeGraphs<usize>, String>,
+    /// Pushes of a graphed length (through the graphs while they are on).
+    graphed: AtomicU64,
+    /// Pushes of another length (a stream's tail), run eagerly.
+    eager: AtomicU64,
+}
+
+/// What every post-module layer of one fixed push shares: the rotary rows
+/// of its positions and its mask, `[1, 1, frames, kept + frames]` (0 where
+/// a key is real and in the query's window, -inf elsewhere).
+struct FixedTables {
+    cos: Tensor,
+    sin: Tensor,
+    mask: Tensor,
+}
+
+impl Audio8DacFixedStream {
+    /// The fixed shapes of `codec`'s streaming push, or `None` when its
+    /// post-module has no attention to fix.
+    pub(super) fn new(codec: &Audio8DacDecoder) -> Result<Option<Self>> {
+        let q = &codec.quantizer;
+        let Some(first) = q.post_module.layers.first() else {
+            return Ok(None);
+        };
+        let attention = &first.attention;
+        let kept = attention.window_size.checked_sub(1).ok_or_else(|| {
+            Error::ConfigError("Audio8 streaming attention requires a window".into())
+        })?;
+        // The histories in the order `decode_stream` keeps them: what
+        // `conv` and `transpose` keep, skipping layers that keep nothing.
+        let conv = |layer: &Audio8CausalConv1d| -> Result<Option<(usize, usize)>> {
+            let channels = layer.conv.weight().dim(1)? * layer.conv.config().groups;
+            Ok((layer.padding_total > 0).then_some((channels, layer.padding_total)))
+        };
+        let transpose = |layer: &Audio8CausalConvTranspose1d| -> Result<Option<(usize, usize)>> {
+            let keep = layer.right_trim.div_ceil(layer.conv.config().stride);
+            Ok((keep > 0).then_some((layer.conv.weight().dim(0)?, keep)))
+        };
+        let mut walk = Vec::new();
+        for block in &q.upsample {
+            walk.push(transpose(&block.transposed)?);
+            walk.push(conv(&block.convnext.dwconv)?);
+        }
+        let d = &codec.decoder;
+        walk.push(conv(&d.first)?);
+        for block in &d.blocks {
+            walk.push(transpose(&block.transposed)?);
+            for unit in &block.residuals {
+                walk.push(conv(&unit.conv1)?);
+                walk.push(conv(&unit.conv2)?);
+            }
+        }
+        walk.push(conv(&d.final_conv)?);
+        let histories = walk.into_iter().flatten().collect::<Vec<_>>();
+        Ok(Some(Self {
+            histories,
+            layers: q.post_module.layers.len(),
+            kv_heads: attention.num_kv_heads,
+            kept,
+            head_dim: attention.head_dim,
+            dtype: d.final_conv.conv.weight().dtype(),
+            graphs: Err("not resolved".into()),
+            graphed: AtomicU64::new(0),
+            eager: AtomicU64::new(0),
+        }))
+    }
+
+    /// `state`'s histories and kept keys and values at the fixed shapes,
+    /// zero-filled in front (zeros for a fresh stream), in input order.
+    fn state_inputs(
+        &self,
+        state: &Audio8DacStreamState,
+        device: &candle_core::Device,
+    ) -> Result<Vec<Tensor>> {
+        let (histories, attention) = state.row_tensors()?;
+        if !(histories.is_empty() && attention.is_empty())
+            && (histories.len() != self.histories.len() || attention.len() != self.layers)
+        {
+            return Err(Error::InvalidInput(
+                "Audio8 codec stream history does not match the fixed shapes".into(),
+            ));
+        }
+        let pad = |tensor: &Tensor, len: usize| -> Result<Tensor> {
+            let have = tensor.dim(2)?;
+            match have.cmp(&len) {
+                std::cmp::Ordering::Equal => Ok(tensor.clone()),
+                std::cmp::Ordering::Less => Ok(tensor.pad_with_zeros(2, len - have, 0)?),
+                std::cmp::Ordering::Greater => Err(Error::InvalidInput(
+                    "Audio8 codec stream history exceeds its fixed shape".into(),
+                )),
+            }
+        };
+        let mut inputs = Vec::with_capacity(self.histories.len() + 2 * self.layers);
+        for (index, &(channels, keep)) in self.histories.iter().enumerate() {
+            inputs.push(match histories.get(index) {
+                Some(history) => pad(history, keep)?,
+                None => Tensor::zeros((1, channels, keep), self.dtype, device)?,
+            });
+        }
+        for layer in 0..self.layers {
+            match attention.get(layer) {
+                Some((k, v)) => {
+                    inputs.push(pad(k, self.kept)?);
+                    inputs.push(pad(v, self.kept)?);
+                }
+                None => {
+                    let zeros = Tensor::zeros(
+                        (1, self.kv_heads, self.kept, self.head_dim),
+                        self.dtype,
+                        device,
+                    )?;
+                    inputs.push(zeros.clone());
+                    inputs.push(zeros);
+                }
+            }
+        }
+        Ok(inputs)
+    }
+
+    /// The mask of a push of `frames` frames from frame `start`: key `j` is
+    /// frame `start - kept + j` (the first `kept - start` are padding);
+    /// query `i` sees keys `i..=kept + i`, its window, if real.
+    fn mask(&self, start: usize, frames: usize, device: &candle_core::Device) -> Result<Tensor> {
+        let keys = self.kept + frames;
+        let first_real = self.kept.saturating_sub(start);
+        let mut mask = Vec::with_capacity(frames * keys);
+        for query in 0..frames {
+            mask.extend((0..keys).map(|key| {
+                if key >= query.max(first_real) && key <= self.kept + query {
+                    0f32
+                } else {
+                    f32::NEG_INFINITY
+                }
+            }));
+        }
+        Ok(Tensor::from_vec(mask, (1, 1, frames, keys), device)?.to_dtype(self.dtype)?)
+    }
+
+    /// `body` over `inputs` for a push of `frames` frames: through its
+    /// graph when that length has one and the graphs are on, eagerly
+    /// otherwise (the same bits).
+    fn run(
+        &self,
+        frames: usize,
+        inputs: &[Tensor],
+        body: &dyn Fn(&[Tensor]) -> Result<Vec<Tensor>>,
+    ) -> Result<Vec<Tensor>> {
+        let graphs = match &self.graphs {
+            Ok(graphs) if GRAPHED_FRAMES.contains(&frames) => graphs,
+            _ => {
+                self.eager.fetch_add(1, Ordering::Relaxed);
+                return body(inputs);
+            }
+        };
+        let inputs = inputs
+            .iter()
+            .map(Tensor::contiguous)
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let bytes = |tensor: &Tensor| (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64;
+        // The graph keeps its stable inputs and outputs of about the same
+        // size (the next histories, keys and values) plus the PCM.
+        let retained = 2 * inputs.iter().map(bytes).sum::<u64>();
+        let outputs = graphs.run(frames, retained, &inputs, body)?;
+        self.graphed.fetch_add(1, Ordering::Relaxed);
+        Ok(outputs)
+    }
+
+    fn diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        };
+        diagnostics["graphed_frames"] = serde_json::json!(GRAPHED_FRAMES);
+        diagnostics["graphed_pushes"] = self.graphed.load(Ordering::Relaxed).into();
+        diagnostics["eager_pushes"] = self.eager.load(Ordering::Relaxed).into();
+        diagnostics
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Audio8DacStreamState {
@@ -153,6 +404,17 @@ impl Audio8DacDecoder {
             ));
         }
         let codes = codebooks_to_tensor(codebooks, &self.config, self.decoder_device()?)?;
+        if let Some(fixed) = &self.stream {
+            let (audio, next) = self.push_fixed(fixed, state, &codes)?;
+            check_cancelled()?;
+            let samples = audio
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            check_cancelled()?;
+            *state = next;
+            return Ok(samples);
+        }
         let mut candidate = state.unshared()?;
         let z = self.push_tensor(&mut candidate, &codes, check_cancelled)?;
         let samples = z.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -210,6 +472,25 @@ impl Audio8DacDecoder {
                 .entry((state.frames, incoming, lane))
                 .or_default()
                 .push(row);
+        }
+        if let Some(fixed) = &self.stream {
+            // Every row alone at its fixed shape: launch every row's push
+            // before reading any PCM back.
+            let mut candidates = Vec::with_capacity(states.len());
+            let mut audio = Vec::with_capacity(states.len());
+            for (state, codes) in states.iter().zip(&tensors) {
+                check_cancelled()?;
+                let (pcm, next) = self.push_fixed(fixed, state, codes)?;
+                audio.push(pcm);
+                candidates.push(next);
+            }
+            let outputs = audio
+                .iter()
+                .map(|pcm| Ok(pcm.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?))
+                .collect::<Result<Vec<_>>>()?;
+            check_cancelled()?;
+            states.clone_from_slice(&candidates);
+            return Ok(outputs);
         }
         let mut candidates = states.to_vec();
         let mut outputs = vec![Vec::new(); states.len()];
@@ -308,6 +589,194 @@ impl Audio8DacDecoder {
     ) -> Result<Tensor> {
         let frames = codes.dim(2)?;
         let mut next = state.clone();
+        let z = self.decode_stream(&mut next, codes, None, check_cancelled)?;
+        let samples = z.dim(2)?;
+        check_cancelled()?;
+        next.frames += frames;
+        next.samples += samples;
+        *state = next;
+        Ok(z)
+    }
+
+    /// One row's push at the fixed shapes ([`Audio8DacFixedStream`]): its
+    /// PCM, `[1, 1, samples]`, and its next state; `state` is unchanged.
+    fn push_fixed(
+        &self,
+        fixed: &Audio8DacFixedStream,
+        state: &Audio8DacStreamState,
+        codes: &Tensor,
+    ) -> Result<(Tensor, Audio8DacStreamState)> {
+        let frames = codes.dim(2)?;
+        let device = codes.device();
+        let rotary = &self
+            .quantizer
+            .post_module
+            .layers
+            .first()
+            .ok_or_else(|| Error::InferenceError("Audio8 codec has no post-module".into()))?
+            .attention
+            .rotary;
+        let (cos, sin) = rotary.range_tables(state.frames, frames)?;
+        let mut inputs = vec![
+            codes.clone(),
+            cos,
+            sin,
+            fixed.mask(state.frames, frames, device)?,
+        ];
+        inputs.extend(fixed.state_inputs(state, device)?);
+        let histories = fixed.histories.len();
+        let body = |inputs: &[Tensor]| self.fixed_body(histories, inputs);
+        let mut outputs = fixed.run(frames, &inputs, &body)?.into_iter();
+        let audio = outputs
+            .next()
+            .ok_or_else(|| Error::InferenceError("Audio8 codec push returned nothing".into()))?;
+        let next_histories = outputs.by_ref().take(histories).collect::<Vec<_>>();
+        let rest = outputs.collect::<Vec<_>>();
+        if next_histories.len() != histories || rest.len() != 2 * fixed.layers {
+            return Err(Error::InferenceError(
+                "Audio8 codec push returned the wrong state".into(),
+            ));
+        }
+        let samples = audio.dim(2)?;
+        Ok((
+            audio,
+            Audio8DacStreamState {
+                histories: next_histories,
+                attention: rest
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[k, v]| (k.clone(), v.clone()))
+                    .collect(),
+                shared: None,
+                frames: state.frames + frames,
+                samples: state.samples + samples,
+                finished: false,
+            },
+        ))
+    }
+
+    /// A fixed push as a pure function of its inputs: the codes, the
+    /// post-module's tables and mask, `histories` histories and every
+    /// layer's kept keys and values; returns the PCM and the next
+    /// histories, keys and values in the same order. What a graph captures.
+    fn fixed_body(&self, histories: usize, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
+        if inputs.len() < 4 + histories {
+            return Err(Error::InvalidInput(
+                "Audio8 codec push has too few inputs".into(),
+            ));
+        }
+        let tables = FixedTables {
+            cos: inputs[1].clone(),
+            sin: inputs[2].clone(),
+            mask: inputs[3].clone(),
+        };
+        let mut state = Audio8DacStreamState {
+            histories: inputs[4..4 + histories].to_vec(),
+            attention: inputs[4 + histories..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[k, v]| (k.clone(), v.clone()))
+                .collect(),
+            ..Default::default()
+        };
+        let audio = self.decode_stream(&mut state, &inputs[0], Some(&tables), &|| Ok(()))?;
+        let mut outputs = Vec::with_capacity(inputs.len() - 3);
+        outputs.push(audio);
+        outputs.extend(state.histories);
+        for (k, v) in state.attention {
+            outputs.push(k);
+            outputs.push(v);
+        }
+        Ok(outputs)
+    }
+
+    /// The streaming codec's fixed-shape pushes and their graphs, or
+    /// `None` off CUDA.
+    pub(crate) fn stream_graphs_diagnostics(&self) -> Option<serde_json::Value> {
+        self.stream.as_ref().map(Audio8DacFixedStream::diagnostics)
+    }
+
+    /// On CUDA, turns the fixed pushes' graphs on (unless
+    /// [`AUDIO8_CODEC_GRAPHS_ENV`] is off) once a self-check passes: two
+    /// streams of a first chunk and a full chunk, the first capturing each
+    /// length's graph and checking a replay against the eager push bit for
+    /// bit, the second checking again over new inputs. A failure leaves the
+    /// pushes eager at the same shapes.
+    pub(crate) fn resolve_stream_graphs(&mut self) {
+        let Ok(device) = self.decoder_device().cloned() else {
+            return;
+        };
+        let Some(fixed) = self.stream.as_mut() else {
+            return;
+        };
+        fixed.graphs = if codec_graphs_requested() {
+            ShapeGraphs::resolve("Audio8 streaming codec", &device, CODEC_GRAPH_LIMITS)
+        } else {
+            Err(format!("{AUDIO8_CODEC_GRAPHS_ENV} is off"))
+        };
+        if fixed.graphs.is_err() {
+            return;
+        }
+        let checked = self.self_check_stream_graphs();
+        let Some(fixed) = self.stream.as_mut() else {
+            return;
+        };
+        let reason = match (&checked, &fixed.graphs) {
+            (Ok(()), Ok(graphs)) if graphs.is_on() => None,
+            (Ok(()), Ok(graphs)) => Some(format!("self-check: {}", graphs.diagnostics()["off"])),
+            (Err(error), _) => Some(format!("self-check failed: {error}")),
+            (Ok(()), Err(reason)) => Some(reason.clone()),
+        };
+        match reason {
+            None => tracing::info!(
+                frames = ?GRAPHED_FRAMES,
+                "Audio8 streaming codec pushes run as CUDA graphs"
+            ),
+            Some(reason) => {
+                tracing::warn!(%reason, "Audio8 streaming codec pushes run eagerly");
+                fixed.graphs = Err(reason);
+            }
+        }
+    }
+
+    fn self_check_stream_graphs(&self) -> Result<()> {
+        let codes = |frames: usize, salt: usize| {
+            (0..self.config.num_codebooks())
+                .map(|book| {
+                    (0..frames)
+                        .map(|frame| ((frame * 7_919 + book * 104_729 + salt * 31) % 1_021) as u32)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        for salt in 0..2 {
+            let mut state = Audio8DacStreamState::default();
+            for frames in GRAPHED_FRAMES {
+                self.push_frames(&mut state, &codes(frames, salt), &|| Ok(()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run pushes at the fixed shapes off CUDA too (a test's reference).
+    #[cfg(test)]
+    pub(crate) fn use_fixed_stream(&mut self) {
+        self.stream = Audio8DacFixedStream::new(self).expect("fixed shapes");
+    }
+
+    /// The walk of one push over `next`'s histories (replaced by the
+    /// push's): `fixed` runs the post-module at the fixed shapes
+    /// ([`Audio8DacFixedStream`]); `None` at `next.frames` over the keys it
+    /// kept. `next`'s frame and sample counts are the caller's.
+    fn decode_stream(
+        &self,
+        next: &mut Audio8DacStreamState,
+        codes: &Tensor,
+        fixed: Option<&FixedTables>,
+        check_cancelled: CancelCheck<'_>,
+    ) -> Result<Tensor> {
         let q = &self.quantizer;
         let semantic = q
             .semantic_quantizer
@@ -319,7 +788,8 @@ impl Audio8DacDecoder {
         let mut z = transformer(
             &q.post_module,
             &semantic.broadcast_add(&residual)?,
-            &mut next,
+            next,
+            fixed,
             check_cancelled,
         )?;
         let mut cursor = 0;
@@ -371,11 +841,6 @@ impl Audio8DacDecoder {
             &mut cursor,
         )?
         .tanh()?;
-        let samples = z.dim(2)?;
-        check_cancelled()?;
-        next.frames += frames;
-        next.samples += samples;
-        *state = next;
         Ok(z)
     }
 }
@@ -470,6 +935,7 @@ fn transformer(
     module: &Audio8WindowLimitedTransformer,
     x: &Tensor,
     state: &mut Audio8DacStreamState,
+    fixed: Option<&FixedTables>,
     cancel: CancelCheck<'_>,
 ) -> Result<Tensor> {
     let mut h = if module.channels_first {
@@ -482,13 +948,24 @@ fn transformer(
     }
     for (idx, layer) in module.layers.iter().enumerate() {
         cancel()?;
-        let (attn, kv) = attention(
-            &layer.attention,
-            &layer.attention_norm.forward(&h)?,
-            state.attention.get(idx),
-            state.frames,
-            cancel,
-        )?;
+        let normed = layer.attention_norm.forward(&h)?;
+        let (attn, kv) = match fixed {
+            Some(tables) => fixed_attention(
+                &layer.attention,
+                &normed,
+                state.attention.get(idx).ok_or_else(|| {
+                    Error::InvalidInput("Audio8 fixed codec push has no kept keys".into())
+                })?,
+                tables,
+            )?,
+            None => attention(
+                &layer.attention,
+                &normed,
+                state.attention.get(idx),
+                state.frames,
+                cancel,
+            )?,
+        };
         if idx == state.attention.len() {
             state.attention.push(kv);
         } else {
@@ -606,6 +1083,98 @@ fn attention(
     Ok((layer.wo.forward(&output)?, next))
 }
 
+/// One post-module layer's windowed attention at the fixed shape: `prior`
+/// is the `window - 1` kept keys and values (zero until real), the tables
+/// rotate the push's positions and mask the keys that are padding or out
+/// of a query's window. Returns the output and the next kept keys and
+/// values, again `window - 1`.
+fn fixed_attention(
+    layer: &Audio8DacAttention,
+    x: &Tensor,
+    prior: &AttentionState,
+    tables: &FixedTables,
+) -> Result<(Tensor, AttentionState)> {
+    let (batch, len, _) = x.dims3()?;
+    let qdim = layer.num_heads * layer.head_dim;
+    let kvdim = layer.num_kv_heads * layer.head_dim;
+    let kept = layer.window_size.saturating_sub(1);
+    let (pk, pv) = prior;
+    if pk.dim(2)? != kept || pv.dim(2)? != kept {
+        return Err(Error::InferenceError(
+            "Audio8 fixed codec keys have the wrong length".into(),
+        ));
+    }
+    let qkv = layer.wqkv.forward(x)?;
+    let q = layer
+        .rotary
+        .apply_tables(
+            &qkv.narrow(2, 0, qdim)?
+                .reshape((batch, len, layer.num_heads, layer.head_dim))?,
+            &tables.cos,
+            &tables.sin,
+        )?
+        .transpose(1, 2)?;
+    let k = layer
+        .rotary
+        .apply_tables(
+            &qkv.narrow(2, qdim, kvdim)?.reshape((
+                batch,
+                len,
+                layer.num_kv_heads,
+                layer.head_dim,
+            ))?,
+            &tables.cos,
+            &tables.sin,
+        )?
+        .transpose(1, 2)?;
+    let v = qkv
+        .narrow(2, qdim + kvdim, kvdim)?
+        .reshape((batch, len, layer.num_kv_heads, layer.head_dim))?
+        .transpose(1, 2)?;
+    let k = Tensor::cat(&[pk, &k], 2)?;
+    let v = Tensor::cat(&[pv, &v], 2)?;
+    let keys = kept + len;
+    let next = (
+        k.narrow(2, len, kept)?.copy()?,
+        v.narrow(2, len, kept)?.copy()?,
+    );
+    let k = repeat_kv(&k.transpose(1, 2)?, layer.num_heads, layer.num_kv_heads)?
+        .transpose(1, 2)?
+        .reshape((batch * layer.num_heads, keys, layer.head_dim))?;
+    let v = repeat_kv(&v.transpose(1, 2)?, layer.num_heads, layer.num_kv_heads)?
+        .transpose(1, 2)?
+        .reshape((batch * layer.num_heads, keys, layer.head_dim))?;
+    let q = q.reshape((batch * layer.num_heads, len, layer.head_dim))?;
+    let mut outputs = Vec::new();
+    for start in (0..len).step_by(ATTENTION_QUERY_BLOCK) {
+        let count = ATTENTION_QUERY_BLOCK.min(len - start);
+        // Queries start..start + count see keys start..start + count + kept.
+        let key_count = count + kept;
+        let scores = (q.narrow(1, start, count)?.contiguous()?.matmul(
+            &k.narrow(1, start, key_count)?
+                .transpose(1, 2)?
+                .contiguous()?,
+        )? * (layer.head_dim as f64).sqrt().recip())?;
+        let mask = tables
+            .mask
+            .narrow(2, start, count)?
+            .narrow(3, start, key_count)?;
+        let scores = scores
+            .reshape((batch, layer.num_heads, count, key_count))?
+            .broadcast_add(&mask)?
+            .reshape((batch * layer.num_heads, count, key_count))?;
+        outputs.push(
+            ops::softmax_last_dim(&scores)?
+                .matmul(&v.narrow(1, start, key_count)?.contiguous()?)?,
+        );
+    }
+    let output = Tensor::cat(&outputs, 1)?
+        .reshape((batch, layer.num_heads, len, layer.head_dim))?
+        .transpose(1, 2)?
+        .reshape((batch, len, qdim))?;
+    Ok((layer.wo.forward(&output)?, next))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +1187,163 @@ mod tests {
         for (i, (a, b)) in a.iter().zip(b).enumerate() {
             assert!((a - b).abs() < 1e-5, "sample {i}: {a} versus {b}");
         }
+    }
+
+    fn chunk_codes(seed: usize, frames: usize, books: usize) -> Vec<Vec<u32>> {
+        (0..books)
+            .map(|book| {
+                (0..frames)
+                    .map(|frame| ((seed * 5 + book * 3 + frame * 7) % 8) as u32)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn history_shapes(state: &Audio8DacStreamState) -> Vec<Vec<usize>> {
+        let (histories, attention) = state.row_tensors().unwrap();
+        histories
+            .iter()
+            .chain(attention.iter().flat_map(|(k, v)| [k, v]))
+            .map(|t| t.dims().to_vec())
+            .collect()
+    }
+
+    /// Pushes at the fixed shapes decode what pushes at each stream's own
+    /// lengths decode, within rounding, chunk by chunk across the attention
+    /// window and the longest history; their state is the shapes an aged
+    /// stream has, within the retained bound.
+    #[test]
+    fn fixed_shape_pushes_match_age_shaped_pushes() {
+        let device = Device::Cpu;
+        let eager = super::super::tests::tiny_decoder_fixture(&device, true);
+        let mut fixed = super::super::tests::tiny_decoder_fixture(&device, true);
+        fixed.use_fixed_stream();
+        let books = eager.config.num_codebooks();
+        let bound = eager.config.streaming_history_bound_bytes().unwrap();
+        let mut aged = Audio8DacStreamState::default();
+        let mut state = Audio8DacStreamState::default();
+        for (step, frames) in [4, 16, 16, 3, 1, 16, 7, 16].into_iter().enumerate() {
+            let codes = chunk_codes(step, frames, books);
+            let expected = eager.push_frames(&mut aged, &codes, &|| Ok(())).unwrap();
+            let actual = fixed.push_frames(&mut state, &codes, &|| Ok(())).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            let error = crate::kernels::numeric_check::max_abs_diff(&actual, &expected);
+            assert!(error < 1e-5, "step {step}: {error}");
+            assert_eq!(state.decoded_frames(), aged.decoded_frames());
+            assert_eq!(state.emitted_samples(), aged.emitted_samples());
+            assert!(state.retained_tensor_bytes() <= bound);
+        }
+        // 79 frames fill every history and the window: same shapes.
+        assert_eq!(history_shapes(&state), history_shapes(&aged));
+        // A stream begun at its own lengths continues at the fixed shapes.
+        let mut young = Audio8DacStreamState::default();
+        eager
+            .push_frames(&mut young, &chunk_codes(9, 2, books), &|| Ok(()))
+            .unwrap();
+        let mut reference = young.clone();
+        let codes = chunk_codes(10, 16, books);
+        let expected = eager
+            .push_frames(&mut reference, &codes, &|| Ok(()))
+            .unwrap();
+        let actual = fixed.push_frames(&mut young, &codes, &|| Ok(())).unwrap();
+        let error = crate::kernels::numeric_check::max_abs_diff(&actual, &expected);
+        assert!(error < 1e-5, "continued stream: {error}");
+    }
+
+    /// At the fixed shapes, rows of different ages pushed in one batch
+    /// decode bit for bit as each pushed alone, and keep the same state.
+    #[test]
+    fn fixed_rows_pushed_together_match_each_alone_bit_for_bit() {
+        let device = Device::Cpu;
+        let mut codec = super::super::tests::tiny_decoder_fixture(&device, true);
+        codec.use_fixed_stream();
+        let books = codec.config.num_codebooks();
+        let mut states = vec![Audio8DacStreamState::default(); 3];
+        for (row, state) in states.iter_mut().enumerate() {
+            for step in 0..row {
+                codec
+                    .push_frames(
+                        state,
+                        &chunk_codes(row + step, 4 + 12 * step, books),
+                        &|| Ok(()),
+                    )
+                    .unwrap();
+            }
+        }
+        for round in 0..4 {
+            let codes = (0..3)
+                .map(|row| chunk_codes(round * 3 + row, if round == 3 { 5 } else { 16 }, books))
+                .collect::<Vec<_>>();
+            let mut alone = states.clone();
+            let expected = alone
+                .iter_mut()
+                .zip(&codes)
+                .map(|(state, codes)| codec.push_frames(state, codes, &|| Ok(())).unwrap())
+                .collect::<Vec<_>>();
+            let actual = codec
+                .push_frames_batch(&mut states, &codes, &|| Ok(()))
+                .unwrap();
+            let bits = |rows: &[Vec<f32>]| {
+                rows.iter()
+                    .map(|row| row.iter().map(|s| s.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&actual), bits(&expected), "round {round}");
+            for (state, alone) in states.iter().zip(&alone) {
+                assert_eq!(state.decoded_frames(), alone.decoded_frames());
+                assert_eq!(history_shapes(state), history_shapes(alone));
+            }
+        }
+    }
+
+    /// On CUDA every push runs at the fixed shapes; the first-chunk and
+    /// full-chunk lengths replay graphs that give the eager fixed push's
+    /// bits, alone and in batches.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_graphed_codec_pushes_match_eager_fixed_pushes_bit_for_bit() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let mut graphed = super::super::tests::tiny_decoder_fixture(&device, true);
+        assert!(graphed.stream.is_some(), "CUDA pushes run at fixed shapes");
+        graphed.resolve_stream_graphs();
+        let diagnostics = graphed.stream_graphs_diagnostics().unwrap();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        // Fixed shapes, graphs never resolved: the eager reference.
+        let eager = super::super::tests::tiny_decoder_fixture(&device, true);
+        let books = graphed.config.num_codebooks();
+        let bits = |rows: &[Vec<f32>]| {
+            rows.iter()
+                .map(|row| row.iter().map(|s| s.to_bits()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        let mut states = vec![Audio8DacStreamState::default(); 3];
+        let mut reference = states.clone();
+        for (round, frames) in [4, 16, 16, 16, 5].into_iter().enumerate() {
+            let codes = (0..3)
+                .map(|row| chunk_codes(round * 3 + row, frames, books))
+                .collect::<Vec<_>>();
+            let expected = reference
+                .iter_mut()
+                .zip(&codes)
+                .map(|(state, codes)| eager.push_frames(state, codes, &|| Ok(())).unwrap())
+                .collect::<Vec<_>>();
+            let actual = graphed
+                .push_frames_batch(&mut states, &codes, &|| Ok(()))
+                .unwrap();
+            assert_eq!(bits(&actual), bits(&expected), "round {round}");
+        }
+        let diagnostics = graphed.stream_graphs_diagnostics().unwrap();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert!(
+            diagnostics["replays"].as_u64().unwrap_or(0) > 0,
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics["eager_pushes"].as_u64().unwrap_or(0) > 0,
+            "{diagnostics}"
+        );
     }
 
     #[test]

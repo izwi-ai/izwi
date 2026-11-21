@@ -110,9 +110,26 @@ impl Audio8RotaryCache {
                 self.max_seq_len
             )));
         }
-        let cos = self.cos.narrow(0, start_pos, seq_len)?;
-        let sin = self.sin.narrow(0, start_pos, seq_len)?;
+        let (cos, sin) = self.range_tables(start_pos, seq_len)?;
         self.apply_tables(x, &cos, &sin)
+    }
+
+    /// The tables of the `len` positions from `start`: `[len, head_dim / 2]`
+    /// cos and sin (views of the cache), for [`Self::apply_tables`].
+    pub(crate) fn range_tables(&self, start: usize, len: usize) -> Result<(Tensor, Tensor)> {
+        if start
+            .checked_add(len)
+            .is_none_or(|end| end > self.max_seq_len)
+        {
+            return Err(Error::InvalidInput(format!(
+                "Audio8 rotary positions {start}..+{len} exceed cache capacity {}",
+                self.max_seq_len
+            )));
+        }
+        Ok((
+            self.cos.narrow(0, start, len)?,
+            self.sin.narrow(0, start, len)?,
+        ))
     }
 
     /// The tables of packed tokens, each at its own absolute position:

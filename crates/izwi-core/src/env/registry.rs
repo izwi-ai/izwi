@@ -140,6 +140,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "JSON file of real codebook frames for the ignored Audio8 CUDA codec stream test.",
     ),
     CoreEnvVar::new(
+        "IZWI_AUDIO8_CODEC_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Audio8's streaming codec decodes each row's push alone at one shape per incoming frame count: every convolution history at its full length and the post-module's kept keys and values at the window less one, zero until real, under a mask. The first-chunk (4 frames) and full-chunk (16 frames) pushes run as CUDA graphs, one per length, which a load-time self-check captures and compares with the eager push bit for bit; shorter tails run their fixed shape eagerly. A mismatch, a CUDA error or a graph pool past its budget keeps pushes eager at the same shapes and bits. Loads price 288 MiB for the graphs. Any false value turns the graphs off (pushes stay fixed-shape); `codec_graphs` in the model diagnostics reports why they are off, captures, replays and graphed and eager pushes.",
+    ),
+    CoreEnvVar::new(
         "IZWI_AUDIO8_CODEC_PATH",
         Path,
         "unset (test fails)",
@@ -684,6 +691,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "true",
         Once,
         "Draws a Fish S2 step's semantic tokens (CUDA and Metal) and fast codes (each depth) for every row from one device pass and one readback, uploading each frame's sampling noise once for all rows; false samples each row on its own.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_FISH_S2_CODEC_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Fish S2's streaming codec decodes each row's push alone at one shape per incoming frame count: every convolution history at its full length and the post-module's kept keys and values at the window less one, zero until real, under a mask. The first-chunk (4 frames) and full-chunk (16 frames) pushes run as CUDA graphs, one per length, which a load-time self-check captures and compares with the eager push bit for bit; shorter tails run their fixed shape eagerly. A mismatch, a CUDA error or a graph pool past its budget keeps pushes eager at the same shapes and bits. Loads price 304 MiB for the graphs. Any false value turns the graphs off (pushes stay fixed-shape); `codec_graphs` in the model diagnostics reports why they are off, captures, replays and graphed and eager pushes.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_S2_DTYPE",

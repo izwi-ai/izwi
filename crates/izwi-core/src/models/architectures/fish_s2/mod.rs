@@ -47,11 +47,14 @@ pub use dac::{FishS2DacConfig, FishS2DacDecoder};
 pub(crate) use fast::fish_s2_fast_graph_device_bytes;
 
 /// Device bytes a load on `backend` prices for Fish S2's CUDA graphs: the
-/// fast AR's frame graphs (which the load's self-check allocates) and the
-/// slow transformer's decode-step graphs (which the first decode steps
-/// allocate). Zero off CUDA or with the graphs switched off.
+/// fast AR's frame graphs and the streaming codec's push graphs (which the
+/// load's self-checks allocate) and the slow transformer's decode-step
+/// graphs (which the first decode steps allocate). Zero off CUDA or with
+/// the graphs switched off.
 pub(crate) fn fish_s2_graph_device_bytes(backend: crate::backends::BackendKind) -> u64 {
-    fast::fish_s2_fast_graph_device_bytes(backend) + slow::fish_s2_slow_graph_device_bytes(backend)
+    fast::fish_s2_fast_graph_device_bytes(backend)
+        + slow::fish_s2_slow_graph_device_bytes(backend)
+        + dac::fish_s2_codec_graph_device_bytes(backend)
 }
 pub use fast::{FishS2FastConfig, FishS2FastDecoder, FishS2GeneratedFrame, FishS2Sampler};
 #[cfg(test)]
@@ -154,6 +157,10 @@ pub struct FishS2TtsDiagnostics {
     /// their widths, captures and replays; `None` without the native
     /// runtime.
     pub slow_graphs: Option<serde_json::Value>,
+    /// The streaming codec's fixed-shape CUDA pushes and their graphs: why
+    /// the graphs are off, or their captures and replays and the pushes
+    /// they took; `None` off CUDA or without the native runtime.
+    pub codec_graphs: Option<serde_json::Value>,
 }
 
 /// Model-authored terminal reason. Exhausting a budget is incomplete speech.
@@ -329,6 +336,10 @@ impl FishS2TtsModel {
                 .runtime
                 .as_ref()
                 .map(|runtime| runtime.slow.graphs_diagnostics()),
+            codec_graphs: self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.dac.stream_graphs_diagnostics()),
         }
     }
 
@@ -521,7 +532,9 @@ impl FishS2NativeRuntime {
         // A fast frame's input is the slow transformer's hidden state.
         fast.resolve_graphs(precision.loaded);
         let codec_weights = codec.load_weights(&device, DType::F32)?;
-        let dac = FishS2DacDecoder::load(FishS2DacConfig::current(), codec_weights.var_builder())?;
+        let mut dac =
+            FishS2DacDecoder::load(FishS2DacConfig::current(), codec_weights.var_builder())?;
+        dac.resolve_stream_graphs();
         let semantic_allowed_mask = slow.semantic_allowed_mask(eos)?;
 
         Ok(Self {

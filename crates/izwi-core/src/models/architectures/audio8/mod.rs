@@ -61,11 +61,14 @@ pub use contracts::{
 };
 pub use dac::{Audio8DacConfig, Audio8DacDecoder};
 /// Device bytes a load on `backend` prices for Audio8's CUDA graphs: the
-/// fast AR's frame graphs (which the load's self-check allocates) and the
-/// slow transformer's decode-step graphs (which the first decode steps
-/// allocate). Zero off CUDA or with the graphs switched off.
+/// fast AR's frame graphs and the streaming codec's push graphs (which the
+/// load's self-checks allocate) and the slow transformer's decode-step
+/// graphs (which the first decode steps allocate). Zero off CUDA or with
+/// the graphs switched off.
 pub(crate) fn audio8_graph_device_bytes(backend: crate::backends::BackendKind) -> u64 {
-    fast::audio8_fast_graph_device_bytes(backend) + slow::audio8_slow_graph_device_bytes(backend)
+    fast::audio8_fast_graph_device_bytes(backend)
+        + slow::audio8_slow_graph_device_bytes(backend)
+        + dac::audio8_codec_graph_device_bytes(backend)
 }
 pub use fast::{Audio8FastConfig, Audio8FastDecoder, Audio8GeneratedFrame, Audio8Sampler};
 pub(crate) use physical::{Audio8PhysicalStateSpec, AUDIO8_SLOW_STATE_GROUP};
@@ -172,6 +175,10 @@ pub struct Audio8TtsDiagnostics {
     /// their widths, captures and replays; `None` without the native
     /// runtime.
     pub slow_graphs: Option<serde_json::Value>,
+    /// The streaming codec's fixed-shape CUDA pushes and their graphs: why
+    /// the graphs are off, or their captures and replays and the pushes
+    /// they took; `None` off CUDA or without the native runtime.
+    pub codec_graphs: Option<serde_json::Value>,
 }
 
 /// Model-authored terminal reason. Exhausting a budget is incomplete speech.
@@ -341,6 +348,10 @@ impl Audio8TtsModel {
                 .runtime
                 .as_ref()
                 .map(|runtime| runtime.slow.graphs_diagnostics()),
+            codec_graphs: self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.dac.stream_graphs_diagnostics()),
         }
     }
 
@@ -531,7 +542,9 @@ impl Audio8NativeRuntime {
         // A fast frame's input is the slow transformer's hidden state.
         fast.resolve_graphs(precision.loaded);
         let codec_weights = codec.load_weights(&device, DType::F32)?;
-        let dac = Audio8DacDecoder::load(Audio8DacConfig::current(), codec_weights.var_builder())?;
+        let mut dac =
+            Audio8DacDecoder::load(Audio8DacConfig::current(), codec_weights.var_builder())?;
+        dac.resolve_stream_graphs();
         let semantic_allowed_mask = slow.semantic_allowed_mask(eos)?;
 
         Ok(Self {
