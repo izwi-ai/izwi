@@ -591,7 +591,7 @@ mod cuda_impl {
         let launch = config(
             (
                 u32_grid(experts, "experts")?,
-                u32_grid(hidden.div_ceil(8), "hidden")?,
+                u32_grid(hidden.div_ceil(16), "hidden")?,
             ),
             256,
         );
@@ -777,7 +777,7 @@ mod cuda_impl {
         let launch = config(
             (
                 u32_grid(experts, "experts")?,
-                u32_grid(hidden.div_ceil(8), "hidden")?,
+                u32_grid(hidden.div_ceil(16), "hidden")?,
             ),
             256,
         );

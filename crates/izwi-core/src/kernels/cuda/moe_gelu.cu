@@ -52,6 +52,19 @@ __device__ __forceinline__ float mgl_row_dot(const __nv_bfloat16* __restrict__ r
   return acc;
 }
 
+// mgl_row_dot of two rows over the same x, one load of x for both: each
+// row's sum is accumulated in exactly mgl_row_dot's order.
+__device__ __forceinline__ float2 mgl_row_dot2(const __nv_bfloat16* __restrict__ a,
+                                               const __nv_bfloat16* __restrict__ b,
+                                               const float* __restrict__ x, int len, int lane) {
+  float acc_a = 0.0f, acc_b = 0.0f;
+  for (int k0 = lane * 8; k0 < len; k0 += 256) {
+    acc_a += mgl_dot8(*reinterpret_cast<const uint4*>(a + k0), x + k0);
+    acc_b += mgl_dot8(*reinterpret_cast<const uint4*>(b + k0), x + k0);
+  }
+  return make_float2(acc_a, acc_b);
+}
+
 __device__ __forceinline__ float mgl_gelu_tanh(float v) {
   const float inner = 0.7978845608028654f * (v + 0.044715f * v * v * v);
   return 0.5f * v * (1.0f + tanhf(inner));
@@ -193,14 +206,16 @@ extern "C" __global__ void izwi_mgl_up_grouped(
   for (int i = begin; i < end; ++i) {
     const int pair = sorted_pairs[i];
     const float* xt = x + (int64_t)(pair / slots) * hidden;
-    const float g = mgl_warp_sum(mgl_row_dot(gate, xt, hidden, lane));
-    const float u = mgl_warp_sum(mgl_row_dot(up, xt, hidden, lane));
+    const float2 gu = mgl_row_dot2(gate, up, xt, hidden, lane);
+    const float g = mgl_warp_sum(gu.x);
+    const float u = mgl_warp_sum(gu.y);
     if (lane == 0) act[(int64_t)pair * inter + n] = mgl_gelu_tanh(g) * u;
   }
 }
 
 // partial[pair, h] = down[e, h] . act[pair] for every pair routed to e.
-// Grid (experts, hidden / 8), 256 threads.
+// Each warp takes rows h and h + 8 of its block's 16, one load of act for
+// both. Grid (experts, hidden / 16), 256 threads.
 extern "C" __global__ void izwi_mgl_down_grouped(
     const float* __restrict__ act, const int* __restrict__ offsets,
     const int* __restrict__ sorted_pairs,
@@ -210,14 +225,19 @@ extern "C" __global__ void izwi_mgl_down_grouped(
   const int e = blockIdx.x;
   const int begin = offsets[e];
   const int end = offsets[e + 1];
-  const int h = blockIdx.y * 8 + (threadIdx.x >> 5);
+  const int h = blockIdx.y * 16 + (threadIdx.x >> 5);
   if (begin == end || h >= hidden) return;
+  const bool second = h + 8 < hidden;
   const __nv_bfloat16* row = down + ((int64_t)e * hidden + h) * inter;
+  const __nv_bfloat16* row2 = second ? row + 8 * (int64_t)inter : row;
   for (int i = begin; i < end; ++i) {
     const int pair = sorted_pairs[i];
-    const float p =
-        mgl_warp_sum(mgl_row_dot(row, act + (int64_t)pair * inter, inter, lane));
-    if (lane == 0) partial[(int64_t)pair * hidden + h] = p;
+    const float2 p = mgl_row_dot2(row, row2, act + (int64_t)pair * inter, inter, lane);
+    const float p0 = mgl_warp_sum(p.x), p1 = mgl_warp_sum(p.y);
+    if (lane == 0) {
+      partial[(int64_t)pair * hidden + h] = p0;
+      if (second) partial[(int64_t)pair * hidden + h + 8] = p1;
+    }
   }
 }
 
@@ -290,6 +310,30 @@ __device__ __forceinline__ float mgl_row_dot_fp8(const unsigned char* __restrict
   return acc;
 }
 
+// mgl_row_dot_fp8 of two rows over the same x, one load of x for both, each
+// row's sum in mgl_row_dot_fp8's order.
+__device__ __forceinline__ float2 mgl_row_dot2_fp8(const unsigned char* __restrict__ a,
+                                                   const unsigned char* __restrict__ b,
+                                                   const float* __restrict__ x, int len,
+                                                   int lane) {
+  float acc_a = 0.0f, acc_b = 0.0f;
+  for (int k0 = lane * 16; k0 < len; k0 += 512) {
+    const uint4 qa = *reinterpret_cast<const uint4*>(a + k0);
+    const uint4 qb = *reinterpret_cast<const uint4*>(b + k0);
+    const float4* xv = reinterpret_cast<const float4*>(x + k0);
+    const float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+    acc_a = mgl_dot4_fp8(qa.x, x0, acc_a);
+    acc_a = mgl_dot4_fp8(qa.y, x1, acc_a);
+    acc_a = mgl_dot4_fp8(qa.z, x2, acc_a);
+    acc_a = mgl_dot4_fp8(qa.w, x3, acc_a);
+    acc_b = mgl_dot4_fp8(qb.x, x0, acc_b);
+    acc_b = mgl_dot4_fp8(qb.y, x1, acc_b);
+    acc_b = mgl_dot4_fp8(qb.z, x2, acc_b);
+    acc_b = mgl_dot4_fp8(qb.w, x3, acc_b);
+  }
+  return make_float2(acc_a, acc_b);
+}
+
 // izwi_mgl_up_grouped with E4M3 gate_up [experts, 2 * inter, hidden] and
 // scales [experts, 2 * inter].
 extern "C" __global__ void izwi_mgl_up_grouped_fp8(
@@ -312,8 +356,9 @@ extern "C" __global__ void izwi_mgl_up_grouped_fp8(
   for (int i = begin; i < end; ++i) {
     const int pair = sorted_pairs[i];
     const float* xt = x + (int64_t)(pair / slots) * hidden;
-    const float g = mgl_warp_sum(mgl_row_dot_fp8(gate, xt, hidden, lane)) * gate_scale;
-    const float u = mgl_warp_sum(mgl_row_dot_fp8(up, xt, hidden, lane)) * up_scale;
+    const float2 gu = mgl_row_dot2_fp8(gate, up, xt, hidden, lane);
+    const float g = mgl_warp_sum(gu.x) * gate_scale;
+    const float u = mgl_warp_sum(gu.y) * up_scale;
     if (lane == 0) act[(int64_t)pair * inter + n] = mgl_gelu_tanh(g) * u;
   }
 }
@@ -328,16 +373,21 @@ extern "C" __global__ void izwi_mgl_down_grouped_fp8(
   const int e = blockIdx.x;
   const int begin = offsets[e];
   const int end = offsets[e + 1];
-  const int h = blockIdx.y * 8 + (threadIdx.x >> 5);
+  const int h = blockIdx.y * 16 + (threadIdx.x >> 5);
   if (begin == end || h >= hidden) return;
+  const bool second = h + 8 < hidden;
   const int64_t r = (int64_t)e * hidden + h;
-  const unsigned char* row = down + r * inter;
-  const float s = scale[r] * MGL_E4M3_UNSCALE;
+  const int64_t r2 = second ? r + 8 : r;
+  const float s = scale[r] * MGL_E4M3_UNSCALE, s2 = scale[r2] * MGL_E4M3_UNSCALE;
   for (int i = begin; i < end; ++i) {
     const int pair = sorted_pairs[i];
-    const float p =
-        mgl_warp_sum(mgl_row_dot_fp8(row, act + (int64_t)pair * inter, inter, lane)) * s;
-    if (lane == 0) partial[(int64_t)pair * hidden + h] = p;
+    const float2 p = mgl_row_dot2_fp8(down + r * inter, down + r2 * inter,
+                                      act + (int64_t)pair * inter, inter, lane);
+    const float p0 = mgl_warp_sum(p.x) * s, p1 = mgl_warp_sum(p.y) * s2;
+    if (lane == 0) {
+      partial[(int64_t)pair * hidden + h] = p0;
+      if (second) partial[(int64_t)pair * hidden + h + 8] = p1;
+    }
   }
 }
 
