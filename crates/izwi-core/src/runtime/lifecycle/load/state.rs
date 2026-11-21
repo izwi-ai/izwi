@@ -2004,7 +2004,7 @@ impl ModelLifecycleController {
             };
             let capacity = crate::runtime::audio8_capacity::Audio8ServingCapacity::resolve(
                 model.config(), &row_limits, headroom, native_batching,
-                model.state_element_bytes(),
+                model.state_element_bytes(), model.codec_call_slots(),
             )?;
             tracing::info!(?capacity, ?backend, "Sealing Audio8 serving capacity; device throughput qualification is separate");
             bundle_draft.seal_fish_capacity(capacity.clone())?;

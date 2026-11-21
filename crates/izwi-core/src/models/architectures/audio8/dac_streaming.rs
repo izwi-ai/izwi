@@ -1643,4 +1643,69 @@ mod tests {
         };
         check_rows_pushed_together_match_each_alone(&device);
     }
+
+    /// A request's chunks end at the same absolute frames however its
+    /// quanta fall (frames arriving one at a time or in bursts, decoded
+    /// alone or beside another stream), so its PCM is the same bits.
+    #[test]
+    fn chunk_boundaries_do_not_depend_on_scheduling() {
+        use crate::models::architectures::audio8::{audio8_codec_chunks, audio8_codec_quantum_end};
+        let device = Device::Cpu;
+        let codec = fixed_slots(&device, 4, true);
+        let total = 75;
+        let codes = stream_codes(3, total);
+        let peer_codes = stream_codes(4, 200);
+        // `arrivals`: frames generated before each quantum is considered.
+        let decode = |arrivals: &[usize], with_peer: bool| {
+            let mut state = Audio8DacStreamState::default();
+            let mut peer = Audio8DacStreamState::default();
+            let mut peer_cursor = 0;
+            let mut pcm = Vec::new();
+            let mut pushes = Vec::new();
+            for &generated in arrivals {
+                let finished = generated == total;
+                // Quanta until no whole chunk (or tail) is due.
+                loop {
+                    let decoded = state.decoded_frames();
+                    let end = audio8_codec_quantum_end(decoded, generated, finished, 64);
+                    if end == decoded {
+                        break;
+                    }
+                    for (from, to) in audio8_codec_chunks(decoded, end) {
+                        pushes.push((from, to));
+                        let chunk = slice(&codes, from, to);
+                        if with_peer {
+                            let peer_chunk = slice(&peer_codes, peer_cursor, peer_cursor + 16);
+                            peer_cursor += 16;
+                            let mut states = [state.clone(), peer.clone()];
+                            let mut out = codec
+                                .push_frames_batch(&mut states, &[chunk, peer_chunk], &|| Ok(()))
+                                .unwrap();
+                            [state, peer] = states;
+                            pcm.extend(out.swap_remove(0));
+                        } else {
+                            pcm.extend(codec.push_frames(&mut state, &chunk, &|| Ok(())).unwrap());
+                        }
+                    }
+                }
+            }
+            assert_eq!(state.decoded_frames(), total);
+            (pushes, pcm)
+        };
+        let steady = (1..=total).collect::<Vec<_>>();
+        let (pushes, pcm) = decode(&steady, false);
+        assert_eq!(
+            pushes,
+            [(0, 4), (4, 20), (20, 36), (36, 52), (52, 68), (68, 75)]
+        );
+        for (arrivals, with_peer) in [
+            (vec![3, 30, 31, 74, 75], false),
+            (vec![9, 70, 75], true),
+            (vec![75], true),
+        ] {
+            let (other_pushes, other_pcm) = decode(&arrivals, with_peer);
+            assert_eq!(other_pushes, pushes, "{arrivals:?}");
+            assert_eq!(bits(&[other_pcm]), bits(&[pcm.clone()]), "{arrivals:?}");
+        }
+    }
 }

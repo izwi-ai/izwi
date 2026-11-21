@@ -87,8 +87,65 @@ pub(crate) const AUDIO8_AUDIO_CHUNK_FRAMES: usize = 16;
 /// budget changed the prompt's bits under load. Most prompts are one span.
 pub(crate) const AUDIO8_CUDA_PREFILL_SPAN: usize = 256;
 pub(crate) const AUDIO8_FIRST_AUDIO_FRAMES: usize = 4;
+/// The most frames one request decodes in one audio quantum: whole chunks
+/// (or a finished request's tail), run as one codec push per chunk.
+pub(crate) const AUDIO8_CODEC_QUANTUM_FRAMES: usize = 64;
+/// Pending frames at which a request whose audio is not streamed asks for
+/// the codec (a streamed one asks at every chunk).
+pub(crate) const AUDIO8_BUFFERED_AUDIO_FRAMES: usize = 48;
 pub(crate) const AUDIO8_TTS_AUDIO_DECODE_STAGE: &str = "tts.audio_decode.audio8";
 pub(crate) const AUDIO8_TTS_FINALIZE_STAGE: &str = "tts.codec.audio8.scalar";
+
+/// The first chunk boundary after absolute frame `frame`. A request's audio
+/// is decoded in chunks that end at frames 4, 20, 36, ...
+/// ([`AUDIO8_FIRST_AUDIO_FRAMES`] then every [`AUDIO8_AUDIO_CHUNK_FRAMES`])
+/// and at its last frame, whenever and beside whichever requests they run,
+/// so a codec push's shape, and so its PCM, belongs to the request.
+pub(crate) fn audio8_chunk_boundary_after(frame: usize) -> usize {
+    match frame.checked_sub(AUDIO8_FIRST_AUDIO_FRAMES) {
+        None => AUDIO8_FIRST_AUDIO_FRAMES,
+        Some(past) => {
+            AUDIO8_FIRST_AUDIO_FRAMES
+                + (past / AUDIO8_AUDIO_CHUNK_FRAMES + 1) * AUDIO8_AUDIO_CHUNK_FRAMES
+        }
+    }
+}
+
+/// Where an audio quantum of at most `max_frames` stops for a request that
+/// has decoded `decoded` of its `generated` frames: the last chunk boundary
+/// within reach, or a finished request's last frame when its tail fits.
+/// `decoded` when no whole chunk is pending.
+pub(crate) fn audio8_codec_quantum_end(
+    decoded: usize,
+    generated: usize,
+    finished: bool,
+    max_frames: usize,
+) -> usize {
+    let limit = generated.min(decoded.saturating_add(max_frames));
+    if finished && generated == limit {
+        return generated.max(decoded);
+    }
+    let mut end = decoded;
+    loop {
+        let next = audio8_chunk_boundary_after(end);
+        if next > limit {
+            return end;
+        }
+        end = next;
+    }
+}
+
+/// The codec pushes of frames `start..end`, split at chunk boundaries.
+pub(crate) fn audio8_codec_chunks(start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut chunks = Vec::new();
+    let mut from = start;
+    while from < end {
+        let to = audio8_chunk_boundary_after(from).min(end);
+        chunks.push((from, to));
+        from = to;
+    }
+    chunks
+}
 
 pub struct Audio8TtsModel {
     model_identity: u64,
@@ -347,6 +404,15 @@ impl Audio8TtsModel {
         self.runtime
             .as_ref()
             .map_or(4, |runtime| runtime.dtype.size_in_bytes())
+    }
+
+    /// Rows every streaming codec call runs (CUDA's fixed slots), or `None`
+    /// where calls batch rows of one stream age as they come.
+    pub(crate) fn codec_call_slots(&self) -> Option<usize> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.dac.codec_calls())
+            .map(|calls| calls.slots)
     }
 
     pub(crate) fn physical_state_spec(

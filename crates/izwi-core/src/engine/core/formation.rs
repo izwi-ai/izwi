@@ -432,7 +432,21 @@ impl EngineCore {
                 _ => max_frames,
             };
             let bytes = if matches!(work, WorkUnit::SequenceAudioDecode { .. }) {
-                streaming_decode_workspace_bytes(frames)?
+                if request.model_variant.is_some_and(|variant| {
+                    variant.family() == crate::catalog::ModelFamily::Audio8Tts
+                }) {
+                    // A row's share of its quantum's codec calls plus its
+                    // own history and PCM, as sealed at load
+                    // (`streaming_quantum_workspace_per_row`), and never
+                    // less than the row's own history and PCM.
+                    stage.workspace_per_row_bytes.max(
+                        crate::models::architectures::audio8::codec::streaming_row_workspace_bytes(
+                            frames,
+                        )?,
+                    )
+                } else {
+                    streaming_decode_workspace_bytes(frames)?
+                }
             } else {
                 // Terminal flush only moves retained PCM; neural work is complete.
                 0
