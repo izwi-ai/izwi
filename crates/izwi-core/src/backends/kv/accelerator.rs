@@ -1361,11 +1361,33 @@ impl CandleAcceleratorKvArena {
         }
 
         let batch_size = batch.sequences.len();
-        if let Some(index) = cache
-            .entries
-            .iter()
-            .position(|cached| cached.shape_compatible(batch_size, max_blocks))
-        {
+        // Refresh in place only an entry this batch continues: the same
+        // sequences, each from the same first block (the same view one step
+        // later). A model whose layers attend different views of one batch
+        // (SOV-Transcribe's sliding and full layers) sends batches of one
+        // shape that never continue each other; rewriting one entry between
+        // them refreshed it at every switch of layer kind. Such a batch gets
+        // its own entry while the cache has room.
+        let continues = |cached: &CachedDecodeDeviceMetadata| {
+            cached.shape_compatible(batch_size, max_blocks)
+                && cached
+                    .key
+                    .sequences
+                    .iter()
+                    .zip(&batch.sequences)
+                    .all(|(old, new)| same_first_page(old, new))
+        };
+        let full = cache.entries.len() >= ATTENTION_PLAN_CACHE_ENTRIES_PER_KIND;
+        let reusable = cache.entries.iter().position(continues).or_else(|| {
+            full.then(|| {
+                cache
+                    .entries
+                    .iter()
+                    .position(|cached| cached.shape_compatible(batch_size, max_blocks))
+            })
+            .flatten()
+        });
+        if let Some(index) = reusable {
             let mut cached = cache.entries.get_mut(index).ok_or_else(|| {
                 Error::InferenceError("accelerator decode plan cache lost an entry".into())
             })?;
@@ -3185,6 +3207,20 @@ fn copy_resident_pages(destination: &Tensor, source: &Tensor) -> Result<()> {
     destination.slice_set(source, 0, 0).map_err(Error::from)
 }
 
+/// Whether two views of a sequence start at the same page; a reused page
+/// (a new slot generation) still counts as the same.
+fn same_first_page(
+    old: &crate::kv::KvSequenceBlockTable,
+    new: &crate::kv::KvSequenceBlockTable,
+) -> bool {
+    match (old.blocks.first(), new.blocks.first()) {
+        (Some(old), Some(new)) => {
+            (old.arena, old.group, old.index) == (new.arena, new.group, new.index)
+        }
+        (old, new) => old.is_none() && new.is_none(),
+    }
+}
+
 fn update_u32_tensor(
     destination: &Tensor,
     previous: &[u32],
@@ -3971,6 +4007,89 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
+    fn alternating_views_of_one_shape_keep_their_own_plans() -> Result<()> {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "alternating_views_of_one_shape_keep_their_own_plans",
+        ) else {
+            return Ok(());
+        };
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(8),
+            backend: BackendKind::Metal,
+            device_ordinal: Some(0),
+            generation: 1,
+        };
+        let group = KvGroupId::new(0);
+        let arena = CandleAcceleratorKvArena::new_mutation_only(
+            KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 2,
+                capacity_pages: 8,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![super::super::KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 0,
+                        physical_layer: 0,
+                    },
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            },
+            device.clone(),
+        )?;
+        let block = |index| CacheBlockRef {
+            arena: arena_id,
+            group,
+            index,
+            slot_generation: 1,
+        };
+        // Each step, the full view of a row and its sliding-window view (a
+        // later first block), one shape, alternating as SOV-Transcribe's
+        // full and sliding layers do.
+        let views = |context: u32| {
+            let full = KvDecodeBatchMetadata {
+                sequences: vec![crate::kv::KvSequenceBlockTable {
+                    blocks: vec![block(0), block(1), block(2)],
+                    first_page_offset: 0,
+                    context_len: context,
+                }],
+            };
+            let window = KvDecodeBatchMetadata {
+                sequences: vec![crate::kv::KvSequenceBlockTable {
+                    blocks: vec![block(1), block(2), block(3)],
+                    first_page_offset: 1,
+                    context_len: context - 1,
+                }],
+            };
+            (full, window)
+        };
+        for context in [5, 6] {
+            let (full, window) = views(context);
+            for _layer in 0..3 {
+                for batch in [&full, &window] {
+                    let (table, cumulative, offsets, _, _) = arena.lower_decode_tables(batch)?;
+                    let native = packed_decode_metadata(&cumulative, &offsets, &table);
+                    let plan = arena.cached_decode_plan(batch)?;
+                    assert_eq!(plan.cumulative_contexts.to_vec1::<u32>()?, cumulative);
+                    assert_eq!(plan.native_metadata.to_vec1::<u32>()?, native);
+                }
+            }
+        }
+        let stats = arena.attention_plan_cache_stats();
+        // Two entries uploaded at the first step; the second step refreshes
+        // each once. Every other call is an exact hit: no refresh at a
+        // switch of view (one entry rewritten between the views uploaded
+        // at every switch).
+        assert_eq!(stats.misses, 2, "{stats:?}");
+        assert_eq!(stats.device_uploads, 4, "{stats:?}");
+        assert_eq!(stats.hits, 10, "{stats:?}");
+        Ok(())
+    }
+
+    #[test]
     fn failed_in_place_plan_update_never_serves_mixed_device_tables() -> Result<()> {
         let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
             "failed_in_place_plan_update_never_serves_mixed_device_tables",
@@ -4021,12 +4140,13 @@ mod tests {
                 sequence(vec![block(2)], 2),
             ],
         };
-        // Same shape (two rows, two blocks max) but different contexts and
-        // tables, so the cached entry is refreshed in place.
+        // Same shape (two rows, two blocks max) and the same first blocks,
+        // but different contexts and tables, so the cached entry is
+        // refreshed in place.
         let next = KvDecodeBatchMetadata {
             sequences: vec![
-                sequence(vec![block(0), block(1)], 4),
-                sequence(vec![block(3)], 2),
+                sequence(vec![block(0), block(3)], 4),
+                sequence(vec![block(2)], 2),
             ],
         };
         let expected = |batch: &KvDecodeBatchMetadata| -> Result<(Vec<u32>, Vec<u32>, Vec<u32>)> {
