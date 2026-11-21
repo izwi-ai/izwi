@@ -1,7 +1,9 @@
 //! Slow semantic transformer for Fish S2 DualAR generation.
 
 use candle_core::{DType, Tensor};
-use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{ops, Embedding, Linear, Module, VarBuilder};
+
+use crate::kernels::residual_norm::DeviceRmsNorm;
 
 use crate::error::{Error, Result};
 use crate::kernels::cuda::stretch_graphs::StretchGraphs;
@@ -40,7 +42,7 @@ pub struct FishS2SlowTransformer {
     embeddings: Embedding,
     codebook_embeddings: Embedding,
     layers: Vec<FishS2SlowLayer>,
-    norm: RmsNorm,
+    norm: DeviceRmsNorm,
     lm_head: Linear,
     semantic_head: Option<(Linear, u32)>,
     /// On CUDA, the decode step's stretches as graphs (see
@@ -76,17 +78,17 @@ pub(crate) fn fish_s2_slow_graph_device_bytes(backend: crate::backends::BackendK
 }
 
 struct FishS2SlowLayer {
-    input_layernorm: RmsNorm,
+    input_layernorm: DeviceRmsNorm,
     self_attn: FishS2PackedAttention,
-    post_attention_layernorm: RmsNorm,
+    post_attention_layernorm: DeviceRmsNorm,
     mlp: FishS2Mlp,
 }
 
 struct FishS2PackedAttention {
     qkv_proj: Linear,
     o_proj: Linear,
-    q_norm: Option<RmsNorm>,
-    k_norm: Option<RmsNorm>,
+    q_norm: Option<DeviceRmsNorm>,
+    k_norm: Option<DeviceRmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -781,7 +783,7 @@ impl FishS2PackedAttention {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
             o_proj: candle_nn::linear_no_bias(cfg.q_size(), cfg.hidden_size, vb.pp("o_proj"))?,
             q_norm: if vb.contains_tensor("q_norm.weight") {
-                Some(candle_nn::rms_norm(
+                Some(DeviceRmsNorm::load(
                     cfg.head_dim,
                     cfg.rms_norm_eps,
                     vb.pp("q_norm"),
@@ -790,7 +792,7 @@ impl FishS2PackedAttention {
                 None
             },
             k_norm: if vb.contains_tensor("k_norm.weight") {
-                Some(candle_nn::rms_norm(
+                Some(DeviceRmsNorm::load(
                     cfg.head_dim,
                     cfg.rms_norm_eps,
                     vb.pp("k_norm"),
@@ -964,13 +966,18 @@ impl FishS2Mlp {
     }
 }
 
-fn load_rms_norm_alias(dim: usize, eps: f64, vb: &VarBuilder, aliases: &[&str]) -> Result<RmsNorm> {
+fn load_rms_norm_alias(
+    dim: usize,
+    eps: f64,
+    vb: &VarBuilder,
+    aliases: &[&str],
+) -> Result<DeviceRmsNorm> {
     for alias in aliases {
         if vb.contains_tensor(&format!("{alias}.weight")) {
-            return candle_nn::rms_norm(dim, eps, vb.pp(*alias)).map_err(Error::from);
+            return DeviceRmsNorm::load(dim, eps, vb.pp(*alias)).map_err(Error::from);
         }
     }
-    candle_nn::rms_norm(dim, eps, vb.pp(aliases[0])).map_err(Error::from)
+    DeviceRmsNorm::load(dim, eps, vb.pp(aliases[0])).map_err(Error::from)
 }
 
 #[cfg(test)]

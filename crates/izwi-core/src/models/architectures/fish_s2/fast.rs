@@ -3,7 +3,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{ops, Embedding, Linear, Module, VarBuilder};
+
+use crate::kernels::residual_norm::DeviceRmsNorm;
 
 pub use super::sampling::FishS2Sampler;
 use super::sampling::{
@@ -125,7 +127,7 @@ pub struct FishS2FastDecoder {
     project_in: FishS2FastProjectIn,
     embeddings: Embedding,
     layers: Vec<FishS2FastLayer>,
-    norm: RmsNorm,
+    norm: DeviceRmsNorm,
     output: Linear,
     graphs: FastGraphs,
 }
@@ -136,17 +138,17 @@ enum FishS2FastProjectIn {
 }
 
 struct FishS2FastLayer {
-    input_layernorm: RmsNorm,
+    input_layernorm: DeviceRmsNorm,
     self_attn: FishS2FastAttention,
-    post_attention_layernorm: RmsNorm,
+    post_attention_layernorm: DeviceRmsNorm,
     mlp: FishS2FastMlp,
 }
 
 struct FishS2FastAttention {
     qkv_proj: Linear,
     o_proj: Linear,
-    q_norm: Option<RmsNorm>,
-    k_norm: Option<RmsNorm>,
+    q_norm: Option<DeviceRmsNorm>,
+    k_norm: Option<DeviceRmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -1064,7 +1066,7 @@ impl FishS2FastAttention {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
             o_proj: candle_nn::linear_no_bias(cfg.q_size(), cfg.hidden_size, vb.pp("o_proj"))?,
             q_norm: if vb.contains_tensor("q_norm.weight") {
-                Some(candle_nn::rms_norm(
+                Some(DeviceRmsNorm::load(
                     cfg.head_dim,
                     cfg.rms_norm_eps,
                     vb.pp("q_norm"),
@@ -1073,7 +1075,7 @@ impl FishS2FastAttention {
                 None
             },
             k_norm: if vb.contains_tensor("k_norm.weight") {
-                Some(candle_nn::rms_norm(
+                Some(DeviceRmsNorm::load(
                     cfg.head_dim,
                     cfg.rms_norm_eps,
                     vb.pp("k_norm"),
@@ -1379,13 +1381,18 @@ fn semantic_code_from_token_id_from_fast_config(
     Ok(token_id - cfg.semantic_start_token_id)
 }
 
-fn load_rms_norm_alias(dim: usize, eps: f64, vb: &VarBuilder, aliases: &[&str]) -> Result<RmsNorm> {
+fn load_rms_norm_alias(
+    dim: usize,
+    eps: f64,
+    vb: &VarBuilder,
+    aliases: &[&str],
+) -> Result<DeviceRmsNorm> {
     for alias in aliases {
         if vb.contains_tensor(&format!("{alias}.weight")) {
-            return candle_nn::rms_norm(dim, eps, vb.pp(*alias)).map_err(Error::from);
+            return DeviceRmsNorm::load(dim, eps, vb.pp(*alias)).map_err(Error::from);
         }
     }
-    candle_nn::rms_norm(dim, eps, vb.pp(aliases[0])).map_err(Error::from)
+    DeviceRmsNorm::load(dim, eps, vb.pp(aliases[0])).map_err(Error::from)
 }
 
 #[cfg(test)]

@@ -174,6 +174,49 @@ fn cpu(
     Ok((sum, normed))
 }
 
+/// An RMSNorm layer: Candle's `RmsNorm` everywhere but CUDA, where it runs
+/// as [`rms_norm`] (one block of threads a row; Candle's CUDA kernel gives a
+/// row 32 threads, about 14 µs for 32 rows of 2,048 on the H100). The same
+/// math to rounding, and a row's bits still depend on that row alone.
+#[derive(Clone, Debug)]
+pub struct DeviceRmsNorm {
+    inner: candle_nn::RmsNorm,
+    /// The gain in F32, kept on CUDA only.
+    gain: Option<Tensor>,
+    eps: f32,
+}
+
+impl DeviceRmsNorm {
+    pub fn new(weight: Tensor, eps: f64) -> Result<Self> {
+        let gain = if weight.device().is_cuda() {
+            Some(weight.to_dtype(DType::F32)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            inner: candle_nn::RmsNorm::new(weight, eps),
+            gain,
+            eps: eps as f32,
+        })
+    }
+
+    /// `candle_nn::rms_norm`'s loader: `weight` `[dim]` under `vb`.
+    pub fn load(dim: usize, eps: f64, vb: candle_nn::VarBuilder) -> Result<Self> {
+        Self::new(vb.get(dim, "weight")?, eps)
+    }
+}
+
+impl candle_nn::Module for DeviceRmsNorm {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match &self.gain {
+            Some(gain) if x.device().is_cuda() && dtype_tag(x.dtype()).is_ok() => {
+                rms_norm(x, gain, self.eps, x.dtype())
+            }
+            _ => self.inner.forward(x),
+        }
+    }
+}
+
 /// The eager chain on any device, for devices without a kernel and for tests.
 pub fn reference(
     residual: &Tensor,
