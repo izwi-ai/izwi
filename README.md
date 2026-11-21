@@ -4,7 +4,7 @@
 
 <h1 align="center">Izwi</h1>
 
-<p align="center"><strong>Local-first voice AI for speech, chat, and audio workflows.</strong></p>
+<p align="center"><strong>Open-source voice AI that runs on your machine.</strong></p>
 
 <p align="center">
   <a href="https://izwiai.com">Website</a> -
