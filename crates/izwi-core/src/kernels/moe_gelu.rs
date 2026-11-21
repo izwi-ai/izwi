@@ -1117,12 +1117,37 @@ mod tests {
         let scale = Tensor::ones(experts_count, DType::F32, &device).unwrap();
         let routing = route(&logits, &scale, top_k).unwrap();
         let got = experts_fp8(&x, &routing, &cuda_gate, &cuda_down).unwrap();
-        let all = (0..experts_count as u32).collect::<Vec<_>>();
+        // The reference: the CPU kernels' arithmetic over the exact F32
+        // weights (a BF16 decode would round each e4m3 * scale product).
+        let exact = |w: &Fp8Weights| {
+            let (e, r, c) = w.dims3().unwrap();
+            let q =
+                w.q.flatten_all()
+                    .unwrap()
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_vec1::<u8>()
+                    .unwrap();
+            let s = w
+                .scale
+                .flatten_all()
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let values = q
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| e4m3_to_f32(b) * s[i / c])
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, (e, r, c), &Device::Cpu).unwrap()
+        };
         let want = experts(
-            &x,
-            &routing,
-            &dequantize_experts(&cuda_gate, &all).unwrap(),
-            &dequantize_experts(&cuda_down, &all).unwrap(),
+            &x.to_device(&Device::Cpu).unwrap(),
+            &routing.to_device(&Device::Cpu).unwrap(),
+            &exact(&cuda_gate),
+            &exact(&cuda_down),
         )
         .unwrap();
         let host = |t: &Tensor| {
