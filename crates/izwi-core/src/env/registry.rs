@@ -2996,9 +2996,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_FP8_EXPERTS",
         Flag,
-        "true",
+        "false",
         Load,
-        "Stores SOV-Transcribe-1's experts on CUDA as E4M3 rows with an F32 scale each, quantized at load (half the bytes a decode step reads); off keeps the checkpoint's BF16.",
+        "Stores SOV-Transcribe-1's experts on CUDA as E4M3 rows with an F32 scale each, quantized at load: about 23 GB instead of 45.7, same transcripts, but slower than BF16 on the H100 today.",
     ),
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_MODEL_DIR",

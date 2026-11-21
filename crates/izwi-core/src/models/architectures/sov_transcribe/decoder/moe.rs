@@ -181,13 +181,18 @@ pub struct Experts {
     width: usize,
 }
 
-/// Kill switch for SOV-Transcribe's FP8 experts on CUDA (a boolean; on when
-/// unset). Read once, at load.
+/// Opt-in for SOV-Transcribe's FP8 experts on CUDA (a boolean; off when
+/// unset). Read once, at load. FP8 halves the experts' memory (about 23 GB
+/// instead of 45.7) but is slower on the H100 today: at 32 concurrent, 48
+/// against 77 audio-s/s on short clips. Prefill decodes the experts a call
+/// uses to BF16 (28% of kernel time), and the decode kernels re-read each
+/// token's F32 activations once per output channel, so reading half the
+/// weight bytes does not speed them up.
 pub const FP8_EXPERTS_ENV: &str = "IZWI_SOV_TRANSCRIBE_FP8_EXPERTS";
 
 fn fp8_experts_requested() -> bool {
     static ON: crate::env::ReadOnce<bool> =
-        crate::env::ReadOnce::new(|| crate::env::flag_or(FP8_EXPERTS_ENV, true));
+        crate::env::ReadOnce::new(|| crate::env::flag_or(FP8_EXPERTS_ENV, false));
     ON.get()
 }
 
