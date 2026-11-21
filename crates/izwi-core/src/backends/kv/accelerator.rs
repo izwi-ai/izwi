@@ -4089,6 +4089,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "metal")]
     #[test]
     fn failed_in_place_plan_update_never_serves_mixed_device_tables() -> Result<()> {
         let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
