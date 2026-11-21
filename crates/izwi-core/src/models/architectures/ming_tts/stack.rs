@@ -66,10 +66,51 @@ pub(crate) fn project_rows(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -
             .collect::<Result<Vec<_>>>()?;
         Tensor::cat(&products, 0)?
     };
+    add_bias(product, bias)
+}
+
+/// Multiplies Ming's F32 matmuls (the VAE's; the language model's only when
+/// it falls back to F32) on CUDA tensor cores in TF32 (a boolean; on when
+/// unset). Read once.
+pub(crate) const MING_TTS_F32_TF32_ENV: &str = "IZWI_MING_TTS_F32_TF32";
+
+fn f32_tf32_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(MING_TTS_F32_TF32_ENV, true));
+    ON.get()
+}
+
+/// `product + bias`: on CUDA in place in one launch with the same bits
+/// (`bias_rows`), elsewhere Candle's broadcast add.
+fn add_bias(product: Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    use crate::kernels::cuda::bias_rows;
     match bias {
+        Some(bias)
+            if bias_rows::serves(product.device(), product.dtype()) && product.is_contiguous() =>
+        {
+            bias_rows::add_bias(&product, bias, false)?;
+            Ok(product)
+        }
         Some(bias) => Ok(product.broadcast_add(bias)?),
         None => Ok(product),
     }
+}
+
+/// `x` [rows, in] · `weight` [out, in]ᵀ (+ `bias`): an F32 product runs in
+/// TF32 on CUDA tensor cores (F32 tensors and sums, the multiply's inputs
+/// rounded to a 10-bit mantissa) unless `IZWI_MING_TTS_F32_TF32` is off;
+/// everything else is Candle's matmul. The bias goes through [`add_bias`].
+pub(crate) fn product(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    use crate::kernels::cuda::tf32_gemm;
+    let product = if tf32_gemm::serves(x.device(), x.dtype())
+        && weight.dtype() == DType::F32
+        && f32_tf32_requested()
+    {
+        tf32_gemm::matmul_t(x, weight)?
+    } else {
+        x.matmul(&weight.t()?)?
+    };
+    add_bias(product, bias)
 }
 
 /// An RMSNorm gain in F32, the form the fused norm takes.
@@ -86,11 +127,7 @@ fn norm_f32(x: &Tensor, gain: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 fn project(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-    let product = x.matmul(&weight.t()?)?;
-    match bias {
-        Some(bias) => Ok(product.broadcast_add(bias)?),
-        None => Ok(product),
-    }
+    product(x, weight, bias)
 }
 
 /// One layer's weights, each as the checkpoint stores it (the two norm

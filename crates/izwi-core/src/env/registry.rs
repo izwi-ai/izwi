@@ -1608,6 +1608,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "On CUDA, every Ming-3.0-tts decode step runs its language model as CUDA graphs of the work between two layers' paged attention (the residual branches, norms and the next layer's projections and rotation), at the 32 padded rows every CUDA projection already has, checked bit for bit against the eager stretch before replaying; attention stays eager over the real rows. Any graph failure keeps every step eager. Any false value, or cuda.decode_graphs=off, turns them off; `decode_graphs` in the model diagnostics reports why they are off, captures and replays.",
     ),
     CoreEnvVar::new(
+        "IZWI_MING_TTS_F32_TF32",
+        Flag,
+        "true",
+        Load,
+        "Runs Ming's F32 matmuls (the VAE's; the language model's only after an F32 fallback) on CUDA tensor cores in TF32 (F32 tensors and sums, the multiply's inputs rounded to a 10-bit mantissa).",
+    ),
+    CoreEnvVar::new(
         "IZWI_MING_TTS_FLOW_GRAPHS",
         Flag,
         "true",

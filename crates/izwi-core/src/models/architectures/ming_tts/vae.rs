@@ -53,11 +53,7 @@ const POSTERIOR_SCALE_FLOOR: f32 = 1e-4;
 fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     // Metal's matmul takes a left operand only with unit row stride: the
     // encoder's group tokens are a strided view.
-    let y = x.contiguous()?.matmul(&weight.t()?)?;
-    match bias {
-        Some(bias) => Ok(y.broadcast_add(bias)?),
-        None => Ok(y),
-    }
+    super::stack::product(&x.contiguous()?, weight, bias)
 }
 
 fn weight_t(vb: &VarBuilder, output: usize, input: usize) -> Result<Tensor> {
