@@ -345,6 +345,8 @@ impl SovFeedForward {
     /// that many, which bounds the padded blocks however skewed the routing:
     /// on tensor cores even every expert padded to the whole chunk costs
     /// about 2 ms a layer, where the host path's per-expert loop cost 9.
+    /// On CUDA (toolkit 12.5 or later) nothing is padded: each expert's
+    /// tokens run through its weights in one cuBLAS grouped GEMM.
     pub fn sparse_grouped(&self, h: &Tensor, normed: &Tensor) -> Result<Tensor> {
         let tokens = normed.dim(0)?;
         if tokens <= GROUPED_CHUNK_TOKENS {
@@ -393,6 +395,11 @@ impl SovFeedForward {
         if rows == 0 {
             return Ok(normed.zeros_like()?);
         }
+        if normed.device().is_cuda()
+            && crate::kernels::grouped_gemm::available_on_device(normed.dtype())
+        {
+            return self.exact_grouped(normed, &by_expert, &slot_rows, weights);
+        }
         let mut ids = vec![0u32; experts * rows];
         for (expert, choices) in by_expert.iter().enumerate() {
             ids[expert * rows..expert * rows + choices.len()].copy_from_slice(choices);
@@ -422,6 +429,64 @@ impl SovFeedForward {
             .reshape((experts * rows, hidden))?;
         // Each token gathers its slots' rows and sums them by weight (an
         // index_add over the padded rows scanned every row per column).
+        let gather = Tensor::from_vec(gather, tokens * k, device)?;
+        let weights = Tensor::from_vec(weights, (tokens, k, 1), device)?.to_dtype(out.dtype())?;
+        Ok(out
+            .index_select(&gather, 0)?
+            .reshape((tokens, k, hidden))?
+            .broadcast_mul(&weights)?
+            .sum(1)?)
+    }
+
+    /// The grouped experts with no padding (CUDA): each expert's tokens
+    /// sorted into one contiguous run, every run multiplied by exactly its
+    /// expert's resident weights in one grouped GEMM per projection, and
+    /// each token's slots gathered back and summed by weight.
+    fn exact_grouped(
+        &self,
+        normed: &Tensor,
+        by_expert: &[Vec<u32>],
+        slot_rows: &[(usize, usize)],
+        weights: Vec<f32>,
+    ) -> Result<Tensor> {
+        use crate::kernels::grouped_gemm::{grouped_rows_gemm, RowGroup};
+        let (tokens, _) = normed.dims2()?;
+        let k = self.top_k;
+        let mut first = vec![0usize; by_expert.len()];
+        let mut groups = Vec::new();
+        let mut ids = Vec::with_capacity(tokens * k);
+        for (expert, choices) in by_expert.iter().enumerate() {
+            first[expert] = ids.len();
+            if !choices.is_empty() {
+                groups.push(RowGroup {
+                    expert,
+                    first_row: ids.len(),
+                    rows: choices.len(),
+                });
+                ids.extend_from_slice(choices);
+            }
+        }
+        // A slot without an expert reads row 0 at weight zero.
+        let gather = slot_rows
+            .iter()
+            .map(|&(expert, index)| {
+                if expert == usize::MAX {
+                    0
+                } else {
+                    (first[expert] + index) as u32
+                }
+            })
+            .collect::<Vec<_>>();
+        let device = normed.device();
+        let e = &self.experts;
+        let rows = ids.len();
+        let ids = Tensor::from_vec(ids, rows, device)?;
+        let x = normed.index_select(&ids, 0)?;
+        let gate_up = grouped_rows_gemm(&x, &e.gate_up, &groups)?;
+        let gate = gate_up.narrow(1, 0, e.width)?.gelu()?;
+        let up = gate_up.narrow(1, e.width, e.width)?;
+        let out = grouped_rows_gemm(&(gate * up)?.contiguous()?, &e.down, &groups)?;
+        let hidden = out.dim(1)?;
         let gather = Tensor::from_vec(gather, tokens * k, device)?;
         let weights = Tensor::from_vec(weights, (tokens, k, 1), device)?.to_dtype(out.dtype())?;
         Ok(out
