@@ -1590,7 +1590,7 @@ mod tests {
         let streams = (0..6).map(|row| stream_codes(row, 80)).collect::<Vec<_>>();
         let mut shared = vec![Audio8DacStreamState::default(); 6];
         let mut alone = shared.clone();
-        let mut cursor = vec![0usize; 6];
+        let mut cursor = [0usize; 6];
         // Different ages: row r first pushes r % 3 chunks of four alone.
         for row in 0..6 {
             for _ in 0..row % 3 {
@@ -1705,7 +1705,11 @@ mod tests {
         ] {
             let (other_pushes, other_pcm) = decode(&arrivals, with_peer);
             assert_eq!(other_pushes, pushes, "{arrivals:?}");
-            assert_eq!(bits(&[other_pcm]), bits(&[pcm.clone()]), "{arrivals:?}");
+            assert_eq!(
+                bits(&[other_pcm]),
+                bits(std::slice::from_ref(&pcm)),
+                "{arrivals:?}"
+            );
         }
     }
 }

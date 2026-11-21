@@ -2701,7 +2701,7 @@ mod tests {
                             looks.fetch_add(1, Ordering::SeqCst);
                             // Hold the first row until three wait, then take
                             // more than the width allows.
-                            (queued >= 3 || recorded.lock().unwrap().len() > 0).then_some(9)
+                            (queued >= 3 || !recorded.lock().unwrap().is_empty()).then_some(9)
                         },
                         |batch| {
                             recorded.lock().unwrap().push(batch);

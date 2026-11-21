@@ -348,7 +348,7 @@ impl<K: PartialEq + Clone + std::fmt::Debug> ShapeGraphs<K> {
                 eager_shapes.remove(0);
             }
             eager_shapes.push(key.clone());
-            drop(graph);
+            // The graph drops here, behind its stream fence.
             return Ok(Some(eager));
         }
         *pool_growth += growth;
