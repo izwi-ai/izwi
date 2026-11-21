@@ -20,7 +20,7 @@ use candle_core::{DType, Device, Tensor};
 use super::config::LATENT_DIM;
 use super::stack::MingForwardRow;
 use super::stream::{MingAudioStream, MingWindow};
-use super::vae::MingVaeDecoder;
+use super::vae::{MingVaeDecoder, MingVaePending};
 use super::{
     MingGenerationParams, MingLatentInput, MingNoiseStream, MingPrompt, MingRuntime,
     MingStopReason, MIN_LATENTS,
@@ -175,6 +175,7 @@ impl MingRetainedState {
 
     /// Decode the next window; its samples, or `None` when no window is
     /// due.
+    #[cfg(test)]
     pub(crate) fn decode_window(&mut self, decoder: &MingVaeDecoder) -> Result<Option<Vec<f32>>> {
         let Some(window) = self.next_window() else {
             return Ok(None);
@@ -268,6 +269,37 @@ impl MingRetainedState {
         self.phase = MingPhase::Finished;
         Ok(())
     }
+}
+
+/// The next audio window of each state, `None` for a state with none due.
+/// Every due window's stack is queued on the device first, then each is
+/// read back and run through the inverse STFT in turn, so the host's work
+/// on one window overlaps the device's on the next. Each window decodes on
+/// its own (the VAE keeps per-request attention state): a request gets the
+/// samples it would alone.
+pub(crate) fn ming_audio_batch(
+    decoder: &MingVaeDecoder,
+    states: &mut [&mut MingRetainedState],
+) -> Result<Vec<Option<Vec<f32>>>> {
+    let mut queued: Vec<Option<(MingWindow, MingVaePending)>> = Vec::with_capacity(states.len());
+    for state in states.iter_mut() {
+        queued.push(match state.next_window() {
+            Some(window) => {
+                let pending = state.audio.begin(decoder, &state.latents, window)?;
+                Some((window, pending))
+            }
+            None => None,
+        });
+    }
+    states
+        .iter_mut()
+        .zip(queued)
+        .map(|(state, queued)| {
+            queued
+                .map(|(window, pending)| state.audio.finish(decoder, pending, window))
+                .transpose()
+        })
+        .collect()
 }
 
 fn hidden_rows(hidden: &Tensor) -> Result<Vec<Vec<f32>>> {
@@ -624,6 +656,90 @@ mod tests {
                 .fold(0f32, f32::max);
             assert_eq!(worst, 0.0);
         }
+    }
+
+    /// Every state's windows through [`ming_audio_batch`], `together` in one
+    /// batch per round or each state alone; each state's samples as bits.
+    fn audio_bits(
+        decoder: &MingVaeDecoder,
+        states: &mut [MingRetainedState],
+        together: bool,
+    ) -> Vec<Vec<u32>> {
+        let mut out = vec![Vec::new(); states.len()];
+        if together {
+            loop {
+                let mut refs = states.iter_mut().collect::<Vec<_>>();
+                let windows = ming_audio_batch(decoder, &mut refs).unwrap();
+                if windows.iter().all(Option::is_none) {
+                    break;
+                }
+                for (samples, window) in out.iter_mut().zip(windows) {
+                    samples.extend(window.unwrap_or_default().into_iter().map(f32::to_bits));
+                }
+            }
+        } else {
+            for (samples, state) in out.iter_mut().zip(states.iter_mut()) {
+                while let Some(window) = ming_audio_batch(decoder, &mut [state]).unwrap().remove(0)
+                {
+                    samples.extend(window.into_iter().map(f32::to_bits));
+                }
+            }
+        }
+        assert!(states.iter().all(|state| state.audio.done()));
+        out
+    }
+
+    /// Windows queued together are each request's samples alone, bit for
+    /// bit (on the CPU, at each window's own length).
+    #[test]
+    fn audio_windows_together_match_each_alone() {
+        let runtime = tiny_runtime();
+        let fresh = || {
+            ["first row here", "another one", "and the third row of text"]
+                .iter()
+                .map(|text| {
+                    let mut retained = state(&runtime, text, 20);
+                    let mut cache = runtime.scratch_cache(256).unwrap();
+                    run(&runtime, &mut retained, &mut cache, usize::MAX);
+                    retained
+                })
+                .collect::<Vec<_>>()
+        };
+        let alone = audio_bits(runtime.decoder(), &mut fresh(), false);
+        assert!(alone.iter().all(|samples| !samples.is_empty()));
+        assert_eq!(audio_bits(runtime.decoder(), &mut fresh(), true), alone);
+    }
+
+    /// On CUDA, through the VAE window's graph: windows queued together are
+    /// each request's samples alone, bit for bit, and the graph replays.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_audio_windows_together_match_each_alone() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let mut runtime =
+            crate::models::architectures::ming_tts::synthetic::tiny_runtime_on(&device, DType::F32);
+        runtime.resolve_graphs();
+        let fresh = || {
+            ["first row here", "another one", "and the third row of text"]
+                .iter()
+                .map(|text| {
+                    let mut retained = state(&runtime, text, 20);
+                    let mut cache = runtime.scratch_cache(256).unwrap();
+                    run(&runtime, &mut retained, &mut cache, usize::MAX);
+                    retained
+                })
+                .collect::<Vec<_>>()
+        };
+        let alone = audio_bits(runtime.decoder(), &mut fresh(), false);
+        assert_eq!(audio_bits(runtime.decoder(), &mut fresh(), true), alone);
+        let diagnostics = runtime.vae_graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert!(
+            diagnostics["replays"].as_u64().unwrap_or(0) > 0,
+            "{diagnostics}"
+        );
     }
 
     #[test]

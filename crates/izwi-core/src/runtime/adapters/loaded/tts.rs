@@ -1063,24 +1063,56 @@ impl LoadedExecutionAdapter for MingTtsExecutionAdapter {
         finalize.max_workspace_bytes = 0;
         // One VAE window per request and quantum, so other requests' quanta
         // run between them: each request's decode keeps its own attention
-        // state, so windows do not share calls.
+        // state, so windows do not share calls. On CUDA the due windows of
+        // up to the engine rows decode in one quantum: each is its own
+        // fixed-shape graph launch, all queued before any is read back, so
+        // the host's inverse STFT of one overlaps the device's next window.
+        let batched_audio = self.backend_kind == BackendKind::Cuda
+            && self.max_batch_size > 1
+            && crate::models::architectures::ming_tts::ming_audio_batching_enabled();
         let mut acoustic = StageDescriptor::from_execution_profile(
             StageId::new(4),
-            "tts.audio.ming_tts.scalar",
+            if batched_audio {
+                "tts.audio.ming_tts.tensor_static"
+            } else {
+                "tts.audio.ming_tts.scalar"
+            },
             &profile,
-            NativeBatchMode::None,
+            if batched_audio {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
         );
         acoustic.selector = StageWorkSelector::SequenceAudioDecode;
         acoustic.progress = StageProgressKind::Iterative;
         acoustic.shape_policy = StageShapePolicy::Exact;
         acoustic.max_padding_basis_points = 0;
-        acoustic.max_batch_size = 1;
-        acoustic.concurrency = ConcurrencyClass::Exclusive;
-        acoustic.max_work_units = 1;
-        // The VAE stack's activations over a window of up to 8 latents (32
-        // frames at width 896) and its 3,530-wide head: a few megabytes;
-        // the last window of a short request may carry more latents.
-        acoustic.max_workspace_bytes = 256 * 1024 * 1024;
+        if batched_audio {
+            let rows = self.max_batch_size;
+            acoustic.max_batch_size = rows;
+            acoustic.concurrency = ConcurrencyClass::Batchable;
+            acoustic.max_work_units = rows as u64;
+            // One window's stack runs at a time (34 frames at width 896
+            // through 24 layers, its widest [34, 4864] F32, a few megabytes
+            // a layer); each queued row holds its head output (0.5 MB),
+            // its kept keys in and out (1.5 MB each) and its inputs until
+            // it is read back.
+            let shared = 64 * 1024 * 1024_u64;
+            let per_row = 8 * 1024 * 1024_u64;
+            acoustic.workspace_base_bytes = shared;
+            acoustic.workspace_per_row_bytes = per_row;
+            acoustic.max_workspace_bytes = per_row.saturating_mul(rows as u64) + shared;
+        } else {
+            acoustic.max_batch_size = 1;
+            acoustic.concurrency = ConcurrencyClass::Exclusive;
+            acoustic.max_work_units = 1;
+            // The VAE stack's activations over a window of up to 8 latents
+            // (32 frames at width 896) and its 3,530-wide head: a few
+            // megabytes; the last window of a short request may carry more
+            // latents.
+            acoustic.max_workspace_bytes = 256 * 1024 * 1024;
+        }
         for stage in [
             &mut preparation,
             &mut prefill,

@@ -50,8 +50,8 @@ pub use config::{
     MAX_NEW_LATENTS, MAX_REFERENCE_LATENTS, MIN_LATENTS, MIN_REFERENCE_SECONDS, SAMPLE_RATE,
     SPEAKER_WEIGHTS_FILE, WEIGHTS_FILE,
 };
+pub(crate) use model::{ming_audio_batching_enabled, ming_reloads_in_f32, MingAudioProgress};
 pub use model::{ming_lm_precision, MingTtsDiagnostics, MingTtsModel};
-pub(crate) use model::{ming_reloads_in_f32, MingAudioProgress};
 pub(crate) use physical::MING_TTS_DOMAIN;
 pub use prompt::{
     target_language_name, MingControl, MingDialect, MingEmotion, MingLevel, MingSpeaker,

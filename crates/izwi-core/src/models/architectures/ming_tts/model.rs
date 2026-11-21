@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use super::config::{vae_window_keys, CONTEXT_POSITIONS, MAX_NEW_LATENTS, SAMPLE_RATE};
 use super::physical::{ming_physical_state_spec, ming_retained_contract, MingPhysicalStateSpec};
 use super::retained::{
-    ming_decode_batch, ming_prefill_batch, MingDecodeStep, MingPhase, MingPrefillStep,
-    MingPreparedArtifact, MingRetainedState, MingStepRow,
+    ming_audio_batch, ming_decode_batch, ming_prefill_batch, MingDecodeStep, MingPhase,
+    MingPrefillStep, MingPreparedArtifact, MingRetainedState, MingStepRow,
 };
 use super::{MingGenerationParams, MingPrecision, MingReferenceVoice, MingRequest, MingRuntime};
 use crate::backends::{BackendKind, DTypeSelection, DTypeSelectionRequest, DeviceProfile};
@@ -65,6 +65,18 @@ pub struct MingTtsDiagnostics {
     /// device that should run BF16 (CUDA) or F16 (Metal) but lists one here
     /// runs slower than it should.
     pub precision_fallbacks: Vec<String>,
+}
+
+/// Kill switch for the batched audio stage on CUDA (a boolean; on when
+/// unset): off, each request's VAE window is a quantum of its own.
+pub(crate) const MING_TTS_AUDIO_BATCH_ENV: &str = "IZWI_MING_TTS_AUDIO_BATCH";
+
+/// Whether CUDA decodes several requests' due VAE windows in one audio
+/// quantum ([`MingTtsModel::retained_audio_batch`]).
+pub(crate) fn ming_audio_batching_enabled() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(MING_TTS_AUDIO_BATCH_ENV, true));
+    ON.get()
 }
 
 /// What one audio-window quantum did.
@@ -305,31 +317,32 @@ impl MingTtsModel {
         ming_decode_batch(&self.runtime, rows)
     }
 
-    /// Decode the request's next audio window, waiting for the device so
-    /// the window's cost lands in its own quantum.
+    /// Decode the request's next audio window. Its samples are read back
+    /// from the device, so the window's cost lands in its own quantum.
     pub(crate) fn retained_audio_step(
         &self,
         state: &mut MingRetainedState,
     ) -> Result<MingAudioProgress> {
-        let samples = state.decode_window(self.runtime.decoder())?;
-        self.runtime.device().synchronize()?;
-        Ok(match samples {
-            Some(samples) => MingAudioProgress::Window(samples),
-            None => MingAudioProgress::Idle,
-        })
+        self.retained_audio_batch(&mut [state])?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Ming audio window lost its result".into()))
     }
 
-    /// [`Self::retained_audio_step`] for several requests: each request's
-    /// window decodes on its own (the VAE keeps per-request attention
-    /// state), so every request gets the samples it would alone.
+    /// [`Self::retained_audio_step`] for several requests (the batched
+    /// audio stage on CUDA): every due window is queued before any is read
+    /// back ([`ming_audio_batch`]); each request's window decodes on its
+    /// own, so every request gets the samples it would alone.
     pub(crate) fn retained_audio_batch(
         &self,
         states: &mut [&mut MingRetainedState],
     ) -> Result<Vec<MingAudioProgress>> {
-        states
-            .iter_mut()
-            .map(|state| self.retained_audio_step(state))
-            .collect()
+        Ok(ming_audio_batch(self.runtime.decoder(), states)?
+            .into_iter()
+            .map(|samples| match samples {
+                Some(samples) => MingAudioProgress::Window(samples),
+                None => MingAudioProgress::Idle,
+            })
+            .collect())
     }
 
     /// Mark a request whose last window is out as finished.
