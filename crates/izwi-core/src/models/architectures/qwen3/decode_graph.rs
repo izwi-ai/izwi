@@ -3,7 +3,8 @@
 //! decode steps are host-bound on an H100 (about 20 launches a layer, and
 //! the 1.7B model decodes within 5% of the 0.6B), so the whole step, from
 //! the token embeddings to the logits, is captured once per padded width
-//! ([`decode_step::WIDTHS`], 1 to 32 rows) and replayed.
+//! ([`decode_step::WIDTHS`], 1 to 32 rows; Rumble's up to 64) and
+//! replayed.
 //!
 //! The graph body is the eager decode with three swaps, each recorded by a
 //! capture:
@@ -53,6 +54,27 @@ pub(crate) const DECODE_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
     pool_bytes: 160 * MIB,
 };
 
+/// Rumble's limits: its decode reaches 64 rows, so its graphs take the 48-
+/// and 64-row widths too. Their logits add 112 rows (220 across the twelve
+/// widths: 128 MiB at a 152k vocab, 84 MiB at Rumble's 99.6k), and the
+/// widest step's working set doubles (about 128 MB beside the 32-row
+/// step's 64 MB).
+pub(crate) const RUMBLE_DECODE_GRAPH_LIMITS: ShapeGraphLimits = ShapeGraphLimits {
+    max_graphs: 16,
+    retained_bytes: 128 * MIB,
+    pool_bytes: 224 * MIB,
+};
+
+/// The limits of the decode graphs behind `switch`: Rumble's wider ones,
+/// or the families' capped at 32 rows.
+fn decode_graph_limits(switch: &'static str) -> ShapeGraphLimits {
+    if switch == RUMBLE_DECODE_GRAPHS_ENV {
+        RUMBLE_DECODE_GRAPH_LIMITS
+    } else {
+        DECODE_GRAPH_LIMITS
+    }
+}
+
 /// Whether `switch` and `cuda.decode_graphs` leave the decode graphs on.
 pub(crate) fn decode_graphs_requested(switch: &'static str) -> bool {
     crate::env::flag_or(switch, true) && !decode_graphs_switched_off()
@@ -63,7 +85,7 @@ pub(crate) fn decode_graphs_requested(switch: &'static str) -> bool {
 /// with the graphs switched off.
 pub(crate) fn qwen3_decode_graph_device_bytes(backend: BackendKind, switch: &'static str) -> u64 {
     if backend == BackendKind::Cuda && decode_graphs_requested(switch) {
-        DECODE_GRAPH_LIMITS.device_bytes()
+        decode_graph_limits(switch).device_bytes()
     } else {
         0
     }
@@ -112,7 +134,7 @@ impl Qwen3DecodeGraph {
         }
         Ok(Self {
             label,
-            graphs: ShapeGraphs::resolve(label, device, DECODE_GRAPH_LIMITS)?,
+            graphs: ShapeGraphs::resolve(label, device, decode_graph_limits(switch))?,
             checked: Mutex::new(Vec::new()),
             off: Mutex::new(None),
             graphed_steps: AtomicU64::new(0),
@@ -203,7 +225,11 @@ mod tests {
                 assert!(reason.contains("CUDA only"), "{reason}");
                 assert_eq!(
                     qwen3_decode_graph_device_bytes(BackendKind::Cuda, switch),
-                    256 << 20
+                    if switch == RUMBLE_DECODE_GRAPHS_ENV {
+                        352 << 20
+                    } else {
+                        256 << 20
+                    }
                 );
             }
             let previous = std::env::var_os(switch);

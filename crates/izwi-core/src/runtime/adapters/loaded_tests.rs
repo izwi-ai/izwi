@@ -1059,6 +1059,33 @@ fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows()
             );
         }
     }
+    // Rumble decodes up to 64 rows on CUDA, and its encoder and batched
+    // prefill widen with the decode up to 32 rows.
+    if crate::models::architectures::rumble::rumble_retained_decode_enabled(BackendKind::Cuda) {
+        let variant = ModelVariant::Rumble2Flash;
+        for (fitted, decode_rows, encoder_rows) in [
+            (None, 64, 32),
+            (Some(64), 64, 32),
+            (Some(32), 32, 32),
+            (Some(16), 16, 16),
+            (Some(8), 8, 8),
+        ] {
+            let contract = sequence_graph(variant, fitted);
+            let decode = stage(&contract, StageWorkSelector::SequenceDecode);
+            assert_eq!(decode.max_batch_size, decode_rows, "{fitted:?}");
+            assert_eq!(
+                stage(&contract, StageWorkSelector::PreSequencePreparation).max_batch_size,
+                encoder_rows,
+                "{fitted:?}"
+            );
+            let prefill = stage(&contract, StageWorkSelector::SequencePrefill);
+            assert_eq!(prefill.max_batch_size, encoder_rows, "{fitted:?}");
+            assert_eq!(
+                prefill.name,
+                crate::models::architectures::rumble::RUMBLE_STATIC_PREFILL_STAGE
+            );
+        }
+    }
     // The encoder batchers form at most the preparation width, with the
     // per-row budget a batch of eight had.
     let parakeet = sequence_graph(ModelVariant::ParakeetTdt06BV3, None);

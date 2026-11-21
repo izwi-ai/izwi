@@ -20,8 +20,10 @@ use crate::error::{Error, Result};
 use crate::kv::{KvSequenceBlockTable, KvSlotRef};
 
 /// The graphed batch widths: a step of `n` rows replays the graph of the
-/// smallest width that holds it.
-pub const WIDTHS: [usize; 10] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32];
+/// smallest width that holds it. The families capped at 32 rows (Qwen3-ASR,
+/// VibeVoice-ASR, Voxtral, Whisper) never reach 48 or 64; Rumble decodes up
+/// to 64 rows on CUDA.
+pub const WIDTHS: [usize; 12] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
 
 /// A spare row's flat KV slot: the KV write skips it (Candle's scatter
 /// skips the index type's maximum).
@@ -296,7 +298,9 @@ mod tests {
         assert_eq!(graph_width(5), Some(6));
         assert_eq!(graph_width(17), Some(24));
         assert_eq!(graph_width(32), Some(32));
-        assert_eq!(graph_width(33), None);
+        assert_eq!(graph_width(33), Some(48));
+        assert_eq!(graph_width(64), Some(64));
+        assert_eq!(graph_width(65), None);
     }
 
     #[test]

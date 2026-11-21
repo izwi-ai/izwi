@@ -1376,7 +1376,8 @@ mod tests {
     /// A Rumble row holds 14 layers' BF16 K and V and a BF16 prompt
     /// embedding over its 1,051-token minimum sequence (the 128-token prompt
     /// reserve, one window's audio tokens and its 512-token budget) and an
-    /// F32 logits row: about 59 MiB, so 32 rows take about 1.9 GiB.
+    /// F32 logits row: about 59 MiB, so 32 rows take about 1.9 GiB and 64
+    /// rows about 3.7 GiB.
     #[test]
     fn a_rumble_cuda_decode_row_is_priced_for_the_width_fit() {
         const MIB: u64 = 1024 * 1024;
@@ -1386,9 +1387,19 @@ mod tests {
             .unwrap();
         assert_eq!(rumble, 1_051 * (2 * 14 * 1024 * 2 + 1024 * 2) + 99_630 * 4);
         assert_eq!(rumble / MIB, 59);
-        for (headroom, width) in [(70 * GIB, 32), (13 * GIB, 32), (3 * GIB, 16), (GIB, 8)] {
+        // Its ceiling on CUDA is 64 rows (about 3.7 GiB of decode rows).
+        let ceiling =
+            crate::catalog::certified_decode_width(ModelFamily::RumbleAsr, BackendKind::Cuda);
+        assert_eq!(ceiling, crate::catalog::CUDA_ASR_MAX_WIDTH);
+        for (headroom, width) in [
+            (70 * GIB, 64),
+            (13 * GIB, 64),
+            (6 * GIB, 32),
+            (3 * GIB, 16),
+            (GIB, 8),
+        ] {
             assert_eq!(
-                crate::catalog::fit_asr_decode_width(32, 8, rumble, headroom),
+                crate::catalog::fit_asr_decode_width(ceiling, 8, rumble, headroom),
                 width,
                 "{headroom}"
             );

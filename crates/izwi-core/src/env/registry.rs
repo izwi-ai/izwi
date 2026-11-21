@@ -2802,7 +2802,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Flag,
         "true",
         Once,
-        "On CUDA, Rumble's retained route replays each decode step of its text decoder, from the token embeddings to the logits, as one CUDA graph per padded width (1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 rows), with attention on the split decode. Each graph is checked bit for bit against the eager body on its first two steps, and a width's first step against the standard decode (relative L2 within 0.05, same greedy token per row); a mismatch or CUDA error turns the graphs off for the process. Loads that offer the retained route price 256 MiB for them. Any false value (or cuda.decode_graphs=off) keeps the standard decode; `decode_graph` in the diagnostics reports captures, replays and why the graphs are off.",
+        "On CUDA, Rumble's retained route replays each decode step of its text decoder, from the token embeddings to the logits, as one CUDA graph per padded width (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48 or 64 rows), with attention on the split decode. Each graph is checked bit for bit against the eager body on its first two steps, and a width's first step against the standard decode (relative L2 within 0.05, same greedy token per row); a mismatch or CUDA error turns the graphs off for the process. Loads that offer the retained route price 352 MiB for them. Any false value (or cuda.decode_graphs=off) keeps the standard decode; `decode_graph` in the diagnostics reports captures, replays and why the graphs are off.",
     ),
     CoreEnvVar::new(
         "IZWI_RUMBLE_ENCODER_MAX_WAIT_MS",

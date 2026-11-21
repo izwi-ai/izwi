@@ -130,14 +130,26 @@ full window.
 route. Request preparation computes the log-mel on a host worker, then
 `RumbleEncoderBatcher` encodes the audio and splices it into each prompt on
 the device (`asr.encoder.rumble`). Requests that queue while a pass runs
-encode together in the next one, up to the engine's rows: the tower packs
-every row's conv chunks and attends inside each row's own windows, so rows
-of any length share a pass with no padding (a ragged batch, each row priced
-at its own geometry). A packed and a lone encode agree up to rounding; one
-row takes the scalar path.
+encode together in the next one, up to the engine's rows (on CUDA up to the
+decode width, at most 32): the tower packs every row's conv chunks, uploaded
+in one tensor, and attends inside each row's own windows, so rows of any
+length share a pass with no padding (a ragged batch, each row priced at its
+own geometry; on CUDA the conv stem's slices are the pass's base workspace,
+priced once). A lone row runs the same pass with one row, and a packed and
+a lone encode agree up to rounding. On CUDA the F32 tower attends through a
+window plan: every 104-token window is gathered into fixed-width padded
+slots and each layer attends over all windows in one batched product
+(FlashAttention takes F16 and BF16 only, and the per-window loop cost about
+nine launches a window a layer). While the decode is full, CUDA rows wait in
+front of the encoder until a pass takes at least half its width, or at most
+`IZWI_RUMBLE_ENCODER_MAX_WAIT_MS` (40 ms); with free decode rows a pass runs
+at once.
 The prompt prefills onto retained decoder pages in resumable spans
-(`asr.rumble.prefill.scalar`), and the row then decodes beside the other
-rows, one batched step per token (`asr.rumble.decode.tensor_continuous`).
+(`asr.rumble.prefill.scalar`; on CUDA `asr.rumble.prefill.tensor_static`,
+where a step's rows prefill together in one mixed trunk step, a lone row
+included), and the row then decodes beside the other rows, one batched step
+per token (`asr.rumble.decode.tensor_continuous`). On CUDA the retained rows
+hold the prefill stage's rows beside a full decode.
 Each row claims its prompt plus its decode budget from a pool that holds one
 sequence per retained row and never less than one 1,536-token sequence. The
 budget is 512 tokens by default; any budget is narrowed to the room the
@@ -170,16 +182,16 @@ below are why: at a width of a few rows the route costs a single request
 latency and gains the CPU nothing under load.
 
 The decode width is the engine's rows on CPU and Metal. On CUDA with no
-width fixed it is up to 32 rows: each load fits 32, 16 or 8 to its memory
-from a priced row (14 layers of BF16 K and V over the 1,051-token minimum
-sequence, about 59 MiB). The encoder and prefill keep the engine's rows.
+width fixed it is up to 64 rows (every other ASR family stops at 32): each
+load fits 64, 32, 16 or 8 to its memory from a priced row (14 layers of BF16
+K and V over the 1,051-token minimum sequence, about 59 MiB).
 
 On CUDA the batched decode step replays as one CUDA graph per padded width
-(1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 rows), the graphs Qwen3-ASR uses on the
+(1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48 or 64 rows), the graphs Qwen3-ASR uses on the
 same trunk. A graph is checked against the eager body on its first two
 steps and each width's first step against the standard decode; a mismatch
 turns the graphs off for the process. `IZWI_RUMBLE_DECODE_GRAPHS=false`
-keeps the standard decode, a load prices 256 MiB for the graphs, and
+keeps the standard decode, a load prices 352 MiB for the graphs, and
 `decode_graph` in a row's diagnostics reports captures, replays and why the
 graphs are off. They need a BF16 or F16 decoder: a decoder that reloaded in
 F32 decodes without them. None of this has run on a GPU.
