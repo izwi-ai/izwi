@@ -3532,6 +3532,15 @@ impl Qwen3Model {
                         ids, &positions, &cos, &sin, &attention,
                     )?])
                 };
+                // A grown arena (new generation) or a rebuilt RoPE table
+                // replaced buffers the older graphs captured: they can never
+                // replay, and dropping them lets the recaptures reuse their
+                // pages instead of growing the graph pool past its price
+                // (Rumble's graphs turned off five seconds into a load).
+                graph.graphs.retain(|kept| {
+                    kept.arena != key.arena
+                        || (kept.generation >= key.generation && kept.rope_rows >= key.rope_rows)
+                });
                 output = graph.graphs.run(key, retained, &inputs, &body)?.pop();
                 Ok(())
             },
