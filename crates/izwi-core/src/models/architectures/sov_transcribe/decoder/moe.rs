@@ -340,7 +340,7 @@ impl SovFeedForward {
     /// weights: the routing (renormalized, `per_expert_scale` applied) is
     /// read back once, each expert's tokens are gathered into a block padded
     /// to the busiest expert's count, and each block row's output is scaled
-    /// by its weight and added back to its token (padding rows weigh zero).
+    /// by its weight and summed into its token.
     /// Calls of more than [`GROUPED_CHUNK_TOKENS`] tokens run in chunks of
     /// that many, which bounds the padded blocks however skewed the routing:
     /// on tensor cores even every expert padded to the whole chunk costs
@@ -366,19 +366,26 @@ impl SovFeedForward {
     }
 
     fn sparse_grouped_chunk(&self, h: &Tensor, normed: &Tensor) -> Result<Tensor> {
-        let hidden = normed.dim(1)?;
+        let (tokens, hidden) = normed.dims2()?;
         let k = self.top_k;
         let experts = self.experts.per_expert_scale.len();
         let routing =
             crate::kernels::moe_gelu::route(&self.router.logits(h)?, &self.per_expert_scale, k)?
                 .to_device(&Device::Cpu)?
                 .to_vec2::<f32>()?;
-        let mut by_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); experts];
+        // Each expert's tokens, and where each (token, slot) lands among the
+        // padded block rows.
+        let mut by_expert: Vec<Vec<u32>> = vec![Vec::new(); experts];
+        let mut slot_rows = vec![(usize::MAX, 0usize); tokens * k];
+        let mut weights = vec![0f32; tokens * k];
         for (token, row) in routing.iter().enumerate() {
             for slot in 0..k {
                 let id = row[slot];
                 if id >= 0.0 && (id as usize) < experts {
-                    by_expert[id as usize].push((token as u32, row[k + slot]));
+                    let expert = id as usize;
+                    slot_rows[token * k + slot] = (expert, by_expert[expert].len());
+                    by_expert[expert].push(token as u32);
+                    weights[token * k + slot] = row[k + slot];
                 }
             }
         }
@@ -387,13 +394,20 @@ impl SovFeedForward {
             return Ok(normed.zeros_like()?);
         }
         let mut ids = vec![0u32; experts * rows];
-        let mut weights = vec![0f32; experts * rows];
         for (expert, choices) in by_expert.iter().enumerate() {
-            for (slot, &(token, weight)) in choices.iter().enumerate() {
-                ids[expert * rows + slot] = token;
-                weights[expert * rows + slot] = weight;
-            }
+            ids[expert * rows..expert * rows + choices.len()].copy_from_slice(choices);
         }
+        // A slot without an expert reads block row 0 at weight zero.
+        let gather = slot_rows
+            .iter()
+            .map(|&(expert, index)| {
+                if expert == usize::MAX {
+                    0
+                } else {
+                    (expert * rows + index) as u32
+                }
+            })
+            .collect::<Vec<_>>();
         let device = normed.device();
         let e = &self.experts;
         let ids = Tensor::from_vec(ids, experts * rows, device)?;
@@ -406,11 +420,15 @@ impl SovFeedForward {
         let out = (gate * up)?
             .matmul(&e.down.transpose(1, 2)?)?
             .reshape((experts * rows, hidden))?;
-        let weights =
-            Tensor::from_vec(weights, (experts * rows, 1), device)?.to_dtype(out.dtype())?;
-        Ok(normed
-            .zeros_like()?
-            .index_add(&ids, &out.broadcast_mul(&weights)?, 0)?)
+        // Each token gathers its slots' rows and sums them by weight (an
+        // index_add over the padded rows scanned every row per column).
+        let gather = Tensor::from_vec(gather, tokens * k, device)?;
+        let weights = Tensor::from_vec(weights, (tokens, k, 1), device)?.to_dtype(out.dtype())?;
+        Ok(out
+            .index_select(&gather, 0)?
+            .reshape((tokens, k, hidden))?
+            .broadcast_mul(&weights)?
+            .sum(1)?)
     }
 
     /// [`Self::sparse`] through `kernels::moe_gelu`: routing and experts on
