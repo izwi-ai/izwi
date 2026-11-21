@@ -641,11 +641,31 @@ pub struct MingWindowState {
     position: usize,
     /// Per layer: (k, v), each [kept, kv_heads, head_dim].
     kept: Vec<Option<(Tensor, Tensor)>>,
+    /// The fixed-shape path's keys and values ([`MingWindowStack::fixed_forward`]):
+    /// every layer's in one tensor, [layers, 2, window_keys - 1, kv_heads,
+    /// head_dim], the valid ones (the last `min(position, window_keys - 1)`)
+    /// at the end.
+    fixed: Option<Tensor>,
 }
 
 impl MingWindowState {
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// The fixed-shape path's keys and values for the next chunk, taken out
+    /// (fresh zeros from `stack` before the first).
+    pub(crate) fn take_fixed(&mut self, stack: &MingWindowStack) -> Result<Tensor> {
+        match self.fixed.take() {
+            Some(kept) => Ok(kept),
+            None => stack.fixed_empty(),
+        }
+    }
+
+    /// A fixed-shape chunk of `count` positions ran and keeps `kept`.
+    pub(crate) fn advance_fixed(&mut self, count: usize, kept: Tensor) {
+        self.position += count;
+        self.fixed = Some(kept);
     }
 }
 
@@ -740,8 +760,6 @@ impl MingWindowStack {
             .as_ref()
             .map_or(0, |(k, _)| k.dim(0).unwrap_or(0));
         let mask = self.window_mask(kept, count)?;
-        let groups = cfg.num_attention_heads / cfg.num_key_value_heads;
-        let scale = 1.0 / (cfg.head_dim as f64).sqrt();
         let mut hidden = x.to_dtype(DType::F32)?;
         for (layer, slot) in self.layers.iter().zip(state.kept.iter_mut()) {
             let (q, k, v) = layer.qkv(&hidden, &cos, &sin, cfg, false)?;
@@ -753,23 +771,7 @@ impl MingWindowStack {
                 None => (k, v),
             };
             let span = keys.dim(0)?;
-            // q [kv, groups, count, dim] against k, v [kv, 1, span, dim]:
-            // query head h reads KV head h / groups.
-            let q = q
-                .reshape((count, cfg.num_key_value_heads, groups, cfg.head_dim))?
-                .permute((1, 2, 0, 3))?
-                .contiguous()?;
-            let k = keys.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
-            let v = values.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
-            let scores = (q.broadcast_matmul(&k.transpose(2, 3)?)? * scale)?
-                .to_dtype(DType::F32)?
-                .broadcast_add(&mask)?;
-            let weights = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(self.dtype)?;
-            let attn = weights
-                .broadcast_matmul(&v)?
-                .permute((2, 0, 1, 3))?
-                .contiguous()?
-                .reshape((count, cfg.q_out()))?;
+            let attn = self.window_attention(&q, &keys, &values, &mask)?;
             hidden = layer.finish(&hidden, &attn, cfg, false)?;
             // Later positions see at most `window_keys - 1` of these.
             let keep = span.min(self.window_keys - 1);
@@ -780,6 +782,151 @@ impl MingWindowStack {
         }
         state.position = start + count;
         norm_f32(&hidden, &self.norm, cfg.rms_norm_eps)
+    }
+
+    /// Attention of `q` [count, heads, dim] over `keys` and `values` [span,
+    /// kv_heads, dim] under the additive `mask` [count, span] (F32):
+    /// [count, q_out] in the stack's dtype.
+    fn window_attention(
+        &self,
+        q: &Tensor,
+        keys: &Tensor,
+        values: &Tensor,
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let cfg = &self.cfg;
+        let count = q.dim(0)?;
+        let groups = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let scale = 1.0 / (cfg.head_dim as f64).sqrt();
+        // q [kv, groups, count, dim] against k, v [kv, 1, span, dim]:
+        // query head h reads KV head h / groups.
+        let q = q
+            .reshape((count, cfg.num_key_value_heads, groups, cfg.head_dim))?
+            .permute((1, 2, 0, 3))?
+            .contiguous()?;
+        let k = keys.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
+        let v = values.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
+        let scores = (q.broadcast_matmul(&k.transpose(2, 3)?)? * scale)?
+            .to_dtype(DType::F32)?
+            .broadcast_add(mask)?;
+        let weights = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(self.dtype)?;
+        Ok(weights
+            .broadcast_matmul(&v)?
+            .permute((2, 0, 1, 3))?
+            .contiguous()?
+            .reshape((count, cfg.q_out()))?)
+    }
+
+    /// Keys each layer keeps between fixed-shape chunks: all a later
+    /// position can still see.
+    pub(crate) fn fixed_kept(&self) -> usize {
+        self.window_keys - 1
+    }
+
+    /// Columns of [`Self::fixed_tables`] for `queries` query slots: cos,
+    /// sin, then the mask over the kept keys and the slots.
+    pub(crate) fn fixed_table_width(&self, queries: usize) -> usize {
+        self.cfg.head_dim + self.fixed_kept() + queries
+    }
+
+    /// The host-built inputs of a fixed-shape chunk ([`Self::fixed_forward`])
+    /// of `count` positions from `start` in `queries` slots, [queries,
+    /// [`Self::fixed_table_width`]] row-major F32: each slot's RoPE cos and
+    /// sin (zeros past `count`), then its additive mask over the keys
+    /// [kept | slots]. Key `j` holds position `start - kept + j`, so slot `s`
+    /// sees keys `s..=kept + s` (its window) that hold a position (the last
+    /// `min(start, kept)` kept ones, and the slots up to its own). A padding
+    /// slot sees only itself, so its softmax stays finite; no real slot sees
+    /// a padding slot, which comes after it.
+    pub(crate) fn fixed_tables(&self, start: usize, count: usize, queries: usize) -> Vec<f32> {
+        let pairs = self.cfg.head_dim / 2;
+        let kept = self.fixed_kept();
+        let span = kept + queries;
+        let width = self.fixed_table_width(queries);
+        let (cos, sin) = self.freqs.cos_sin_table(start, count);
+        let held = start.min(kept);
+        let mut table = vec![0f32; queries * width];
+        for (slot, row) in table.chunks_exact_mut(width).enumerate() {
+            let (rope, mask) = row.split_at_mut(2 * pairs);
+            mask[..span].fill(f32::NEG_INFINITY);
+            if slot < count {
+                rope[..pairs].copy_from_slice(&cos[slot * pairs..(slot + 1) * pairs]);
+                rope[pairs..].copy_from_slice(&sin[slot * pairs..(slot + 1) * pairs]);
+                mask[slot.max(kept - held)..=kept + slot].fill(0.0);
+            } else {
+                mask[kept + slot] = 0.0;
+            }
+        }
+        table
+    }
+
+    /// One chunk of `state`'s sequence at a fixed shape, whatever its length
+    /// and position: the CUDA VAE decoder's form, which one CUDA graph runs.
+    /// `x` [queries, hidden] holds the chunk's positions then zero padding;
+    /// `tables` is [`Self::fixed_tables`] on the device; `gather` [kept]
+    /// U32 picks the keys the next chunk keeps (`count..count + kept`);
+    /// `kept` is the state's fixed keys and values. Returns the final-norm
+    /// hidden states [queries, hidden] (the padding rows are not meaningful)
+    /// and the keys and values to keep. A row's bits depend only on its own
+    /// sequence, never on what shares a dispatch.
+    pub(crate) fn fixed_forward(
+        &self,
+        x: &Tensor,
+        tables: &Tensor,
+        gather: &Tensor,
+        kept: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let cfg = &self.cfg;
+        let queries = x.dim(0)?;
+        let pairs = cfg.head_dim / 2;
+        let span = self.fixed_kept() + queries;
+        let cos = tables
+            .narrow(1, 0, pairs)?
+            .contiguous()?
+            .to_dtype(self.dtype)?;
+        let sin = tables
+            .narrow(1, pairs, pairs)?
+            .contiguous()?
+            .to_dtype(self.dtype)?;
+        let mask = tables.narrow(1, 2 * pairs, span)?.contiguous()?;
+        let mut hidden = x.to_dtype(DType::F32)?;
+        let mut keep = Vec::with_capacity(self.layers.len());
+        for (index, layer) in self.layers.iter().enumerate() {
+            let (q, k, v) = layer.qkv(&hidden, &cos, &sin, cfg, false)?;
+            let held = kept.get(index)?;
+            let keys = Tensor::cat(&[&held.get(0)?, &k], 0)?;
+            let values = Tensor::cat(&[&held.get(1)?, &v], 0)?;
+            let attn = self.window_attention(&q, &keys, &values, &mask)?;
+            hidden = layer.finish(&hidden, &attn, cfg, false)?;
+            keep.push(Tensor::stack(
+                &[
+                    keys.index_select(gather, 0)?,
+                    values.index_select(gather, 0)?,
+                ],
+                0,
+            )?);
+        }
+        Ok((
+            norm_f32(&hidden, &self.norm, cfg.rms_norm_eps)?,
+            Tensor::stack(&keep, 0)?,
+        ))
+    }
+
+    /// Fresh fixed keys and values for a sequence's first chunk (zeros, all
+    /// masked).
+    pub(crate) fn fixed_empty(&self) -> Result<Tensor> {
+        let cfg = &self.cfg;
+        Ok(Tensor::zeros(
+            (
+                self.layers.len(),
+                2,
+                self.fixed_kept(),
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            ),
+            self.dtype,
+            &self.device,
+        )?)
     }
 
     /// [`Self::forward`] of one chunk from position 0, reporting for each

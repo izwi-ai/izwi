@@ -67,7 +67,7 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::noise::SplitMix64;
 use config::{STOP_THRESHOLD, TOKENIZER_FILE};
 use flow::{MingAggregator, MingFlowHead};
-pub(crate) use graphs::ming_tts_flow_graph_device_bytes;
+pub(crate) use graphs::ming_tts_graph_device_bytes;
 use graphs::{MingFlowGraphs, MingGraphKey};
 use prompt::MingTokenizer;
 use speaker::{sinc_resample, CampPlus, SPEAKER_EMBEDDING_DIM};
@@ -429,11 +429,16 @@ impl MingRuntime {
         })
     }
 
-    /// On CUDA, the flow path's graphs ([`graphs`]): resolved once the
-    /// load's range probe has passed, and checked through capture and
-    /// verification on xorshift inputs before the model serves. A failure
-    /// leaves the flow path eager, with the reason in the diagnostics.
-    pub(crate) fn resolve_flow_graphs(&mut self) {
+    /// On CUDA, the flow path's and the VAE window's graphs ([`graphs`]):
+    /// resolved once the load's range probe has passed, and checked through
+    /// capture and verification on xorshift inputs before the model serves.
+    /// A failure leaves that part eager, with the reason in the diagnostics.
+    pub(crate) fn resolve_graphs(&mut self) {
+        self.resolve_flow_graphs();
+        self.decoder.resolve_graphs();
+    }
+
+    fn resolve_flow_graphs(&mut self) {
         let mut graphs = MingFlowGraphs::resolve(&self.device);
         if graphs.is_on() {
             match self.self_check_flow_graphs(&graphs) {
@@ -527,6 +532,11 @@ impl MingRuntime {
     /// counters.
     pub fn decode_graphs_diagnostics(&self) -> serde_json::Value {
         self.trunk.decode_graphs_diagnostics()
+    }
+
+    /// The VAE window's CUDA graph: its state and counters.
+    pub fn vae_graphs_diagnostics(&self) -> serde_json::Value {
+        self.decoder.graphs_diagnostics()
     }
 
     pub fn model_dir(&self) -> &Path {

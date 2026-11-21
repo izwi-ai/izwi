@@ -52,8 +52,8 @@ use crate::models::architectures::maya2::{
     maya2_mimi_bf16_device_bytes, maya2_reloads_in_f32,
 };
 use crate::models::architectures::ming_tts::{
-    ming_tts_flow_graph_device_bytes,     ming_lm_precision, ming_reloads_in_f32, unused_tensors as ming_unused_tensors, MingPrecision,
-    MingTtsConfig,
+    ming_lm_precision, ming_reloads_in_f32, ming_tts_graph_device_bytes,
+    unused_tensors as ming_unused_tensors, MingPrecision, MingTtsConfig,
     WEIGHTS_FILE as MING_TTS_WEIGHTS_FILE,
 };
 use crate::models::architectures::qwen3::core::qwen3_dense_projection_fusion_enabled;
@@ -557,8 +557,9 @@ fn ming_tts_plan(
         .map(|(name, _)| name)
         .collect::<Vec<_>>();
     let dtype = ming_lm_precision(device).dtype;
-    // The flow path's CUDA graphs allocate at the load's self-check.
-    let graphs = ming_tts_flow_graph_device_bytes(backend);
+    // The flow path's and VAE window's CUDA graphs allocate at the load's
+    // self-checks.
+    let graphs = ming_tts_graph_device_bytes(backend);
     let plan = price_ming_tts(
         &files,
         backend,

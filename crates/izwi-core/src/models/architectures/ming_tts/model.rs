@@ -59,6 +59,8 @@ pub struct MingTtsDiagnostics {
     pub flow_graphs: serde_json::Value,
     /// The language model's decode-step CUDA graphs, likewise.
     pub decode_graphs: serde_json::Value,
+    /// The VAE window's CUDA graph, likewise.
+    pub vae_graphs: serde_json::Value,
     /// Each precision the load refused before the kept one, and why: a
     /// device that should run BF16 (CUDA) or F16 (Metal) but lists one here
     /// runs slower than it should.
@@ -130,7 +132,7 @@ impl MingTtsModel {
             device.device.synchronize()?;
         }
         let (mut runtime, precision, report) = loaded.expect("the ladder ends in F32");
-        runtime.resolve_flow_graphs();
+        runtime.resolve_graphs();
         tracing::info!(
             "Ming TTS on {:?}: language model {:?}, flow path {:?}, VAE {:?} ({}; {}); {} keys per VAE frame",
             BackendKind::from(device.kind),
@@ -188,6 +190,7 @@ impl MingTtsModel {
             voice_cloning: self.runtime.can_clone_voices(),
             flow_graphs: self.runtime.flow_graphs_diagnostics(),
             decode_graphs: self.runtime.decode_graphs_diagnostics(),
+            vae_graphs: self.runtime.vae_graphs_diagnostics(),
             precision_fallbacks: self.precision_fallbacks.clone(),
         }
     }
