@@ -11,7 +11,7 @@
 //!   `[2 * width, hidden]` with the gate in its first `width` rows and the
 //!   up projection in its last; `down_proj[e]` is `[hidden, width]`.
 //!
-//! Three paths compute the experts, with the same arithmetic:
+//! Four paths compute the experts, with the same arithmetic:
 //!
 //! * **Host-routed** (the reference): the router's probabilities are read to
 //!   the host once per layer and each selected expert runs as two matmuls
@@ -23,6 +23,14 @@
 //!   tokens, so it costs what the host path reads without the readback, and
 //!   a row's result does not depend on the batch. It serves decode steps
 //!   (up to [`FUSED_MAX_PAIRS`] routed pairs) on CUDA.
+//! * **Grouped** ([`SovFeedForward::sparse_grouped`]): device routing read
+//!   back once, each expert's tokens laid out in a padded `[experts, rows,
+//!   hidden]` block, and every expert run as one batched matmul over its
+//!   resident weights (two GEMMs and the scatter back: about a dozen launches
+//!   a layer). It serves prefill spans on CUDA, where the host path's
+//!   per-expert loop cost about 1,800 launches a layer (233 ms for a
+//!   512-token span on the H100) and the fused kernels' warp-per-channel
+//!   dots cannot use tensor cores.
 //! * **Gathered** ([`SovFeedForward::sparse_device`]): device routing from
 //!   composed tensor operations, each choice's expert rows gathered into one
 //!   batched matmul. Portable but it copies the weights; kept for
@@ -40,17 +48,17 @@ use super::norm::RmsNorm;
 use crate::error::Result;
 use crate::models::shared::moe::{ExpertSet, SparseMoeConfig, SparseMoeDispatcher};
 
-/// `IZWI_SOV_TRANSCRIBE_MOE_BACKEND`: `auto` (the default: fused on CUDA
-/// for calls of at most [`FUSED_MAX_PAIRS`] routed pairs, host-routed
-/// otherwise), `fused` (the fused kernels for every call; their CPU
-/// reference off CUDA), `host` (always host-routed) or `device` (always
-/// gathered).
+/// `IZWI_SOV_TRANSCRIBE_MOE_BACKEND`: `auto` (the default: on CUDA fused
+/// for calls of at most [`FUSED_MAX_PAIRS`] routed pairs and grouped above;
+/// host-routed off CUDA), `fused` (the fused kernels for every call; their
+/// CPU reference off CUDA), `grouped` (always grouped), `host` (always
+/// host-routed) or `device` (always gathered).
 pub const MOE_BACKEND_ENV: &str = "IZWI_SOV_TRANSCRIBE_MOE_BACKEND";
 
 /// The most routed pairs (tokens times 8) a fused call takes under `auto`:
 /// every decode width up to 64 rows. Longer prefill spans run each expert's
-/// tokens as one GEMM on the host-routed path, which the per-channel warp
-/// kernels cannot match once an expert has many tokens.
+/// tokens as GEMMs on the grouped path, which the per-channel warp kernels
+/// cannot match once an expert has many tokens.
 pub const FUSED_MAX_PAIRS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +67,7 @@ pub enum MoeBackend {
     Host,
     Device,
     Fused,
+    Grouped,
 }
 
 /// The expert path one call takes.
@@ -67,6 +76,7 @@ pub enum ExpertPath {
     Host,
     Gathered,
     Fused,
+    Grouped,
 }
 
 impl MoeBackend {
@@ -76,8 +86,9 @@ impl MoeBackend {
             "host" | "legacy" => Ok(Self::Host),
             "device" | "gathered" => Ok(Self::Device),
             "fused" => Ok(Self::Fused),
+            "grouped" => Ok(Self::Grouped),
             other => Err(crate::error::Error::InvalidInput(format!(
-                "{MOE_BACKEND_ENV}={other:?}: expected auto, fused, host or device"
+                "{MOE_BACKEND_ENV}={other:?}: expected auto, fused, grouped, host or device"
             ))),
         }
     }
@@ -95,6 +106,7 @@ impl MoeBackend {
             Self::Host => "host",
             Self::Device => "device",
             Self::Fused => "fused",
+            Self::Grouped => "grouped",
         }
     }
 
@@ -104,9 +116,11 @@ impl MoeBackend {
             Self::Host => ExpertPath::Host,
             Self::Device => ExpertPath::Gathered,
             Self::Fused => ExpertPath::Fused,
+            Self::Grouped => ExpertPath::Grouped,
             Self::Auto if device.is_cuda() && tokens * top_k <= FUSED_MAX_PAIRS => {
                 ExpertPath::Fused
             }
+            Self::Auto if device.is_cuda() => ExpertPath::Grouped,
             Self::Auto => ExpertPath::Host,
         }
     }
@@ -114,7 +128,10 @@ impl MoeBackend {
     /// Whether a call of `tokens` tokens on `device` keeps routing on the
     /// device (no host readback): what a CUDA graph of the step needs.
     pub fn routes_on_device(self, device: &Device, tokens: usize, top_k: usize) -> bool {
-        self.path(device, tokens, top_k) != ExpertPath::Host
+        matches!(
+            self.path(device, tokens, top_k),
+            ExpertPath::Gathered | ExpertPath::Fused
+        )
     }
 }
 
@@ -310,7 +327,66 @@ impl SovFeedForward {
             ExpertPath::Host => self.sparse(h, normed),
             ExpertPath::Gathered => self.sparse_device(h, normed),
             ExpertPath::Fused => self.sparse_fused(h, normed),
+            ExpertPath::Grouped => self.sparse_grouped(h, normed),
         }
+    }
+
+    /// [`Self::sparse`] as two batched matmuls over every expert's resident
+    /// weights: the routing (renormalized, `per_expert_scale` applied) is
+    /// read back once, each expert's tokens are gathered into a block padded
+    /// to the busiest expert's count, and each block row's output is scaled
+    /// by its weight and added back to its token (padding rows weigh zero).
+    /// A call whose padding would pass four times its routed pairs (most
+    /// tokens on a few experts) takes the host path instead.
+    pub fn sparse_grouped(&self, h: &Tensor, normed: &Tensor) -> Result<Tensor> {
+        let (tokens, hidden) = normed.dims2()?;
+        let k = self.top_k;
+        let experts = self.experts.per_expert_scale.len();
+        let routing =
+            crate::kernels::moe_gelu::route(&self.router.logits(h)?, &self.per_expert_scale, k)?
+                .to_device(&Device::Cpu)?
+                .to_vec2::<f32>()?;
+        let mut by_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); experts];
+        for (token, row) in routing.iter().enumerate() {
+            for slot in 0..k {
+                let id = row[slot];
+                if id >= 0.0 && (id as usize) < experts {
+                    by_expert[id as usize].push((token as u32, row[k + slot]));
+                }
+            }
+        }
+        let rows = by_expert.iter().map(Vec::len).max().unwrap_or(0);
+        if rows == 0 {
+            return Ok(normed.zeros_like()?);
+        }
+        if experts * rows > 4 * tokens * k {
+            return self.sparse(h, normed);
+        }
+        let mut ids = vec![0u32; experts * rows];
+        let mut weights = vec![0f32; experts * rows];
+        for (expert, choices) in by_expert.iter().enumerate() {
+            for (slot, &(token, weight)) in choices.iter().enumerate() {
+                ids[expert * rows + slot] = token;
+                weights[expert * rows + slot] = weight;
+            }
+        }
+        let device = normed.device();
+        let e = &self.experts;
+        let ids = Tensor::from_vec(ids, experts * rows, device)?;
+        let x = normed
+            .index_select(&ids, 0)?
+            .reshape((experts, rows, hidden))?;
+        let gate_up = x.matmul(&e.gate_up.transpose(1, 2)?)?;
+        let gate = gate_up.narrow(2, 0, e.width)?.gelu()?;
+        let up = gate_up.narrow(2, e.width, e.width)?;
+        let out = (gate * up)?
+            .matmul(&e.down.transpose(1, 2)?)?
+            .reshape((experts * rows, hidden))?;
+        let weights =
+            Tensor::from_vec(weights, (experts * rows, 1), device)?.to_dtype(out.dtype())?;
+        Ok(normed
+            .zeros_like()?
+            .index_add(&ids, &out.broadcast_mul(&weights)?, 0)?)
     }
 
     /// [`Self::sparse`] through `kernels::moe_gelu`: routing and experts on

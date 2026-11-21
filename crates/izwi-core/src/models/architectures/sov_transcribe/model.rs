@@ -474,6 +474,7 @@ impl SovTranscribeModel {
             MoeBackend::Host => None,
             MoeBackend::Device => Some(ExpertPath::Gathered),
             MoeBackend::Fused => Some(ExpertPath::Fused),
+            MoeBackend::Grouped => Some(ExpertPath::Grouped),
             MoeBackend::Auto if device.is_cuda() => Some(ExpertPath::Fused),
             MoeBackend::Auto => None,
         };
@@ -486,7 +487,12 @@ impl SovTranscribeModel {
                 None
             }
             Some(path) => {
-                let error = decoder.check_expert_path(path, 4)?;
+                let mut error = decoder.check_expert_path(path, 4)?;
+                // `auto` on CUDA also serves prefill spans grouped: that path
+                // must agree too.
+                if decoder.moe_backend() == MoeBackend::Auto {
+                    error = error.max(decoder.check_expert_path(ExpertPath::Grouped, 64)?);
+                }
                 if error.is_nan() || error > MOE_CHECK_LIMIT {
                     tracing::warn!(
                         "SOV-Transcribe: the {path:?} experts deviate from the host-routed reference by {error:.3e}; routing on the host"
