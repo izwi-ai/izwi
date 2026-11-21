@@ -34,6 +34,9 @@ pub struct MingTtsModel {
     /// (digest of the clip and its transcript, the encoded voice), most
     /// recently used last.
     references: Mutex<Vec<([u8; 32], Arc<MingReferenceVoice>)>>,
+    /// Each precision the load tried before the one it kept, and why it was
+    /// refused (empty when the device's precision passed its probe).
+    precision_fallbacks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +59,10 @@ pub struct MingTtsDiagnostics {
     pub flow_graphs: serde_json::Value,
     /// The language model's decode-step CUDA graphs, likewise.
     pub decode_graphs: serde_json::Value,
+    /// Each precision the load refused before the kept one, and why: a
+    /// device that should run BF16 (CUDA) or F16 (Metal) but lists one here
+    /// runs slower than it should.
+    pub precision_fallbacks: Vec<String>,
 }
 
 /// What one audio-window quantum did.
@@ -96,6 +103,7 @@ impl MingTtsModel {
         let ladder = MingPrecision::ladder(selection.dtype);
         let last = ladder.len() - 1;
         let mut loaded = None;
+        let mut precision_fallbacks = Vec::new();
         for (step, precision) in ladder.into_iter().enumerate() {
             let runtime = MingRuntime::load(model_dir, &device.device, precision)?;
             if step == last {
@@ -113,6 +121,10 @@ impl MingTtsModel {
                 BackendKind::from(device.kind),
                 report.reason
             );
+            precision_fallbacks.push(format!(
+                "lm {:?}, flow {:?}: {}",
+                precision.lm, precision.flow, report.reason
+            ));
             // Free this attempt's weights before loading the next.
             drop(runtime);
             device.device.synchronize()?;
@@ -134,6 +146,7 @@ impl MingTtsModel {
             variant,
             runtime,
             references: Mutex::new(Vec::new()),
+            precision_fallbacks,
         })
     }
 
@@ -175,6 +188,7 @@ impl MingTtsModel {
             voice_cloning: self.runtime.can_clone_voices(),
             flow_graphs: self.runtime.flow_graphs_diagnostics(),
             decode_graphs: self.runtime.decode_graphs_diagnostics(),
+            precision_fallbacks: self.precision_fallbacks.clone(),
         }
     }
 

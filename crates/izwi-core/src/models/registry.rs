@@ -8687,15 +8687,22 @@ impl ModelRegistry {
             let guard = self.ming_tts_models.read().await;
             for (variant, entry) in guard.iter() {
                 if let Some(model) = entry.ready_model() {
+                    let model_diagnostics = model.diagnostics();
+                    let device_kind = format!("{:?}", self.device.kind);
                     diagnostics.push(loaded_model_diagnostics_entry(
                         &self.device,
                         *variant,
                         "ming_tts",
                         "ming_tts",
-                        LoadedModelActualRuntime::default(),
+                        // The language model's dtype: what the device runs
+                        // after the load's precision probe.
+                        LoadedModelActualRuntime::from_values(
+                            Some(&device_kind),
+                            Some(&model_diagnostics.dtype),
+                        ),
                         None,
                         None,
-                        serde_json::to_value(model.diagnostics()).ok(),
+                        serde_json::to_value(model_diagnostics).ok(),
                     ));
                 }
             }
