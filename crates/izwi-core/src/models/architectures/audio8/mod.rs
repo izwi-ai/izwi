@@ -517,7 +517,10 @@ impl Audio8NativeRuntime {
         // A fast frame's input is the slow transformer's hidden state.
         fast.resolve_graphs(precision.loaded);
         let codec_weights = codec.load_weights(&device, DType::F32)?;
-        let dac = Audio8DacDecoder::load(Audio8DacConfig::current(), codec_weights.var_builder())?;
+        let mut dac =
+            Audio8DacDecoder::load(Audio8DacConfig::current(), codec_weights.var_builder())?;
+        // Fixed-slot, row-invariant codec calls on CUDA.
+        dac.resolve_codec_calls()?;
         let semantic_allowed_mask = slow.semantic_allowed_mask(eos)?;
 
         Ok(Self {

@@ -17,7 +17,7 @@ use crate::models::architectures::audio8::tokenizer::Audio8VqCodes;
 
 #[path = "dac_streaming.rs"]
 mod streaming;
-pub(crate) use streaming::Audio8DacStreamState;
+pub(crate) use streaming::{Audio8CodecCalls, Audio8DacStreamState};
 
 pub(crate) const ATTENTION_QUERY_BLOCK: usize = 64;
 
@@ -59,6 +59,9 @@ pub struct Audio8DacDecoder {
     encoder: Audio8DacAudioEncoder,
     quantizer: Audio8DownsampleResidualVectorQuantizer,
     decoder: Audio8DacAudioDecoder,
+    /// Fixed-slot, row-invariant streaming calls (CUDA, set at load by
+    /// [`Self::resolve_codec_calls`]); `None` keeps the age-bucketed path.
+    calls: Option<Audio8CodecCalls>,
 }
 
 struct Audio8DownsampleResidualVectorQuantizer {
@@ -391,6 +394,7 @@ impl Audio8DacDecoder {
             encoder,
             quantizer,
             decoder,
+            calls: None,
         })
     }
 
