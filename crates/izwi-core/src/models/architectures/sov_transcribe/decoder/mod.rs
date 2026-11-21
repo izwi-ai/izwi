@@ -375,10 +375,12 @@ impl SovDecoder {
             .collect::<candle_core::Result<Vec<_>>>()?;
         let mut x = Tensor::cat(&embeds, 0)?;
         let rope = self.step_rope(positions)?;
+        let mut profile = PrefillProfile::start(&self.device)?;
         for (index, layer) in self.layers.iter().enumerate() {
             let h = layer.input_norm.forward(&x)?;
             let (cos, sin) = rope.of(&layer.attention);
             let (q, k, v) = layer.attention.project(&h, cos, sin)?;
+            profile.mark(&self.device, PrefillPhase::Projections)?;
             let mut attended = Vec::with_capacity(rows.len());
             let mut offset = 0;
             for (r, row) in rows.iter().enumerate() {
@@ -394,6 +396,7 @@ impl SovDecoder {
                 )?);
                 offset += len;
             }
+            profile.mark(&self.device, PrefillPhase::Attention)?;
             let attended = layer.attention.output(&Tensor::cat(&attended, 0)?)?;
             // The residual add and the dense branch's norm in one launch.
             let (sum, dense_in) = layer
@@ -403,6 +406,7 @@ impl SovDecoder {
 
             let ff = &layer.feed_forward;
             let dense = layer.post_ff_norm_1.forward(&ff.dense(&dense_in)?)?;
+            profile.mark(&self.device, PrefillPhase::Dense)?;
             if let Some((request, trace)) = trace.as_mut() {
                 if request.routes {
                     trace.routes.push(ff.routes(&x)?);
@@ -415,6 +419,7 @@ impl SovDecoder {
             )?)?;
             let (_, m) = layer.post_ff_norm.add_forward(&dense, &sparse)?;
             x = (x + m)?.broadcast_mul(&layer.scalar)?;
+            profile.mark(&self.device, PrefillPhase::Experts)?;
             if let Some((request, trace)) = trace.as_mut() {
                 if request.hidden_after_layers.contains(&index) {
                     trace.hidden.push((index, host_values(&x)?));
@@ -427,6 +432,7 @@ impl SovDecoder {
             last.push(x.narrow(0, offset + len - 1, 1)?);
             offset += len;
         }
+        profile.finish_named("prefill", rows.len(), lengths.iter().sum());
         self.final_norm.forward_f32(&Tensor::cat(&last, 0)?)
     }
 
@@ -518,7 +524,9 @@ impl SovDecoder {
         };
         let mut inputs = vec![x.clone()];
         inputs.extend(rope.iter().cloned());
+        let mut profile = PrefillProfile::start(&self.device)?;
         let mut qkv = stretch(0, inputs, &first)?;
+        profile.mark(&self.device, PrefillPhase::Projections)?;
         let last = self.layers.len() - 1;
         for index in 0..self.layers.len() {
             let attention = &self.layers[index].attention;
@@ -536,12 +544,16 @@ impl SovDecoder {
                 )?);
             }
             let attended = Tensor::cat(&attended, 0)?;
+            profile.mark(&self.device, PrefillPhase::Attention)?;
             if index == last {
                 let tail = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
                     let x = self.post_attention(index, &inputs[0], &inputs[1])?;
                     Ok(vec![self.final_norm.forward_f32(&x)?])
                 };
-                return Ok(stretch(index + 1, vec![x, attended], &tail)?.remove(0));
+                let out = stretch(index + 1, vec![x, attended], &tail)?.remove(0);
+                profile.mark(&self.device, PrefillPhase::Experts)?;
+                profile.finish_named("decode", count, count);
+                return Ok(out);
             }
             let between = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
                 let x = self.post_attention(index, &inputs[0], &inputs[1])?;
@@ -551,6 +563,7 @@ impl SovDecoder {
             let mut inputs = vec![x, attended];
             inputs.extend(rope.iter().cloned());
             let mut outputs = stretch(index + 1, inputs, &between)?;
+            profile.mark(&self.device, PrefillPhase::Experts)?;
             x = outputs.remove(0);
             qkv = outputs;
         }
@@ -645,5 +658,82 @@ impl SovDecoder {
     /// the reference formulas, for the routing test.
     pub(crate) fn feed_forward(&self, layer: usize) -> &SovFeedForward {
         &self.layers[layer].feed_forward
+    }
+}
+
+/// `IZWI_SOV_TRANSCRIBE_PROFILE`: when set (`1`, `on`, `true`), every packed
+/// prefill synchronizes the device around its phases and logs where its
+/// time went. A diagnostic: the synchronizations slow serving.
+pub const PROFILE_ENV: &str = "IZWI_SOV_TRANSCRIBE_PROFILE";
+
+fn profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env::flag_or(PROFILE_ENV, false))
+}
+
+#[derive(Clone, Copy)]
+enum PrefillPhase {
+    Projections,
+    Attention,
+    Dense,
+    Experts,
+}
+
+/// Device-synchronized wall time per prefill phase, summed over layers.
+struct PrefillProfile {
+    last: Option<std::time::Instant>,
+    started: Option<std::time::Instant>,
+    seconds: [f64; 4],
+}
+
+impl PrefillProfile {
+    fn start(device: &candle_core::Device) -> Result<Self> {
+        if !profiling() {
+            return Ok(Self {
+                last: None,
+                started: None,
+                seconds: [0.0; 4],
+            });
+        }
+        device.synchronize()?;
+        let now = std::time::Instant::now();
+        Ok(Self {
+            last: Some(now),
+            started: Some(now),
+            seconds: [0.0; 4],
+        })
+    }
+
+    fn mark(&mut self, device: &candle_core::Device, phase: PrefillPhase) -> Result<()> {
+        let Some(last) = self.last else {
+            return Ok(());
+        };
+        device.synchronize()?;
+        let now = std::time::Instant::now();
+        self.seconds[phase as usize] += (now - last).as_secs_f64();
+        self.last = Some(now);
+        Ok(())
+    }
+
+    /// Logs the phases. In a decode step the dense and expert work runs
+    /// inside the graphed stretches, so "experts" there is each stretch
+    /// (dense, experts, norms and the next layer's projections) and
+    /// "projections" the first layer's.
+    fn finish_named(&self, kind: &'static str, rows: usize, tokens: usize) {
+        let Some(started) = self.started else {
+            return;
+        };
+        let ms = |s: f64| (s * 1e4).round() / 10.0;
+        tracing::info!(
+            rows,
+            tokens,
+            total_ms = ms(started.elapsed().as_secs_f64()),
+            projections_ms = ms(self.seconds[0]),
+            attention_ms = ms(self.seconds[1]),
+            dense_ms = ms(self.seconds[2]),
+            experts_ms = ms(self.seconds[3]),
+            kind,
+            "SOV-Transcribe profile"
+        );
     }
 }
