@@ -61,6 +61,11 @@ pub const MOE_BACKEND_ENV: &str = "IZWI_SOV_TRANSCRIBE_MOE_BACKEND";
 /// cannot match once an expert has many tokens.
 pub const FUSED_MAX_PAIRS: usize = 512;
 
+/// The most tokens one grouped call pads its experts' blocks over: with 128
+/// experts of the published geometry, the padded input, activations and
+/// output stay under about 1 GiB of BF16.
+pub const GROUPED_CHUNK_TOKENS: usize = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoeBackend {
     Auto,
@@ -336,10 +341,32 @@ impl SovFeedForward {
     /// read back once, each expert's tokens are gathered into a block padded
     /// to the busiest expert's count, and each block row's output is scaled
     /// by its weight and added back to its token (padding rows weigh zero).
-    /// A call whose padding would pass four times its routed pairs (most
-    /// tokens on a few experts) takes the host path instead.
+    /// Calls of more than [`GROUPED_CHUNK_TOKENS`] tokens run in chunks of
+    /// that many, which bounds the padded blocks however skewed the routing:
+    /// on tensor cores even every expert padded to the whole chunk costs
+    /// about 2 ms a layer, where the host path's per-expert loop cost 9.
     pub fn sparse_grouped(&self, h: &Tensor, normed: &Tensor) -> Result<Tensor> {
-        let (tokens, hidden) = normed.dims2()?;
+        let tokens = normed.dim(0)?;
+        if tokens <= GROUPED_CHUNK_TOKENS {
+            return self.sparse_grouped_chunk(h, normed);
+        }
+        let mut outputs = Vec::with_capacity(tokens.div_ceil(GROUPED_CHUNK_TOKENS));
+        let mut start = 0;
+        while start < tokens {
+            let len = GROUPED_CHUNK_TOKENS.min(tokens - start);
+            outputs.push(
+                self.sparse_grouped_chunk(
+                    &h.narrow(0, start, len)?,
+                    &normed.narrow(0, start, len)?,
+                )?,
+            );
+            start += len;
+        }
+        Ok(Tensor::cat(&outputs, 0)?)
+    }
+
+    fn sparse_grouped_chunk(&self, h: &Tensor, normed: &Tensor) -> Result<Tensor> {
+        let hidden = normed.dim(1)?;
         let k = self.top_k;
         let experts = self.experts.per_expert_scale.len();
         let routing =
@@ -358,9 +385,6 @@ impl SovFeedForward {
         let rows = by_expert.iter().map(Vec::len).max().unwrap_or(0);
         if rows == 0 {
             return Ok(normed.zeros_like()?);
-        }
-        if experts * rows > 4 * tokens * k {
-            return self.sparse(h, normed);
         }
         let mut ids = vec![0u32; experts * rows];
         let mut weights = vec![0f32; experts * rows];
