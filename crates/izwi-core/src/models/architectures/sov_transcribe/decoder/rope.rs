@@ -77,6 +77,22 @@ impl Rope {
 /// Rotates `x [positions, heads, head_dim]` by `(cos, sin)`
 /// `[positions, 1, head_dim / 2]` (`rotate_half`).
 pub fn apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    // On CUDA Candle's fused half-split rotation over the positions as one
+    // sequence: one launch where the ops below take six strided ones and a
+    // concat, each uploading its strides. Each value is rotated in F32 and
+    // rounded once.
+    if x.device().is_cuda() && cos.dtype() == x.dtype() {
+        let positions = x.dim(0)?;
+        let (cos, sin) = (cos.squeeze(1)?.contiguous()?, sin.squeeze(1)?.contiguous()?);
+        if cos.dims() == [positions, x.dim(2)? / 2] {
+            return Ok(candle_nn::rotary_emb::rope_thd(
+                &x.unsqueeze(0)?.contiguous()?,
+                &cos,
+                &sin,
+            )?
+            .squeeze(0)?);
+        }
+    }
     let half = cos.dim(2)?;
     let first = x.narrow(2, 0, half)?;
     let second = x.narrow(2, half, half)?;
@@ -173,6 +189,47 @@ mod tests {
         assert!((out[4] - (values[4] * c + values[0] * s)).abs() < 1e-6);
         for channel in [1, 2, 3, 5, 6, 7] {
             assert_eq!(out[channel], values[channel]);
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fused_rotation_matches_the_eager_rotation() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let values =
+            |len: usize, seed: u64| crate::kernels::numeric_check::xorshift_values(len, seed, 1.0);
+        let (n, heads, dim) = (5, 3, 16);
+        let x =
+            Tensor::from_vec(values(n * heads * dim, 1), (n, heads, dim), &Device::Cpu).unwrap();
+        let angles = values(n * dim / 2, 2);
+        let table = |f: fn(f32) -> f32| {
+            Tensor::from_vec(
+                angles.iter().map(|a| f(*a)).collect::<Vec<_>>(),
+                (n, 1, dim / 2),
+                &Device::Cpu,
+            )
+            .unwrap()
+        };
+        let (cos, sin) = (table(f32::cos), table(f32::sin));
+        let want = apply(&x, &cos, &sin)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let on = |t: &Tensor| t.to_device(&device).unwrap();
+        let got = apply(&on(&x), &on(&cos), &on(&sin))
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (index, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!((g - w).abs() < 1e-5, "{index}: {g} {w}");
         }
     }
 }

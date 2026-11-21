@@ -49,8 +49,10 @@ struct Layer {
     post_ff_norm_2: RmsNorm,
     post_ff_norm: RmsNorm,
     feed_forward: SovFeedForward,
-    /// `layer_scalar`, in the compute dtype.
-    scalar: Tensor,
+    /// `layer_scalar`, its value in the compute dtype (applied as a scalar
+    /// multiply: a broadcast of a `[1]` tensor uploads its strides every
+    /// launch, a scalar's bits are the same).
+    scalar: f64,
 }
 
 /// What a traced forward records (tests and parity runs).
@@ -148,7 +150,11 @@ impl SovDecoder {
                 pre_ff_norm_2: norm("pre_feedforward_layernorm_2")?,
                 post_ff_norm_2: norm("post_feedforward_layernorm_2")?,
                 post_ff_norm: norm("post_feedforward_layernorm")?,
-                scalar: checkpoint.tensor(&format!("{l}.layer_scalar"), device, dtype)?,
+                scalar: checkpoint
+                    .tensor(&format!("{l}.layer_scalar"), device, dtype)?
+                    .to_dtype(DType::F64)?
+                    .flatten_all()?
+                    .to_vec1::<f64>()?[0],
                 attention,
                 feed_forward,
             };
@@ -423,7 +429,7 @@ impl SovDecoder {
                 &layer.pre_ff_norm_2.forward(&x)?,
             )?)?;
             let (_, m) = layer.post_ff_norm.add_forward(&dense, &sparse)?;
-            x = (x + m)?.broadcast_mul(&layer.scalar)?;
+            x = (x + m)?.affine(layer.scalar, 0.0)?;
             profile.mark(&self.device, PrefillPhase::Experts)?;
             if let Some((request, trace)) = trace.as_mut() {
                 if request.hidden_after_layers.contains(&index) {
@@ -476,7 +482,7 @@ impl SovDecoder {
             &layer.pre_ff_norm_2.forward(&sum)?,
         )?)?;
         let (_, m) = layer.post_ff_norm.add_forward(&dense, &sparse)?;
-        Ok((sum + m)?.broadcast_mul(&layer.scalar)?)
+        Ok((sum + m)?.affine(layer.scalar, 0.0)?)
     }
 
     /// One decode step (each row one token) as `layers + 1` stretches: the
@@ -703,7 +709,7 @@ impl SovDecoder {
                 .post_ff_norm_2
                 .forward(&ff.sparse(&x, &layer.pre_ff_norm_2.forward(&x)?)?)?;
             let (_, m) = layer.post_ff_norm.add_forward(&dense, &sparse)?;
-            x = (x + m)?.broadcast_mul(&layer.scalar)?;
+            x = (x + m)?.affine(layer.scalar, 0.0)?;
         }
         self.final_norm.forward_f32(&x)
     }
