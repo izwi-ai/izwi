@@ -233,6 +233,14 @@ impl Audio8SlowTransformer {
         self.lm_head.weight().device()
     }
 
+    /// The RoPE tables every slow layer shares.
+    fn rotary(&self) -> Result<&Audio8RotaryCache> {
+        self.layers
+            .first()
+            .map(|layer| &layer.self_attn.rotary)
+            .ok_or_else(|| Error::InvalidInput("Audio8 slow transformer has no layers".into()))
+    }
+
     /// Persistent RoPE table bytes, shared by every slow layer.
     pub fn rotary_cache_bytes(&self) -> u64 {
         self.layers
@@ -423,11 +431,19 @@ impl Audio8SlowTransformer {
                 hidden = hidden.pad_with_zeros(1, 0, padded - rows)?;
             }
             let real = counts.iter().sum::<usize>();
+            // Every packed token's rotary tables at its own position, once
+            // for every layer: one rotation per projection, not one per row.
+            let positions = starts
+                .iter()
+                .zip(&counts)
+                .flat_map(|(&start, &count)| start..start + count)
+                .collect::<Vec<_>>();
+            let (cos, sin) = self.rotary()?.position_tables(&positions, real)?;
             for (index, layer) in self.layers.iter().enumerate() {
                 let norm = layer.input_layernorm.forward(&hidden)?;
                 let attn = layer
                     .self_attn
-                    .forward_batch(&norm, real, &starts, &counts, caches[0], &mut batch, index)?;
+                    .forward_batch(&norm, real, &cos, &sin, caches[0], &mut batch, index)?;
                 hidden = hidden.broadcast_add(&attn)?;
                 let ff = layer
                     .mlp
@@ -623,8 +639,8 @@ impl Audio8PackedAttention {
         &self,
         x: &Tensor,
         total: usize,
-        starts: &[usize],
-        counts: &[usize],
+        cos: &Tensor,
+        sin: &Tensor,
         cache: &PhysicalPagedKvCache,
         batch: &mut super::batch::Audio8PhysicalBatch,
         layer: usize,
@@ -644,24 +660,10 @@ impl Audio8PackedAttention {
             self.num_kv_heads,
             self.head_dim,
         ))?;
-        let mut qs = Vec::new();
-        let mut ks = Vec::new();
-        let mut offset = 0;
-        for (&start, &count) in starts.iter().zip(counts) {
-            qs.push(
-                self.rotary
-                    .apply(&q.narrow(1, offset, count)?, start)?
-                    .squeeze(0)?,
-            );
-            ks.push(
-                self.rotary
-                    .apply(&k.narrow(1, offset, count)?, start)?
-                    .squeeze(0)?,
-            );
-            offset += count;
-        }
-        let q = Tensor::cat(&qs, 0)?.contiguous()?;
-        let k = Tensor::cat(&ks, 0)?.contiguous()?;
+        // Each token at its own position (`cos`/`sin`), every row at once:
+        // the rotation is elementwise, so the bits are each row's alone.
+        let q = self.rotary.apply_tables(&q, cos, sin)?.squeeze(0)?;
+        let k = self.rotary.apply_tables(&k, cos, sin)?.squeeze(0)?;
         let out = batch.attend(
             cache,
             layer,
