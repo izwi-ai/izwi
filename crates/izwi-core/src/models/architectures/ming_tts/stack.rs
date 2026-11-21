@@ -334,12 +334,15 @@ impl MingTrunk {
             dtype,
             &device,
         )?;
+        // Every CUDA decode step is padded to one width (see
+        // `Self::forward`): one set of graphs, no per-row state to copy.
         let graphs = StretchGraphs::resolve(
             "Ming TTS language model",
             super::graphs::MING_TTS_DECODE_GRAPHS_ENV,
             &device,
             cfg.num_hidden_layers + 1,
-        );
+        )
+        .map(|graphs| graphs.with_widths(|rows| rows == MAX_DECODE_GROUP));
         Ok(Self {
             cfg,
             dtype,
@@ -376,6 +379,12 @@ impl MingTrunk {
 
     pub fn max_positions(&self) -> usize {
         self.max_positions
+    }
+
+    /// Run decode steps eagerly (a test's reference for the graphs).
+    #[cfg(test)]
+    pub(crate) fn turn_off_graphs(&mut self) {
+        self.graphs = Err("turned off by a test".into());
     }
 
     /// The embeddings of `ids`, [ids, hidden] in the model dtype.
@@ -507,15 +516,38 @@ impl MingTrunk {
             // attention: the first layer's norm, projections and rotation;
             // then each layer's residual branches with the next layer's
             // projections; then the last layer's residual branches. On CUDA
-            // a decode step (one position a row) at a graphed width replays
-            // each stretch as a graph, captured and checked bit for bit
-            // against the eager stretch first; elsewhere the stretches run
-            // as they are, in the same order.
+            // a decode step (one position a row, at most
+            // `MAX_DECODE_GROUP` rows) replays each stretch as a graph,
+            // captured and checked bit for bit against the eager stretch
+            // first; elsewhere the stretches run as they are, in the same
+            // order.
+            //
+            // A graphed step's stretch inputs are padded with zero rows to
+            // `MAX_DECODE_GROUP`, one shape for every width. The bits are
+            // the unpadded step's: the projections already run at that
+            // padded row count (`project_rows`), every other stretch op
+            // keeps rows apart, and attention reads the real rows only.
             let decode_step = spans.iter().all(|span| span.q_len == 1);
             let mut run = match &self.graphs {
-                Ok(graphs) if decode_step => graphs.begin(tokens),
+                Ok(graphs) if decode_step && tokens <= MAX_DECODE_GROUP => {
+                    graphs.begin(MAX_DECODE_GROUP)
+                }
                 _ => None,
             };
+            let width = if run.is_some() {
+                MAX_DECODE_GROUP
+            } else {
+                tokens
+            };
+            let pad = |t: Tensor| -> Result<Tensor> {
+                if width > tokens {
+                    Ok(t.pad_with_zeros(0, 0, width - tokens)?)
+                } else {
+                    Ok(t)
+                }
+            };
+            let (cos, sin) = (pad(cos)?, pad(sin)?);
+            hidden = pad(hidden)?;
             let mut stretch = |index: usize,
                                inputs: Vec<Tensor>,
                                body: &dyn Fn(&[Tensor]) -> Result<Vec<Tensor>>|
@@ -555,12 +587,12 @@ impl MingTrunk {
                     )?);
                     offset += count;
                 }
-                let attn = if outputs.len() == 1 {
+                let attn = pad(if outputs.len() == 1 {
                     outputs.pop().expect("one group")
                 } else {
                     Tensor::cat(&outputs, 0)?
                 }
-                .reshape((tokens, cfg.q_out()))?;
+                .reshape((tokens, cfg.q_out()))?)?;
                 let layer = &self.layers[index];
                 if index == last_layer {
                     let tail = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {

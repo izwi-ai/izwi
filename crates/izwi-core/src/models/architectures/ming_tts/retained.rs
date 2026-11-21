@@ -592,15 +592,18 @@ mod tests {
         assert_eq!(latents, expected);
     }
 
-    #[test]
-    fn rows_decoded_together_match_each_alone() {
-        let runtime = tiny_runtime();
-        let texts = ["first row here", "another one", "and the third row of text"];
+    /// Each text's latents decoded alone, and all of them decoded together
+    /// (the rows that are still decoding share each step), on caches of the
+    /// runtime's device and dtype.
+    fn latents_alone_and_together(
+        runtime: &MingRuntime,
+        texts: &[&str],
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         let cfg = runtime.trunk().config();
         let caches = |rows: usize| {
             crate::models::shared::attention::physical::test_physical_caches_with_dtype_on(
                 runtime.device(),
-                DType::F32,
+                runtime.lm_dtype(),
                 cfg.num_hidden_layers,
                 cfg.num_key_value_heads,
                 cfg.head_dim,
@@ -611,19 +614,19 @@ mod tests {
         let alone = texts
             .iter()
             .map(|text| {
-                let mut retained = state(&runtime, text, 7);
+                let mut retained = state(runtime, text, 7);
                 let mut cache = caches(1).pop().unwrap();
-                run(&runtime, &mut retained, &mut cache, usize::MAX)
+                run(runtime, &mut retained, &mut cache, usize::MAX)
             })
             .collect::<Vec<_>>();
         let mut states = texts
             .iter()
-            .map(|text| state(&runtime, text, 7))
+            .map(|text| state(runtime, text, 7))
             .collect::<Vec<_>>();
         let mut caches = caches(texts.len());
         for (state, cache) in states.iter_mut().zip(caches.iter_mut()) {
             let span = state.prompt_tokens();
-            ming_prefill_batch(&runtime, &mut [MingStepRow { state, cache }], &[span]).unwrap();
+            ming_prefill_batch(runtime, &mut [MingStepRow { state, cache }], &[span]).unwrap();
         }
         loop {
             let mut rows = states
@@ -635,27 +638,71 @@ mod tests {
             if rows.is_empty() {
                 break;
             }
-            ming_decode_batch(&runtime, &mut rows).unwrap();
+            ming_decode_batch(runtime, &mut rows).unwrap();
         }
+        let together = states.into_iter().map(|state| state.latents).collect();
+        (alone, together)
+    }
+
+    fn bits(rows: &[Vec<f32>]) -> Vec<Vec<u32>> {
+        rows.iter()
+            .map(|row| row.iter().map(|value| value.to_bits()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn rows_decoded_together_match_each_alone() {
+        let runtime = tiny_runtime();
+        let texts = ["first row here", "another one", "and the third row of text"];
         // On caches of one kind a row's latents are the bits it gets alone
         // (a scratch cache pages differently and rounds in the sixth place).
-        for (state, alone) in states.iter().zip(&alone) {
-            assert_eq!(state.latents.len(), alone.len());
-            let worst = state
-                .latents
-                .iter()
-                .zip(alone)
-                .map(|(a, b)| {
-                    let d = (a - b).abs();
-                    if d.is_finite() {
-                        d
-                    } else {
-                        f32::INFINITY
-                    }
-                })
-                .fold(0f32, f32::max);
-            assert_eq!(worst, 0.0);
-        }
+        let (alone, together) = latents_alone_and_together(&runtime, &texts);
+        assert!(alone.iter().all(|latents| !latents.is_empty()));
+        assert_eq!(bits(&together), bits(&alone));
+    }
+
+    /// On CUDA, with the decode stretches graphed at their one padded width:
+    /// from eleven rows down to one, a row's latents are the bits it gets
+    /// alone, and the bits the eager (ungraphed) steps give.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_rows_decoded_together_match_each_alone_and_eager() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let texts = [
+            "first row here",
+            "another one",
+            "and the third row of text",
+            "one two three",
+            "keep going",
+            "hello there friend",
+            "the text",
+            "row of text here",
+            "two one",
+            "three two one friend",
+            "first another third",
+        ];
+        let synthetic = crate::models::architectures::ming_tts::synthetic::tiny_runtime_on;
+        let graphed = synthetic(&device, DType::BF16);
+        let (alone, together) = latents_alone_and_together(&graphed, &texts);
+        assert_eq!(bits(&together), bits(&alone));
+        let diagnostics = graphed.decode_graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert_eq!(
+            diagnostics["widths"],
+            serde_json::json!([32]),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics["replays"].as_u64().unwrap_or(0) > 0,
+            "{diagnostics}"
+        );
+        let mut eager = synthetic(&device, DType::BF16);
+        eager.turn_off_decode_graphs();
+        let (eager_alone, eager_together) = latents_alone_and_together(&eager, &texts);
+        assert_eq!(bits(&eager_alone), bits(&alone));
+        assert_eq!(bits(&eager_together), bits(&alone));
     }
 
     /// Every state's windows through [`ming_audio_batch`], `together` in one

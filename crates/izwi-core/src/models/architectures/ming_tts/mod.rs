@@ -534,6 +534,13 @@ impl MingRuntime {
         self.trunk.decode_graphs_diagnostics()
     }
 
+    /// Run the language model's decode steps eagerly (a test's reference
+    /// for the graphs).
+    #[cfg(test)]
+    pub(crate) fn turn_off_decode_graphs(&mut self) {
+        self.trunk.turn_off_graphs();
+    }
+
     /// The VAE window's CUDA graph: its state and counters.
     pub fn vae_graphs_diagnostics(&self) -> serde_json::Value {
         self.decoder.graphs_diagnostics()
