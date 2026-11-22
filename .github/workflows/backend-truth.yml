@@ -355,8 +355,9 @@ jobs:
     runs-on: macos-15
     # The Metal lane's izwi-core and izwi-server suites alone take about 40
     # minutes on a cold cache since Fish Audio Drama 3, before the worker
-    # parity build and the KV matrix run.
-    timeout-minutes: 75
+    # parity build and the KV matrix run; with the v0.1.4 models' CUDA and
+    # Metal kernels the lane passed 75 minutes while still compiling.
+    timeout-minutes: 100
     env:
       MACOSX_DEPLOYMENT_TARGET: "12.0"
 
