@@ -1,6 +1,6 @@
 ---
 title: "Overview"
-description: "User documentation for Izwi, a local-first audio inference engine for speech, voice, and chat workflows."
+description: "User documentation for Izwi, open-source voice AI that runs on your machine."
 sidebarTitle: "Overview"
 icon: "house"
 ---

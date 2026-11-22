@@ -140,7 +140,7 @@ RUN --mount=type=cache,id=izwi-cargo-registry,target=/usr/local/cargo/registry,s
 FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS production
 
 LABEL org.opencontainers.image.title="Izwi Audio" \
-      org.opencontainers.image.description="Rust-native audio inference engine" \
+      org.opencontainers.image.description="Open-source voice AI that runs on your machine" \
       org.opencontainers.image.vendor="Izwi" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/izwi-ai/izwi" \
@@ -196,7 +196,7 @@ CMD ["izwi-server"]
 FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04@sha256:14f6d08d1cd4a96effbfe3101d0b56326f552c199d05e4979ee0bd616df5811b AS production-cuda
 
 LABEL org.opencontainers.image.title="Izwi Audio (CUDA)" \
-      org.opencontainers.image.description="Rust-native audio inference engine with CUDA support" \
+      org.opencontainers.image.description="Open-source voice AI that runs on your machine, with CUDA support" \
       org.opencontainers.image.vendor="Izwi" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/izwi-ai/izwi" \
