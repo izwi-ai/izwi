@@ -25,8 +25,21 @@ use super::config::{
     MingTtsConfig, FRAMES_PER_LATENT, FRAME_SAMPLES, ISTFT_BINS, ISTFT_SIZE, LATENT_DIM,
     LATENT_SAMPLES,
 };
+use super::graphs::{MingVaeGraphKey, MingVaeGraphs};
 use super::stack::{MingWindowStack, MingWindowState};
+use super::stream::WINDOW_LATENTS;
 use crate::error::{Error, Result};
+
+/// Query slots of a fixed-shape window (CUDA): the most frames a request's
+/// window runs, a full window's latents and the two frames the previous
+/// window held back (34). A longer run is split into chunks of this many.
+pub(crate) const FIXED_WINDOW_FRAMES: usize =
+    WINDOW_LATENTS * FRAMES_PER_LATENT + FRAMES_PER_LATENT / 2;
+
+/// The widest attention window the fixed shape takes: past it (an
+/// `IZWI_MING_TTS_VAE_WINDOW_KEYS` override) CUDA runs windows as the CPU
+/// does.
+const FIXED_MAX_WINDOW_KEYS: usize = 256;
 
 /// Samples trimmed from each end of the overlap-added signal.
 const ISTFT_PAD: usize = (ISTFT_SIZE - FRAME_SAMPLES) / 2;
@@ -37,14 +50,17 @@ const POSTERIOR_SCALE_FLOOR: f32 = 1e-4;
 
 /// `x` [rows, in] through `weight` [out, in] as stored (transposed as a
 /// view, so no transposed copy is written on the device).
-fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+/// With `tf32` (the decoder's head, see [`MingWindowStack::with_tf32`]) an
+/// F32 product runs in TF32 on CUDA.
+fn linear(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, tf32: bool) -> Result<Tensor> {
     // Metal's matmul takes a left operand only with unit row stride: the
     // encoder's group tokens are a strided view.
-    let y = x.contiguous()?.matmul(&weight.t()?)?;
-    match bias {
-        Some(bias) => Ok(y.broadcast_add(bias)?),
-        None => Ok(y),
-    }
+    super::stack::product(&x.contiguous()?, weight, bias, tf32)
+}
+
+/// Whether the decoder's own linears run in TF32 (as its stack does).
+fn decoder_tf32() -> bool {
+    super::stack::f32_tf32_requested()
 }
 
 fn weight_t(vb: &VarBuilder, output: usize, input: usize) -> Result<Tensor> {
@@ -155,22 +171,145 @@ pub struct MingVaeDecoder {
     head_t: Tensor,
     head_bias: Tensor,
     istft: IstftFrame,
+    /// On CUDA, the fixed-shape window and its graph; `None` runs windows at
+    /// their own length (the CPU and Metal).
+    fixed: Option<FixedWindow>,
+}
+
+/// The CUDA decoder's fixed-shape window ([`MingWindowStack::fixed_forward`]
+/// with the input and head linears around it): every window runs in
+/// [`FIXED_WINDOW_FRAMES`] slots, so a request's samples are the same
+/// whatever runs beside it, and one CUDA graph replays the whole window
+/// (about 750 launches eagerly).
+struct FixedWindow {
+    graphs: MingVaeGraphs,
+    /// Per chunk length `count` (index `count - 1`): the keys a chunk keeps,
+    /// `count..count + kept` as U32 on the device.
+    gathers: Vec<Tensor>,
+}
+
+/// A window whose stack is queued on the device: what
+/// [`MingVaeDecoder::finish`] turns into samples.
+pub(crate) struct MingVaePending {
+    /// The head's output for the new frames, [frames, 2 * bins] F32, on the
+    /// device; `None` when no frame was due.
+    head: Option<Tensor>,
+    /// Frames run through the stack once this window is in.
+    ready: usize,
+    last: bool,
+}
+
+/// A window read back to the host ([`MingVaeDecoder::read_back`]): what the
+/// inverse STFT needs, with no device work left.
+pub(crate) struct MingVaeHostWindow {
+    /// The head's frames, [frames, 2 * bins] row-major F32.
+    head: Option<Vec<f32>>,
+    ready: usize,
+    last: bool,
 }
 
 impl MingVaeDecoder {
-    /// Load the decoder from `vb` (rooted at `audio.decoder`).
+    /// Load the decoder from `vb` (rooted at `audio.decoder`). On CUDA its
+    /// windows run at the fixed shape, their graph off until
+    /// [`Self::resolve_graphs`].
     pub fn load(cfg: &MingTtsConfig, vb: VarBuilder, window_keys: usize) -> Result<Self> {
+        let fixed = vb.device().is_cuda() && window_keys <= FIXED_MAX_WINDOW_KEYS;
+        Self::load_with(cfg, vb, window_keys, fixed)
+    }
+
+    /// [`Self::load`], the fixed-shape window chosen by `fixed`.
+    pub(crate) fn load_with(
+        cfg: &MingTtsConfig,
+        vb: VarBuilder,
+        window_keys: usize,
+        fixed: bool,
+    ) -> Result<Self> {
         let hidden = cfg.vae_stack.hidden_size;
         let fc1 = vb.pp("fc1");
         let head = vb.pp("head").pp("out");
+        let stack = MingWindowStack::load(cfg.vae_stack.clone(), vb.pp("decoder"), window_keys)?
+            .with_tf32();
+        let fixed = if fixed {
+            let kept = stack.fixed_kept() as u32;
+            let gathers = (1..=FIXED_WINDOW_FRAMES as u32)
+                .map(|count| {
+                    Tensor::from_vec(
+                        (count..count + kept).collect::<Vec<_>>(),
+                        kept as usize,
+                        stack.device(),
+                    )
+                })
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            Some(FixedWindow {
+                graphs: MingVaeGraphs::off("not resolved"),
+                gathers,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             fc1_t: weight_t(&fc1, hidden, LATENT_DIM)?,
             fc1_bias: fc1.get(hidden, "bias")?,
             head_t: weight_t(&head, 2 * ISTFT_BINS, hidden)?,
             head_bias: head.get(2 * ISTFT_BINS, "bias")?,
-            stack: MingWindowStack::load(cfg.vae_stack.clone(), vb.pp("decoder"), window_keys)?,
+            stack,
             istft: IstftFrame::new(),
+            fixed,
         })
+    }
+
+    /// On CUDA, the fixed-shape window's graph: resolved and run through
+    /// capture and verification on two windows of xorshift latents, so a
+    /// window that cannot graph says so before serving (and runs eagerly at
+    /// the same shape, with the same bits).
+    pub(crate) fn resolve_graphs(&mut self) {
+        let Some(fixed) = self.fixed.as_mut() else {
+            return;
+        };
+        fixed.graphs = MingVaeGraphs::resolve(self.stack.device());
+        if !fixed.graphs.is_on() {
+            return;
+        }
+        let checked = (|| -> Result<()> {
+            use crate::kernels::numeric_check::xorshift_values;
+            let mut state = MingVaeDecodeState::default();
+            for (seed, latents) in [(0x5641_45A1u64, 4), (0x5641_45A2, WINDOW_LATENTS)] {
+                let values = xorshift_values(latents * LATENT_DIM, seed, 1.0);
+                let pending = self.begin(&mut state, &values, false)?;
+                self.finish(&mut state, pending)?;
+            }
+            Ok(())
+        })();
+        let Some(fixed) = self.fixed.as_mut() else {
+            return;
+        };
+        if let Err(error) = checked {
+            fixed.graphs.turn_off(format!("self-check failed: {error}"));
+        }
+        if fixed.graphs.is_on() {
+            tracing::info!(
+                frames = FIXED_WINDOW_FRAMES,
+                "Ming TTS VAE windows run as a CUDA graph"
+            );
+        } else {
+            tracing::warn!(
+                reason = %fixed.graphs.diagnostics()["off"],
+                "Ming TTS VAE windows run eagerly at the fixed shape"
+            );
+        }
+    }
+
+    /// The fixed-shape window's graph: its state and counters, or why
+    /// windows run at their own length.
+    pub(crate) fn graphs_diagnostics(&self) -> serde_json::Value {
+        match &self.fixed {
+            Some(fixed) => {
+                let mut diagnostics = fixed.graphs.diagnostics();
+                diagnostics["frames"] = FIXED_WINDOW_FRAMES.into();
+                diagnostics
+            }
+            None => serde_json::json!({ "off": "windows run at their own length off CUDA" }),
+        }
     }
 
     pub fn dtype(&self) -> DType {
@@ -189,6 +328,20 @@ impl MingVaeDecoder {
         latents: &[f32],
         last: bool,
     ) -> Result<Vec<f32>> {
+        let pending = self.begin(state, latents, last)?;
+        self.finish(state, pending)
+    }
+
+    /// The first half of [`Self::push`]: queue the stack over the frames
+    /// `latents` make due, without waiting for the device. The window's
+    /// samples come from [`Self::finish`], which must be the next call on
+    /// `state`; several requests' windows can be queued before any finishes.
+    pub(crate) fn begin(
+        &self,
+        state: &mut MingVaeDecodeState,
+        latents: &[f32],
+        last: bool,
+    ) -> Result<MingVaePending> {
         if state.finished {
             return Err(Error::InvalidInput(
                 "Ming VAE decode was already finished".into(),
@@ -204,10 +357,11 @@ impl MingVaeDecoder {
         state.latents.extend_from_slice(latents);
         let count = state.latents();
         if count == 0 {
-            if last {
-                state.finished = true;
-            }
-            return Ok(Vec::new());
+            return Ok(MingVaePending {
+                head: None,
+                ready: state.frames,
+                last,
+            });
         }
         // The last two frames of a latent interpolate towards the next one.
         let ready = if last {
@@ -215,18 +369,144 @@ impl MingVaeDecoder {
         } else {
             count * FRAMES_PER_LATENT - FRAMES_PER_LATENT / 2
         };
-        if ready > state.frames {
+        let head = if ready > state.frames {
             let frames = upsample_frames(&state.latents, state.frames, ready);
             let new = ready - state.frames;
-            let device = self.stack.device();
-            let x = Tensor::from_vec(frames, (new, LATENT_DIM), device)?.to_dtype(self.dtype())?;
-            let x = linear(&x, &self.fc1_t, Some(&self.fc1_bias))?;
-            let hidden = self.stack.forward(&x, &mut state.stack)?;
-            let head = linear(&hidden, &self.head_t, Some(&self.head_bias))?
-                .to_dtype(DType::F32)?
-                .to_device(&Device::Cpu)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
+            Some(match &self.fixed {
+                Some(fixed) => self.fixed_head(fixed, frames, new, &mut state.stack)?,
+                None => {
+                    let device = self.stack.device();
+                    let x = Tensor::from_vec(frames, (new, LATENT_DIM), device)?
+                        .to_dtype(self.dtype())?;
+                    let x = linear(&x, &self.fc1_t, Some(&self.fc1_bias), decoder_tf32())?;
+                    let hidden = self.stack.forward(&x, &mut state.stack)?;
+                    linear(&hidden, &self.head_t, Some(&self.head_bias), decoder_tf32())?
+                        .to_dtype(DType::F32)?
+                }
+            })
+        } else {
+            None
+        };
+        Ok(MingVaePending { head, ready, last })
+    }
+
+    /// The head over `new` frames (row-major [new, 64]) through the
+    /// fixed-shape window, chunk by chunk: [new, 2 * bins] F32 on the
+    /// device.
+    fn fixed_head(
+        &self,
+        fixed: &FixedWindow,
+        frames: Vec<f32>,
+        new: usize,
+        stack: &mut MingWindowState,
+    ) -> Result<Tensor> {
+        let queries = FIXED_WINDOW_FRAMES;
+        let tables = self.stack.fixed_table_width(queries);
+        let width = LATENT_DIM + tables;
+        let key = MingVaeGraphKey {
+            queries,
+            kept: self.stack.fixed_kept(),
+        };
+        let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+            let [packed, gather, kept] = inputs else {
+                return Err(Error::InferenceError(format!(
+                    "Ming VAE window received {} inputs, expected 3",
+                    inputs.len()
+                )));
+            };
+            let x = packed
+                .narrow(1, 0, LATENT_DIM)?
+                .contiguous()?
+                .to_dtype(self.dtype())?;
+            let x = linear(&x, &self.fc1_t, Some(&self.fc1_bias), decoder_tf32())?;
+            let tables = packed.narrow(1, LATENT_DIM, tables)?;
+            let (hidden, kept) = self.stack.fixed_forward(&x, &tables, gather, kept)?;
+            let head = linear(&hidden, &self.head_t, Some(&self.head_bias), decoder_tf32())?
+                .to_dtype(DType::F32)?;
+            Ok(vec![head, kept])
+        };
+        let bytes = |tensor: &Tensor| (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64;
+        let mut heads = Vec::with_capacity(new.div_ceil(queries));
+        for (chunk, rows) in frames.chunks(queries * LATENT_DIM).enumerate() {
+            let count = rows.len() / LATENT_DIM;
+            let table = self.stack.fixed_tables(stack.position(), count, queries);
+            let mut packed = vec![0f32; queries * width];
+            for (slot, row) in packed.chunks_exact_mut(width).enumerate() {
+                if slot < count {
+                    row[..LATENT_DIM]
+                        .copy_from_slice(&rows[slot * LATENT_DIM..(slot + 1) * LATENT_DIM]);
+                }
+                row[LATENT_DIM..].copy_from_slice(&table[slot * tables..(slot + 1) * tables]);
+            }
+            let inputs = [
+                Tensor::from_vec(packed, (queries, width), self.stack.device())?,
+                fixed.gathers[count - 1].clone(),
+                stack.take_fixed(&self.stack)?,
+            ];
+            // What the graph keeps: stable copies of its inputs, and its
+            // outputs (the head and the kept keys, as large as their input).
+            let retained = inputs.iter().map(bytes).sum::<u64>()
+                + bytes(&inputs[2])
+                + (queries * 2 * ISTFT_BINS * DType::F32.size_in_bytes()) as u64;
+            let mut outputs = fixed.graphs.run(key, retained, &inputs, &body)?;
+            let (Some(kept), Some(head)) = (outputs.pop(), outputs.pop()) else {
+                return Err(Error::InferenceError(format!(
+                    "Ming VAE window chunk {chunk} returned too few outputs"
+                )));
+            };
+            stack.advance_fixed(count, kept);
+            heads.push(head.narrow(0, 0, count)?);
+        }
+        Ok(if heads.len() == 1 {
+            heads.pop().expect("one chunk")
+        } else {
+            Tensor::cat(&heads, 0)?
+        })
+    }
+
+    /// The second half of [`Self::push`]: read the queued head back, run
+    /// its frames through the inverse STFT and return the samples they
+    /// settle.
+    pub(crate) fn finish(
+        &self,
+        state: &mut MingVaeDecodeState,
+        pending: MingVaePending,
+    ) -> Result<Vec<f32>> {
+        let host = self.read_back(pending)?;
+        self.finish_host(state, host)
+    }
+
+    /// Reads a queued window's head back to the host: the device half of
+    /// [`Self::finish`], which must run on the thread that owns the device.
+    pub(crate) fn read_back(&self, pending: MingVaePending) -> Result<MingVaeHostWindow> {
+        let MingVaePending { head, ready, last } = pending;
+        let head = head
+            .map(|head| -> Result<Vec<f32>> {
+                Ok(head
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?)
+            })
+            .transpose()?;
+        Ok(MingVaeHostWindow { head, ready, last })
+    }
+
+    /// The host half of [`Self::finish`]: the inverse STFT of a read-back
+    /// window and the samples it settles. Touches no device memory, so the
+    /// windows of several requests can run on separate threads.
+    pub(crate) fn finish_host(
+        &self,
+        state: &mut MingVaeDecodeState,
+        host: MingVaeHostWindow,
+    ) -> Result<Vec<f32>> {
+        let MingVaeHostWindow { head, ready, last } = host;
+        if state.latents() == 0 {
+            if last {
+                state.finished = true;
+            }
+            return Ok(Vec::new());
+        }
+        if let Some(head) = head {
             if head.iter().any(|value| !value.is_finite()) {
                 return Err(Error::InferenceError(
                     "Ming VAE decoder produced a non-finite spectrum".into(),
@@ -367,9 +647,10 @@ impl MingVaeEncoder {
         let x =
             Tensor::from_vec(samples.to_vec(), (frames, FRAME_SAMPLES), device)?.to_dtype(dtype)?;
         let x = linear(
-            &linear(&x, &self.fc1_t, None)?,
+            &linear(&x, &self.fc1_t, None, false)?,
             &self.fc2_t,
             Some(&self.fc2_bias),
+            false,
         )?;
         let hidden = self.stack.forward(&x, &mut MingWindowState::default())?;
         // The group token after every four frames.
@@ -392,7 +673,7 @@ impl MingVaeEncoder {
             .narrow(1, FRAMES_PER_LATENT, 1)?
             .squeeze(1)?
             .contiguous()?;
-        let moments = linear(&tokens, &self.fc3_t, Some(&self.fc3_bias))?
+        let moments = linear(&tokens, &self.fc3_t, Some(&self.fc3_bias), false)?
             .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?;
         let mean = moments
@@ -517,12 +798,37 @@ pub(crate) mod tests {
     }
 
     fn decoder(window_keys: usize) -> MingVaeDecoder {
+        decoder_on(&Device::Cpu, window_keys, false)
+    }
+
+    /// The tiny decoder on `device`, its windows at the fixed shape or not.
+    pub(crate) fn decoder_on(device: &Device, window_keys: usize, fixed: bool) -> MingVaeDecoder {
         let cfg = tiny_vae_config();
         let mut rng = SplitMix64::new(21);
         let mut tensors = HashMap::new();
         tiny_decoder_weights(&cfg, "", &mut rng, &mut tensors);
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
-        MingVaeDecoder::load(&cfg, vb, window_keys).unwrap()
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        MingVaeDecoder::load_with(&cfg, vb, window_keys, fixed).unwrap()
+    }
+
+    /// `latents` pushed in pieces of `plan` latents (the last piece ends
+    /// the utterance), every window's samples in order.
+    pub(crate) fn decode_in_windows(
+        decoder: &MingVaeDecoder,
+        latents: &[f32],
+        plan: &[usize],
+    ) -> Vec<f32> {
+        let mut state = MingVaeDecodeState::default();
+        let mut samples = Vec::new();
+        let mut offset = 0;
+        for (index, count) in plan.iter().enumerate() {
+            let last = index + 1 == plan.len();
+            let slice = &latents[offset * LATENT_DIM..(offset + count) * LATENT_DIM];
+            samples.extend(decoder.push(&mut state, slice, last).unwrap());
+            offset += count;
+        }
+        assert!(state.finished());
+        samples
     }
 
     #[test]
@@ -572,6 +878,98 @@ pub(crate) mod tests {
             .push(&mut state, &latents[..2 * LATENT_DIM], false)
             .unwrap();
         assert_eq!(first.len(), 6 * FRAME_SAMPLES - ISTFT_PAD);
+    }
+
+    /// The fixed-shape window (CUDA's) decodes what the window at its own
+    /// length does, over the stream's window plan, a piece longer than one
+    /// chunk, and a window short enough to keep every key and long enough
+    /// to slide.
+    #[test]
+    fn the_fixed_shape_window_decodes_what_the_eager_window_does() {
+        let latents = SplitMix64::new(5).standard_normals(40 * LATENT_DIM);
+        for window_keys in [6, 64] {
+            let eager = decoder_on(&Device::Cpu, window_keys, false);
+            let fixed = decoder_on(&Device::Cpu, window_keys, true);
+            assert!(fixed.fixed.is_some() && eager.fixed.is_none());
+            for plan in [&[4usize, 8, 8, 8, 8, 4][..], &[4, 8, 19, 9], &[40]] {
+                let expected = decode_in_windows(&eager, &latents, plan);
+                let got = decode_in_windows(&fixed, &latents, plan);
+                assert_eq!(got.len(), expected.len());
+                let worst = max_diff(&got, &expected);
+                assert!(worst < 2e-4, "keys {window_keys}, plan {plan:?}: {worst}");
+            }
+        }
+    }
+
+    /// The VAE window's CUDA graph returns the eager fixed-shape window's
+    /// samples bit for bit, through capture, verification and replays.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_vae_window_graph_matches_its_eager_shape_bit_for_bit() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let latents = SplitMix64::new(5).standard_normals(44 * LATENT_DIM);
+        let plan = [4usize, 8, 8, 8, 8, 8];
+        let eager = decoder_on(&device, 64, true);
+        let mut graphed = decoder_on(&device, 64, true);
+        graphed.resolve_graphs();
+        let diagnostics = graphed.graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        let bits = |samples: Vec<f32>| samples.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        let expected = bits(decode_in_windows(&eager, &latents, &plan));
+        for run in 0..2 {
+            let got = bits(decode_in_windows(&graphed, &latents, &plan));
+            assert!(got == expected, "run {run}");
+        }
+        let diagnostics = graphed.graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert!(
+            diagnostics["replays"].as_u64().unwrap_or(0) >= 10,
+            "{diagnostics}"
+        );
+    }
+
+    /// A slot's mask sees its window's keys that hold a position, and a
+    /// padding slot sees only itself.
+    #[test]
+    fn fixed_tables_mask_each_slot_to_its_window() {
+        let decoder = decoder_on(&Device::Cpu, 6, true);
+        let stack = &decoder.stack;
+        let (kept, queries, pairs) = (stack.fixed_kept(), 4, stack.config().head_dim / 2);
+        let width = stack.fixed_table_width(queries);
+        let open = |start: usize, count: usize| -> Vec<Vec<usize>> {
+            stack
+                .fixed_tables(start, count, queries)
+                .chunks(width)
+                .map(|row| {
+                    row[2 * pairs..]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, value)| **value == 0.0)
+                        .map(|(key, _)| key)
+                        .collect()
+                })
+                .collect()
+        };
+        // First chunk: no kept key holds a position.
+        assert_eq!(
+            open(0, 2),
+            [vec![5], vec![5, 6], vec![kept + 2], vec![kept + 3]]
+        );
+        // Two positions held; slot 3 reaches back five keys.
+        assert_eq!(
+            open(2, 4),
+            [
+                vec![3, 4, 5],
+                vec![3, 4, 5, 6],
+                vec![3, 4, 5, 6, 7],
+                vec![3, 4, 5, 6, 7, 8]
+            ]
+        );
+        // Every kept key held: the window slides.
+        assert_eq!(open(40, 1)[0], [0, 1, 2, 3, 4, 5]);
+        assert_eq!(open(40, 2)[1], [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

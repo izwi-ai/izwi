@@ -160,18 +160,28 @@ impl ResolvedFishServingCapacity {
             fast_head,
             model.num_codebooks,
         ])?;
-        // The slow state is retained once and shared by both public
-        // capabilities; each has its own invocation bank, so price its
-        // prefill+decode scratch and fast state twice, plus codec candidates.
-        let row_bytes = slow_bytes
-            .checked_add(
-                fast_bytes.checked_mul(2).ok_or_else(|| {
-                    Error::ModelLoadError("Fish serving row budget overflow".into())
-                })?,
-            )
-            .and_then(|bytes| bytes.checked_add(profile.ar_workspace_per_row.checked_mul(4)?))
-            .and_then(|bytes| bytes.checked_add(profile.codec_workspace_per_row.checked_mul(4)?))
-            .ok_or_else(|| Error::ModelLoadError("Fish serving row budget overflow".into()))?;
+        // A request runs in one capability at a time, and its prefill, decode
+        // and codec workspaces are transient: the live resource authority
+        // admits each invocation's workspace exactly. So a row prices its
+        // retained slow and fast state, its codec stream's current and
+        // rollback histories, and one of each workspace (as Audio8's does).
+        // Pricing four of each workspace held the H100 to four rows beside
+        // 72 GB of headroom.
+        let codec_histories =
+            crate::models::architectures::fish_s2::dac::FishS2DacConfig::current()
+                .streaming_history_bound_bytes()?
+                .checked_mul(2)
+                .ok_or_else(|| Error::ModelLoadError("Fish serving row budget overflow".into()))?;
+        let row_bytes = [
+            slow_bytes,
+            fast_bytes,
+            profile.ar_workspace_per_row,
+            profile.codec_workspace_per_row,
+            codec_histories,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| Error::ModelLoadError("Fish serving row budget overflow".into()))?;
         // Reference preparation for the longest reference a request may
         // carry (the 30 s reference limit, at the highest accepted rate), not
         // the codec's 4,096-frame ceiling (FSH-2: 2 x 39 GB).
@@ -372,9 +382,11 @@ mod tests {
             .unwrap()
             .active_rows
         };
-        // H100 headroom after about 10 GB of BF16 weights.
+        // H100 headroom after about 10 GB of BF16 weights: a row prices one
+        // of each workspace, so the H100 holds many requests (four of each
+        // held it to four rows).
         let h100 = rows(68, 2);
-        assert!(h100 >= 4, "H100: {h100} rows");
+        assert!(h100 >= 12, "H100: {h100} rows");
         // An F32 fallback prices twice the KV, never more rows.
         assert!(rows(68, 4) <= h100);
         assert!(

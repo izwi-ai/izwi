@@ -25,9 +25,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/kernels/cuda/counter_noise.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/relpos_attention.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/transducer_greedy.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/small_attention.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/bias_rows.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/rope_pairs.cu");
+
+    println!("cargo::rustc-check-cfg=cfg(izwi_cublas_grouped)");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return Ok(());
+    }
+    // cudarc binds `cublasGemmGroupedBatchedEx` only for CUDA 12.5 and
+    // later, read from the same `nvcc --version` line it reads.
+    if nvcc_release().is_some_and(|release| release >= (12, 5)) {
+        println!("cargo:rustc-cfg=izwi_cublas_grouped");
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
@@ -62,10 +72,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "src/kernels/cuda/counter_noise.cu",
             "src/kernels/cuda/relpos_attention.cu",
             "src/kernels/cuda/transducer_greedy.cu",
+            "src/kernels/cuda/small_attention.cu",
+            "src/kernels/cuda/bias_rows.cu",
+            "src/kernels/cuda/rope_pairs.cu",
         ])
         .arg("-std=c++17")
         .arg("-O3")
         .build_ptx()?;
     bindings.write(out_dir.join("qwen35_ptx.rs"))?;
     Ok(())
+}
+
+/// The toolkit release `nvcc --version` reports on its fourth line
+/// ("Cuda compilation tools, release 13.0, V13.0.88"), as cudarc reads it.
+fn nvcc_release() -> Option<(u32, u32)> {
+    let output = std::process::Command::new("nvcc")
+        .arg("--version")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let release = stdout
+        .lines()
+        .nth(3)?
+        .split(", ")
+        .nth(1)?
+        .split(' ')
+        .nth(1)?;
+    let (major, minor) = release.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }

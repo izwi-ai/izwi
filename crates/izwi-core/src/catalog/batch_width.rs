@@ -27,7 +27,10 @@
 //! Voxtral's offline rows and Granite Speech 4.1's, Granite Speech 5.0's
 //! and Rumble's retained rows);
 //! their encoders, preparation and prefill stay at the engine rows, and each
-//! load fits the width to its memory.
+//! load fits the width to its memory. Rumble's decode alone goes past that
+//! ceiling, to [`CUDA_ASR_MAX_WIDTH`]: its rows are small (about 59 MiB),
+//! its decode graphs are captured up to that width, and its encoder and
+//! prefill batch on CUDA too.
 
 use super::ModelFamily;
 use crate::backends::BackendKind;
@@ -41,6 +44,11 @@ pub(crate) const MING_TTS_METAL_WIDTH: usize = 8;
 /// The CUDA ceiling: a policy constant, not a kernel or metadata limit and
 /// not a measured width.
 pub(crate) const CUDA_MAX_WIDTH: usize = 32;
+
+/// The ASR decode ceiling on CUDA: the ASR engine width when no width is
+/// fixed. Only Rumble is certified past [`CUDA_MAX_WIDTH`]; every other ASR
+/// family clamps to its own certified width.
+pub(crate) const CUDA_ASR_MAX_WIDTH: usize = 64;
 
 /// The automatic CUDA width of the engine rows, and of chat families not
 /// certified for wider CUDA batches.
@@ -62,7 +70,7 @@ pub(crate) const CUDA_DEFAULT_WIDTH: usize = 8;
 /// | Granite Speech 4.1 (decode only) | 2 | 2 | 32 | Unmeasured past one row. Each request held the device for its whole decode; retained rows now step together (one token upload, one RoPE gather, one paged append and attention per layer, one argmax readback for every row), and the real 2B Plus checkpoint emits the atomic route's tokens through spans, scalar steps and a two-row batch on CPU and Metal (`granite_speech_retained_decode_matches_atomic_on_*`) |
 /// | Granite Speech 5.0 (decode only) | 2 | 2 | 32 | Unmeasured past one row. Each request held the device for its whole decode on a 16k-token KV lease; retained rows now step together (one token upload, one RoPE gather, one paged append and attention per layer, one argmax readback for every row), a row decodes bit-identically alone and beside others on the CPU, and the real GGUF checkpoint emits the atomic route's tokens through spans, scalar steps and a three-row batch on Metal (`granite_speech5_retained_decode_matches_atomic_on_metal`) |
 /// | SOV-Transcribe-1 (CUDA only) | — | — | 32 | Unmeasured. Decode reads about 4.8 GB of dense weights per step plus the routed experts; the fused expert kernels read each used expert once for every row of a step and sum each row in a fixed order, so wider steps share the reads and a row decodes the same alone as beside others (CPU synthetic test, every expert path). A 30 s row holds about 190 MiB of KV, so 32 rows fit in the 32,768-token pool |
-/// | Rumble (decode only) | 2 | 2 | 32 | Unmeasured on CUDA. Retained rows step together through the Qwen3 core's batched decode (the step Qwen3-ASR's rows take), a row decodes the same alone and beside others on the CPU, and the published checkpoint emits the atomic route's tokens through spans, scalar steps and a four-row batch on CPU and Metal (`the_retained_route_matches_the_atomic_route_on_*`) |
+/// | Rumble (decode only) | 2 | 2 | 64 | Unmeasured past 32 rows on CUDA (H100 at 32: about 507 audio-s/s on 5-15 s clips, decode 28% of the device time). Retained rows step together through the Qwen3 core's batched decode (the step Qwen3-ASR's rows take), a row decodes the same alone and beside others on the CPU, and the published checkpoint emits the atomic route's tokens through spans, scalar steps and a four-row batch on CPU and Metal (`the_retained_route_matches_the_atomic_route_on_*`) |
 /// | Voxtral (offline decode only) | 2 | 2 | 32 | Unmeasured past one row. H100: an offline request held the device for its whole decode (about 6.3 ms a frame), 9.6 audio-s/s flat from 1 to 32 streams; offline rows now step together (one token upload, LM forward and argmax readback for every row), and a row emits the same alone as beside others (CPU tiny-model test) |
 ///
 /// Qwen3.5 on the CPU gained nothing past two rows in a repeated run, so it
@@ -73,6 +81,7 @@ pub(crate) const CUDA_DEFAULT_WIDTH: usize = 8;
 /// `IZWI_FISH_DRAMA3_NATIVE_BATCHING`, and CUDA keeps the automatic eight.
 pub(crate) const fn certified_decode_width(family: ModelFamily, backend: BackendKind) -> usize {
     match (backend, family) {
+        (BackendKind::Cuda, ModelFamily::RumbleAsr) => CUDA_ASR_MAX_WIDTH,
         (
             BackendKind::Cuda,
             ModelFamily::Qwen35Chat
@@ -88,8 +97,7 @@ pub(crate) const fn certified_decode_width(family: ModelFamily, backend: Backend
             | ModelFamily::Voxtral
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::GraniteSpeech5Asr
-            | ModelFamily::SovTranscribeAsr
-            | ModelFamily::RumbleAsr,
+            | ModelFamily::SovTranscribeAsr,
         ) => CUDA_MAX_WIDTH,
         (BackendKind::Cuda, _) => CUDA_DEFAULT_WIDTH,
         (BackendKind::Cpu | BackendKind::Metal, ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat)
@@ -101,7 +109,9 @@ pub(crate) const fn certified_decode_width(family: ModelFamily, backend: Backend
 
 /// The widest certified width of any family on `backend`: the engine-wide
 /// tensor width ceiling, and the automatic width on CPU and Metal (each
-/// loaded model then clamps to its own family's width).
+/// loaded model then clamps to its own family's width). Rumble's ASR decode
+/// past it on CUDA comes from the ASR engine width ([`asr_engine_width`]),
+/// not the engine rows.
 pub(crate) const fn max_certified_decode_width(backend: BackendKind) -> usize {
     match backend {
         BackendKind::Cuda => CUDA_MAX_WIDTH,
@@ -131,23 +141,24 @@ pub(crate) const fn chat_engine_width(
 
 /// The engine width ASR decode clamps to its family's certified width: on
 /// CUDA with no width fixed (`IZWI_MAX_BATCH_SIZE` or `max_num_seqs`) the
-/// CUDA ceiling, otherwise the non-chat rows.
+/// ASR ceiling [`CUDA_ASR_MAX_WIDTH`], otherwise the non-chat rows.
 pub(crate) const fn asr_engine_width(
     backend: BackendKind,
     non_chat_width: usize,
     automatic: bool,
 ) -> usize {
     match backend {
-        BackendKind::Cuda if automatic => CUDA_MAX_WIDTH,
+        BackendKind::Cuda if automatic => CUDA_ASR_MAX_WIDTH,
         _ => non_chat_width,
     }
 }
 
 /// The engine width TTS decode clamps to its family's certified width
-/// ([`tts_decode_width`]): ASR's on CUDA and the CPU; on Metal the engine's
-/// tensor width, so a family certified past the non-chat rows there (Ming
-/// 3.0 TTS) can use it, while every other family clamps back to the
-/// non-chat rows.
+/// ([`tts_decode_width`]): the CUDA ceiling on CUDA with no width fixed and
+/// the non-chat rows on the CPU (as ASR's were before Rumble's wider
+/// ceiling); on Metal the engine's tensor width, so a family certified past
+/// the non-chat rows there (Ming 3.0 TTS) can use it, while every other
+/// family clamps back to the non-chat rows.
 pub(crate) const fn tts_engine_width(
     backend: BackendKind,
     non_chat_width: usize,
@@ -156,7 +167,8 @@ pub(crate) const fn tts_engine_width(
 ) -> usize {
     match backend {
         BackendKind::Metal if tensor_width > non_chat_width => tensor_width,
-        _ => asr_engine_width(backend, non_chat_width, automatic),
+        BackendKind::Cuda if automatic => CUDA_MAX_WIDTH,
+        _ => non_chat_width,
     }
 }
 
@@ -236,9 +248,9 @@ pub(crate) const fn tts_decode_width(
 
 /// Widths a load fits an ASR decode wider than the engine rows to, widest
 /// first.
-const ASR_FIT_WIDTHS: [usize; 3] = [CUDA_MAX_WIDTH, 16, CUDA_DEFAULT_WIDTH];
+const ASR_FIT_WIDTHS: [usize; 4] = [CUDA_ASR_MAX_WIDTH, CUDA_MAX_WIDTH, 16, CUDA_DEFAULT_WIDTH];
 
-/// The widest of 32, 16 and 8 rows, at most `ceiling` and above `floor`,
+/// The widest of 64, 32, 16 and 8 rows, at most `ceiling` and above `floor`,
 /// whose rows of `per_row_bytes` take at most half of `headroom_bytes` (the
 /// planning headroom left after the model's resident weights); `floor`, the
 /// rows the model ran at before, when none does. The other half stays free
@@ -298,16 +310,29 @@ mod tests {
 
     const BACKENDS: [BackendKind; 3] = [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
 
+    /// The engine ceiling is the widest certified family, but for Rumble's
+    /// ASR decode on CUDA, which only the ASR engine width reaches.
     #[test]
     fn the_engine_ceiling_is_the_widest_certified_family() {
         for backend in BACKENDS {
             let widest = crate::model::ModelVariant::all()
                 .iter()
+                .filter(|variant| {
+                    backend != BackendKind::Cuda || variant.family() != ModelFamily::RumbleAsr
+                })
                 .map(|variant| certified_decode_width(variant.family(), backend))
                 .max()
                 .unwrap();
             assert_eq!(max_certified_decode_width(backend), widest, "{backend:?}");
         }
+        assert_eq!(
+            certified_decode_width(ModelFamily::RumbleAsr, BackendKind::Cuda),
+            CUDA_ASR_MAX_WIDTH
+        );
+        assert_eq!(
+            asr_engine_width(BackendKind::Cuda, 8, true),
+            CUDA_ASR_MAX_WIDTH
+        );
     }
 
     #[test]
@@ -397,8 +422,8 @@ mod tests {
     }
 
     /// The ten ASR families whose decode steps every row per launch take
-    /// the CUDA ceiling; every other speech family keeps the engine rows, and
-    /// none changes on CPU or Metal.
+    /// the CUDA ceiling (Rumble the ASR ceiling past it); every other speech
+    /// family keeps the engine rows, and none changes on CPU or Metal.
     #[test]
     fn batched_asr_decode_families_take_the_cuda_ceiling() {
         const WIDE: [ModelFamily; 10] = [
@@ -416,7 +441,11 @@ mod tests {
         for family in WIDE {
             assert_eq!(
                 certified_decode_width(family, BackendKind::Cuda),
-                CUDA_MAX_WIDTH,
+                if family == ModelFamily::RumbleAsr {
+                    CUDA_ASR_MAX_WIDTH
+                } else {
+                    CUDA_MAX_WIDTH
+                },
                 "{family:?}"
             );
             for backend in [BackendKind::Cpu, BackendKind::Metal] {
@@ -475,8 +504,28 @@ mod tests {
         );
         assert_eq!(
             decode(ModelFamily::RumbleAsr, BackendKind::Cuda, 8, true),
-            CUDA_MAX_WIDTH
+            CUDA_ASR_MAX_WIDTH
         );
+        // Every other ASR family stays at its certified 32 under the wider
+        // ASR engine width, and TTS at its own.
+        for variant in crate::model::ModelVariant::all() {
+            let family = variant.family();
+            if family != ModelFamily::RumbleAsr {
+                assert!(
+                    decode(family, BackendKind::Cuda, 8, true) <= CUDA_MAX_WIDTH,
+                    "{family:?}"
+                );
+                assert!(
+                    tts_decode_width(
+                        family,
+                        BackendKind::Cuda,
+                        8,
+                        tts_engine_width(BackendKind::Cuda, 8, 8, true)
+                    ) <= CUDA_MAX_WIDTH,
+                    "{family:?}"
+                );
+            }
+        }
         assert_eq!(
             decode(ModelFamily::RumbleAsr, BackendKind::Metal, 2, true),
             2
@@ -521,6 +570,10 @@ mod tests {
         // Below even the floor's rows the model keeps the rows it ran at.
         assert_eq!(fit_asr_decode_width(32, 8, row, GIB), 8);
         assert_eq!(fit_asr_decode_width(32, 8, row, 0), 8);
+        // Rumble's 64-row ceiling takes 64 rows where half the headroom
+        // holds them, else the widest narrower width.
+        assert_eq!(fit_asr_decode_width(64, 8, row, 70 * GIB), 64);
+        assert_eq!(fit_asr_decode_width(64, 8, row, 12 * GIB), 32);
         // The fit never exceeds the ceiling, and never drops below a floor
         // that is not one of its widths.
         assert_eq!(fit_asr_decode_width(16, 8, row, 70 * GIB), 16);

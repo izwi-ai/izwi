@@ -28,6 +28,11 @@ use super::transcript::split_rumble_output;
 
 static NEXT_DECODE_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The retained graph's batched prefill stage on CUDA: the rows a step
+/// prefills run as one mixed trunk step
+/// ([`RumbleAsrModel::continue_resumable_prefill_batch`]).
+pub(crate) const RUMBLE_STATIC_PREFILL_STAGE: &str = "asr.rumble.prefill.tensor_static";
+
 /// The retained route's switch for Rumble (on by default on CUDA only).
 pub(crate) const RUMBLE_RETAINED_DECODE_ENV: &str = "IZWI_RUMBLE_RETAINED_DECODE";
 
@@ -139,7 +144,11 @@ pub(crate) struct RumbleAsrPreparationStageSeal {
     pub(crate) dtype: String,
     pub(crate) max_work_units: u64,
     pub(crate) max_materialized_tensor_elements_per_row: u64,
+    /// One row's workspace ceiling, beside the pass's base.
     pub(crate) max_workspace_bytes: u64,
+    /// Workspace one pass holds whatever its rows
+    /// ([`RumbleAsrModel::preparation_workspace_base_bytes`]).
+    pub(crate) workspace_base_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,6 +565,12 @@ impl RumbleAsrModel {
     /// MLP rows per token plus its windowed attention scores for every
     /// head, the projector, and the prompt's assembly. The same formula
     /// prices a request's reservation and the loaded model's ceiling.
+    ///
+    /// On CUDA the stem's slices serve every row of a pass, so their
+    /// transient is the stage's base ([`Self::preparation_workspace_base_bytes`])
+    /// rather than each row's, and the encoder's attention runs over whole
+    /// padded windows (`audio_tower::WindowPlan`), so its per-token terms
+    /// cover the row's tokens rounded up to whole windows.
     fn preparation_workspace_bytes(
         &self,
         mel_frames: usize,
@@ -575,11 +590,24 @@ impl RumbleAsrModel {
             * 2;
         let chunks = mel_frames.div_ceil(chunk_frames.max(1));
         let element_bytes = std::mem::size_of::<f32>() as u64;
-        let conv_bytes = to_u64(chunks, "conv workspace")?
-            .checked_mul(to_u64(conv_chunk_elements, "conv workspace")?)
-            .and_then(|elements| elements.checked_mul(element_bytes))
-            .ok_or_else(|| overflow("conv workspace"))?
-            .min(2 * RUMBLE_AUDIO_CNN_SLICE_BUDGET_BYTES);
+        let per_pass_stem = self.device().kind.is_cuda();
+        let conv_bytes = if per_pass_stem {
+            0
+        } else {
+            to_u64(chunks, "conv workspace")?
+                .checked_mul(to_u64(conv_chunk_elements, "conv workspace")?)
+                .and_then(|elements| elements.checked_mul(element_bytes))
+                .ok_or_else(|| overflow("conv workspace"))?
+                .min(2 * RUMBLE_AUDIO_CNN_SLICE_BUDGET_BYTES)
+        };
+        let encoder_tokens = if per_pass_stem {
+            audio_tokens
+                .div_ceil(window_tokens.max(1))
+                .checked_mul(window_tokens.max(1))
+                .ok_or_else(|| overflow("encoder workspace"))?
+        } else {
+            audio_tokens
+        };
         let per_token = [
             audio.d_model * 10,
             audio.encoder_ffn_dim * 2,
@@ -592,7 +620,7 @@ impl RumbleAsrModel {
         let elements = mel_frames
             .checked_mul(audio.num_mel_bins * 2)
             .and_then(|features| {
-                audio_tokens
+                encoder_tokens
                     .checked_mul(per_token)
                     .and_then(|encoder| features.checked_add(encoder))
             })
@@ -607,6 +635,18 @@ impl RumbleAsrModel {
             .and_then(|bytes| bytes.checked_add(conv_bytes))
             .filter(|bytes| *bytes > 0)
             .ok_or_else(|| overflow("preparation workspace"))
+    }
+
+    /// Bytes one preparation pass holds whatever its rows: on CUDA the conv
+    /// stem's slices (each under its byte budget, priced at two in flight),
+    /// which [`Self::preparation_workspace_bytes`] then leaves out of every
+    /// row; elsewhere 0, each row pricing the stem itself.
+    pub(crate) fn preparation_workspace_base_bytes(&self) -> u64 {
+        if self.device().kind.is_cuda() {
+            2 * RUMBLE_AUDIO_CNN_SLICE_BUDGET_BYTES
+        } else {
+            0
+        }
     }
 
     /// The ceilings of one request's preparation on `backend`: 30 s of audio
@@ -649,6 +689,7 @@ impl RumbleAsrModel {
                 audio_tokens,
                 prompt_tokens,
             )?,
+            workspace_base_bytes: self.preparation_workspace_base_bytes(),
         })
     }
 
@@ -802,14 +843,20 @@ impl RumbleAsrModel {
         })
     }
 
-    /// Prefill `[span_start, span_end)` of the row's prompt. The last span
-    /// stages the greedy first token. Returns whether prefill is complete.
-    pub(crate) fn continue_resumable_prefill(
+    /// Whether this load prefills rows together in one mixed trunk step
+    /// ([`Self::continue_resumable_prefill_batch`]): CUDA's retained route,
+    /// whose lone rows take the same step so a row prefills the same way
+    /// alone as beside others. CPU and Metal prefill one row at a time.
+    pub(crate) fn supports_static_prefill_batch(&self) -> bool {
+        self.retained_decode() && self.device().kind.is_cuda()
+    }
+
+    fn validate_prefill_span(
         &self,
-        state: &mut RumbleDecodeState,
+        state: &RumbleDecodeState,
         span_start: usize,
         span_end: usize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if state.artifact.model_identity != self.model_identity() {
             return Err(Error::InvalidInput(
                 "Rumble retained state belongs to another loaded model".into(),
@@ -825,6 +872,24 @@ impl RumbleAsrModel {
                 "Rumble prefill span is non-monotonic or out of range".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Prefill `[span_start, span_end)` of the row's prompt. The last span
+    /// stages the greedy first token. Returns whether prefill is complete.
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut RumbleDecodeState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        if self.supports_static_prefill_batch() {
+            return self
+                .continue_resumable_prefill_batch(&mut [(state, span_start, span_end)])?
+                .pop()
+                .ok_or_else(|| Error::InferenceError("Rumble prefill lost its row".into()));
+        }
+        self.validate_prefill_span(state, span_start, span_end)?;
         let span = state
             .artifact
             .embeddings
@@ -855,6 +920,90 @@ impl RumbleAsrModel {
         state.prefill_progress = span_end;
         state.pos = span_end;
         state.managed_completions_drained = false;
+        Ok(complete)
+    }
+
+    /// Prefill each row's span `[start, end)` in one mixed trunk step: every
+    /// row's span of prompt embeddings runs through the projections and MLP
+    /// together, and each layer writes all K/V once and attends per row on
+    /// that row's own pages. A row whose span ends its prompt stages its
+    /// greedy first token. Returns whether each row's prefill is complete.
+    /// The rows' caches must share one arena; they advance only when the
+    /// whole step succeeds.
+    pub(crate) fn continue_resumable_prefill_batch(
+        &self,
+        rows: &mut [(&mut RumbleDecodeState, usize, usize)],
+    ) -> Result<Vec<bool>> {
+        use crate::models::shared::attention::mixed::{MixedRowLayout, MixedRowSpan};
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        for (state, start, end) in rows.iter() {
+            self.validate_prefill_span(state, *start, *end)?;
+        }
+        let complete = rows
+            .iter()
+            .map(|(state, _, end)| *end == state.artifact.prompt_tokens)
+            .collect::<Vec<_>>();
+        let sample_rows = complete
+            .iter()
+            .enumerate()
+            .filter_map(|(row, complete)| complete.then_some(row))
+            .collect::<Vec<_>>();
+        let spans = rows
+            .iter()
+            .map(|(state, start, end)| state.artifact.embeddings.narrow(1, *start, end - start))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let embeds = if spans.len() == 1 {
+            spans[0].clone()
+        } else {
+            Tensor::cat(&spans, 1)?
+        };
+        drop(spans);
+        let layout = MixedRowLayout::new(
+            rows.iter()
+                .map(|(_, start, end)| MixedRowSpan {
+                    start_pos: *start,
+                    q_len: end - start,
+                })
+                .collect(),
+            0,
+        )?;
+        let logits = {
+            let mut caches = rows
+                .iter_mut()
+                .map(|(state, _, _)| &mut state.cache)
+                .collect::<Vec<_>>();
+            self.text_model().forward_managed_mixed_with_embeds(
+                &embeds,
+                layout,
+                &mut caches,
+                &sample_rows,
+            )?
+        };
+        let sampled = match logits {
+            Some(logits) => sampled_argmax(&logits)?,
+            None => Vec::new(),
+        };
+        if sampled.len() != sample_rows.len() {
+            return Err(Error::InferenceError(
+                "Rumble prefill batch sampled the wrong row count".into(),
+            ));
+        }
+        for (row, token) in sample_rows.into_iter().zip(sampled) {
+            rows[row].0.pending_token = Some(token);
+        }
+        for (state, _, end) in rows.iter_mut() {
+            if state.cache.context_len() != *end {
+                return Err(Error::InferenceError(format!(
+                    "Rumble prefill committed {} tokens instead of {end}",
+                    state.cache.context_len()
+                )));
+            }
+            state.prefill_progress = *end;
+            state.pos = *end;
+            state.managed_completions_drained = false;
+        }
         Ok(complete)
     }
 
@@ -1014,6 +1163,16 @@ impl RumbleAsrModel {
         let delta = state.publish_stable_text(true)?;
         Ok(state.step(delta))
     }
+}
+
+/// The argmax of each row of `[rows, vocab]` logits.
+fn sampled_argmax(logits: &Tensor) -> Result<Vec<u32>> {
+    logits
+        .to_dtype(DType::F32)?
+        .argmax(D::Minus1)?
+        .to_dtype(DType::U32)?
+        .to_vec1::<u32>()
+        .map_err(Error::from)
 }
 
 /// The argmax of each row's last position of `[rows, sequence, vocab]`.

@@ -17,7 +17,7 @@ use crate::models::architectures::qwen3::core::repeat_kv;
 
 #[path = "dac_streaming.rs"]
 mod streaming;
-pub(crate) use streaming::FishS2DacStreamState;
+pub(crate) use streaming::{fish_s2_codec_graph_device_bytes, FishS2DacStreamState};
 
 pub(crate) const ATTENTION_QUERY_BLOCK: usize = 64;
 
@@ -53,6 +53,9 @@ pub struct FishS2DacDecoder {
     encoder: FishS2DacAudioEncoder,
     quantizer: FishS2DownsampleResidualVectorQuantizer,
     decoder: FishS2DacAudioDecoder,
+    /// On CUDA, streaming pushes at fixed shapes (and their graphs); `None`
+    /// runs them at each stream's own history lengths.
+    stream: Option<streaming::FishS2DacFixedStream>,
 }
 
 struct FishS2DownsampleResidualVectorQuantizer {
@@ -361,12 +364,17 @@ impl FishS2DacDecoder {
         let encoder = FishS2DacAudioEncoder::load(&config, vb.pp("encoder"))?;
         let quantizer = FishS2DownsampleResidualVectorQuantizer::load(&config, vb.pp("quantizer"))?;
         let decoder = FishS2DacAudioDecoder::load(&config, vb.pp("decoder"))?;
-        Ok(Self {
+        let mut codec = Self {
             config,
             encoder,
             quantizer,
             decoder,
-        })
+            stream: None,
+        };
+        if vb.device().is_cuda() {
+            codec.stream = streaming::FishS2DacFixedStream::new(&codec)?;
+        }
+        Ok(codec)
     }
 
     pub fn config(&self) -> &FishS2DacConfig {

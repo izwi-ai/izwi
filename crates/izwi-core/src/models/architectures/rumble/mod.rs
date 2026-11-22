@@ -61,7 +61,7 @@ pub use prompt::{
 pub(crate) use retained::{
     rumble_retained_decode_enabled, RumbleAsrPreparationStageSeal, RumbleDecodeCheckpoint,
     RumbleDecodeState, RumbleDecodeStep, RumblePreparedGeometry, RumblePreparedPromptArtifact,
-    RUMBLE_RETAINED_DECODE_ENV,
+    RUMBLE_RETAINED_DECODE_ENV, RUMBLE_STATIC_PREFILL_STAGE,
 };
 pub use tokenizer::{RumbleSpecialTokens, RumbleTokenizer};
 pub use transcript::{split_rumble_output, RumbleOutput};

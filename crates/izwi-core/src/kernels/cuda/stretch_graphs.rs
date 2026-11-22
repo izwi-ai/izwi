@@ -85,6 +85,9 @@ pub struct StretchGraphs {
     label: &'static str,
     device: Device,
     stretches: usize,
+    /// Which step widths replay graphs: [`graphed_width`] unless the model
+    /// set its own ([`Self::with_widths`]).
+    widths: fn(usize) -> bool,
     runtime: Mutex<Runtime>,
     warmups: AtomicU64,
     captures: AtomicU64,
@@ -114,12 +117,21 @@ impl StretchGraphs {
             label,
             device: device.clone(),
             stretches,
+            widths: graphed_width,
             runtime: Mutex::new(Ok(HashMap::new())),
             warmups: AtomicU64::new(0),
             captures: AtomicU64::new(0),
             verified: AtomicU64::new(0),
             replays: AtomicU64::new(0),
         })
+    }
+
+    /// The graphs replaying the step widths `graphed` accepts in place of
+    /// [`graphed_width`]: for a model whose stretches carry no per-row state
+    /// copies and that pads every step to one width, say.
+    pub fn with_widths(mut self, graphed: fn(usize) -> bool) -> Self {
+        self.widths = graphed;
+        self
     }
 
     /// A step of `rows` rows through the graphs, or `None` when they are off,
@@ -132,7 +144,7 @@ impl StretchGraphs {
     /// (a sampling policy, say) as launch arguments: `key` fingerprints
     /// them, and each key keeps its own graphs.
     pub fn begin_keyed(&self, rows: usize, key: u64) -> Option<StepRun<'_>> {
-        if !graphed_width(rows) {
+        if !(self.widths)(rows) {
             return None;
         }
         let guard = self.runtime.try_lock().ok()?;

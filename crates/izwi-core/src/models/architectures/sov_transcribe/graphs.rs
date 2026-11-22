@@ -61,20 +61,50 @@ pub fn resolve_encoder(device: &Device) -> Result<ShapeGraphs<usize>, String> {
     ShapeGraphs::resolve("SOV-Transcribe encoder", device, ENCODER_GRAPH_LIMITS)
 }
 
+/// The row counts a decode step's graphs are captured at: a step pads its
+/// rows to the next of these, so every width up to the fitted 32 replays a
+/// graph (the stretches hold no per-row state, only the step's activations).
+pub const DECODE_GRAPH_WIDTHS: [usize; 6] = [1, 2, 4, 8, 16, 32];
+
+/// The captured width a step of `rows` rows pads to, or `None` past the
+/// widest.
+pub fn decode_graph_width(rows: usize) -> Option<usize> {
+    DECODE_GRAPH_WIDTHS
+        .iter()
+        .copied()
+        .find(|&width| width >= rows)
+}
+
+fn graphed_decode_width(rows: usize) -> bool {
+    DECODE_GRAPH_WIDTHS.contains(&rows)
+}
+
 /// The decode step's graphs for `stretches` stretches on `device`, or why
 /// it has none.
 pub fn resolve_decode(device: &Device, stretches: usize) -> Result<StretchGraphs, String> {
-    StretchGraphs::resolve(
+    Ok(StretchGraphs::resolve(
         "SOV-Transcribe decoder",
         DECODE_GRAPHS_ENV,
         device,
         stretches,
-    )
+    )?
+    .with_widths(graphed_decode_width))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_steps_pad_to_the_next_captured_width() {
+        assert_eq!(decode_graph_width(1), Some(1));
+        assert_eq!(decode_graph_width(3), Some(4));
+        assert_eq!(decode_graph_width(9), Some(16));
+        assert_eq!(decode_graph_width(32), Some(32));
+        assert_eq!(decode_graph_width(33), None);
+        assert!(DECODE_GRAPH_WIDTHS.iter().all(|&w| graphed_decode_width(w)));
+        assert!(!graphed_decode_width(3));
+    }
 
     #[test]
     fn graphs_are_cuda_only() {

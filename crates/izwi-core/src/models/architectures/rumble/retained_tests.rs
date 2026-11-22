@@ -232,6 +232,115 @@ fn rows_decode_the_same_alone_and_batched() {
     assert_ne!(alone[0].0, alone[2].0);
 }
 
+/// Rows prefilled together in one mixed step, in whole prompts or in spans
+/// beside other rows' whole prompts, stage what they stage alone and then
+/// decode the same tokens.
+#[test]
+fn rows_prefill_the_same_alone_and_batched() {
+    let checkpoint = SyntheticRumbleCheckpoint::write();
+    let model = load(&checkpoint);
+    let clips = [
+        (tone(16_000, 0.031), 9),
+        (tone(40_000, 0.012), 6),
+        (tone(8_000, 0.07), 12),
+    ];
+    let decode_all = |states: &mut [RumbleDecodeState]| {
+        while states.iter().any(|state| !state.finished()) {
+            let mut rows = states
+                .iter_mut()
+                .filter(|state| !state.finished())
+                .collect::<Vec<_>>();
+            model.decode_step_batch(&mut rows).expect("batch decodes");
+            for state in states.iter_mut() {
+                let _ = state.take_managed_write_completions();
+            }
+        }
+        states
+            .iter()
+            .map(|state| state.generated_ids().to_vec())
+            .collect::<Vec<_>>()
+    };
+    let alone = clips
+        .iter()
+        .map(|(audio, budget)| {
+            let mut state = model
+                .begin_resumable_prefill_managed(
+                    artifact(&model, audio),
+                    options(*budget),
+                    caches(&model, 1).pop().unwrap(),
+                )
+                .unwrap();
+            prefill(&model, &mut state, usize::MAX / 2);
+            decode_all(std::slice::from_mut(&mut state)).remove(0)
+        })
+        .collect::<Vec<_>>();
+
+    let mut states = clips
+        .iter()
+        .zip(caches(&model, clips.len()))
+        .map(|((audio, budget), cache)| {
+            model
+                .begin_resumable_prefill_managed(artifact(&model, audio), options(*budget), cache)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let totals = states
+        .iter()
+        .map(RumbleDecodeState::prefill_token_count)
+        .collect::<Vec<_>>();
+    // Rows 0 and 2 prefill whole beside row 1's first span; row 1 then
+    // finishes alone.
+    {
+        let [first, second, third] = &mut states[..] else {
+            unreachable!()
+        };
+        let complete = model
+            .continue_resumable_prefill_batch(&mut [
+                (first, 0, totals[0]),
+                (second, 0, 7),
+                (third, 0, totals[2]),
+            ])
+            .expect("rows prefill together");
+        assert_eq!(complete, vec![true, false, true]);
+        let complete = model
+            .continue_resumable_prefill_batch(&mut [(second, 7, totals[1])])
+            .expect("the last span prefills");
+        assert_eq!(complete, vec![true]);
+    }
+    for (state, total) in states.iter_mut().zip(&totals) {
+        assert_eq!(state.prefill_progress(), *total);
+        assert_eq!(state.sequence_position(), *total);
+        let _ = state.take_managed_write_completions();
+    }
+    assert_eq!(decode_all(&mut states), alone);
+    assert_ne!(alone[0], alone[2]);
+
+    // A span out of order refuses the whole batch and moves no row.
+    let mut states = clips[..2]
+        .iter()
+        .zip(caches(&model, 2))
+        .map(|((audio, budget), cache)| {
+            model
+                .begin_resumable_prefill_managed(artifact(&model, audio), options(*budget), cache)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let [first, second] = &mut states[..] else {
+        unreachable!()
+    };
+    assert!(model
+        .continue_resumable_prefill_batch(&mut [(first, 0, 5), (second, 3, 9)])
+        .is_err());
+    assert_eq!(
+        (first.prefill_progress(), second.prefill_progress()),
+        (0, 0)
+    );
+    assert!(model
+        .continue_resumable_prefill_batch(&mut [])
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn misuse_of_a_retained_row_is_refused() {
     let checkpoint = SyntheticRumbleCheckpoint::write();

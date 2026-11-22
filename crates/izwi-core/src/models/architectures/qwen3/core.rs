@@ -3532,6 +3532,15 @@ impl Qwen3Model {
                         ids, &positions, &cos, &sin, &attention,
                     )?])
                 };
+                // A grown arena (new generation) or a rebuilt RoPE table
+                // replaced buffers the older graphs captured: they can never
+                // replay, and dropping them lets the recaptures reuse their
+                // pages instead of growing the graph pool past its price
+                // (Rumble's graphs turned off five seconds into a load).
+                graph.graphs.retain(|kept| {
+                    kept.arena != key.arena
+                        || (kept.generation >= key.generation && kept.rope_rows >= key.rope_rows)
+                });
                 output = graph.graphs.run(key, retained, &inputs, &body)?.pop();
                 Ok(())
             },
@@ -3615,7 +3624,27 @@ impl Qwen3Model {
         caches: &mut [&mut PhysicalPagedKvCache],
         sample_rows: &[usize],
     ) -> Result<Option<Tensor>> {
-        if input_ids.len() != layout.total_tokens()
+        if input_ids.len() != layout.total_tokens() {
+            return Err(Error::InvalidInput(
+                "Qwen3 mixed step inputs do not match its row layout".to_string(),
+            ));
+        }
+        let ids = Tensor::from_slice(input_ids, (1, input_ids.len()), &self.device)?;
+        let embeds = self.embeddings(&ids)?;
+        self.forward_managed_mixed_with_embeds(&embeds, layout, caches, sample_rows)
+    }
+
+    /// [`Self::forward_managed_mixed`] over caller-provided embeddings
+    /// `[1, total tokens, hidden]` in `layout` order (an audio model's
+    /// prompts with their audio spliced in).
+    pub(crate) fn forward_managed_mixed_with_embeds(
+        &self,
+        embeds: &Tensor,
+        layout: MixedRowLayout,
+        caches: &mut [&mut PhysicalPagedKvCache],
+        sample_rows: &[usize],
+    ) -> Result<Option<Tensor>> {
+        if embeds.dims() != [1, layout.total_tokens(), self.cfg.hidden_size]
             || caches.len() != layout.rows().len()
             || sample_rows.iter().any(|row| *row >= caches.len())
         {
@@ -3646,8 +3675,7 @@ impl Qwen3Model {
             let refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
             let mut step = PreparedPhysicalMixedStep::new(&refs, layout)?;
             let logits = (|| -> Result<Option<Tensor>> {
-                let ids = Tensor::from_slice(input_ids, (1, input_ids.len()), &self.device)?;
-                let mut x = self.embeddings(&ids)?;
+                let mut x = embeds.clone();
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     x = layer.forward_managed_mixed(&x, &refs, &mut step, layer_idx)?;
                 }

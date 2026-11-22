@@ -361,8 +361,8 @@ fn device_expert_paths_match_the_host_routed_reference() {
     // kernels' CPU reference).
     assert_eq!(model.decoder().moe_backend(), MoeBackend::Auto);
     assert!(model.decoder().fused_experts_supported());
-    for path in [ExpertPath::Gathered, ExpertPath::Fused] {
-        for rows in [1, 3, 9] {
+    for path in [ExpertPath::Gathered, ExpertPath::Fused, ExpertPath::Grouped] {
+        for rows in [1, 3, 9, 40] {
             let error = model.decoder().check_expert_path(path, rows).unwrap();
             assert!(error < 1e-5, "{path:?} {rows} rows: {error}");
         }
@@ -372,6 +372,9 @@ fn device_expert_paths_match_the_host_routed_reference() {
     assert_eq!(MoeBackend::Device.path(&cpu, 64, 8), ExpertPath::Gathered);
     assert_eq!(MoeBackend::Fused.path(&cpu, 64, 8), ExpertPath::Fused);
     assert_eq!(MoeBackend::Host.path(&cpu, 1, 8), ExpertPath::Host);
+    assert_eq!(MoeBackend::Grouped.path(&cpu, 64, 8), ExpertPath::Grouped);
+    assert!(!MoeBackend::Grouped.routes_on_device(&cpu, 64, 8));
+    assert_eq!(MoeBackend::parse("grouped").unwrap(), MoeBackend::Grouped);
     assert!(!MoeBackend::Auto.routes_on_device(&cpu, 1, 8));
     assert_eq!(FUSED_MAX_PAIRS / 8, 64);
     assert_eq!(MoeBackend::parse("fused").unwrap(), MoeBackend::Fused);

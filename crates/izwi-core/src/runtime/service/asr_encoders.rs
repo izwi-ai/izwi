@@ -172,7 +172,41 @@ encoder_batch_row!(
 /// widths are the same for every class, so batch shapes do not change.
 pub(super) struct EncoderBatchFormation<K, P> {
     /// A key's queue exists exactly while a runner drains it.
-    queues: std::sync::Mutex<HashMap<K, VecDeque<P>>>,
+    queues: std::sync::Mutex<HashMap<K, VecDeque<QueuedEncoderRow<P>>>>,
+}
+
+/// A waiting row and when it was queued.
+struct QueuedEncoderRow<P> {
+    queued_at: Instant,
+    row: P,
+}
+
+/// How often a paced runner ([`EncoderBatchFormation::run_paced`]) that
+/// chose to wait looks at its queue again.
+const PACED_ENCODER_POLL: Duration = Duration::from_millis(1);
+
+/// What a paced runner does next.
+enum PacedEncoderBatch<P> {
+    Run(Vec<P>),
+    Wait,
+    Retired,
+}
+
+/// A runner that unwinds drops its key's waiting rows, whose submitters
+/// then fail, and frees the key for a new runner.
+struct AbandonEncoderRunner<'a, K: Eq + std::hash::Hash, P: EncoderBatchRow> {
+    formation: &'a EncoderBatchFormation<K, P>,
+    key: &'a K,
+    armed: bool,
+}
+
+impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> Drop for AbandonEncoderRunner<'_, K, P> {
+    fn drop(&mut self) {
+        if self.armed {
+            let rows = self.formation.queues().remove(self.key);
+            drop(rows);
+        }
+    }
 }
 
 impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> EncoderBatchFormation<K, P> {
@@ -182,7 +216,7 @@ impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> EncoderBatchFormation<K, P> {
         }
     }
 
-    fn queues(&self) -> std::sync::MutexGuard<'_, HashMap<K, VecDeque<P>>> {
+    fn queues(&self) -> std::sync::MutexGuard<'_, HashMap<K, VecDeque<QueuedEncoderRow<P>>>> {
         self.queues
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -191,6 +225,10 @@ impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> EncoderBatchFormation<K, P> {
     /// Queues `row` under `key`. True when the key had no runner: the
     /// caller then starts one with [`Self::run`].
     pub(super) fn push(&self, key: K, row: P) -> bool {
+        let row = QueuedEncoderRow {
+            queued_at: Instant::now(),
+            row,
+        };
         let mut queues = self.queues();
         match queues.get_mut(&key) {
             Some(queue) => {
@@ -212,24 +250,7 @@ impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> EncoderBatchFormation<K, P> {
         F: FnMut(Vec<P>) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        /// A runner that unwinds drops its key's waiting rows, whose
-        /// submitters then fail, and frees the key for a new runner.
-        struct Abandon<'a, K: Eq + std::hash::Hash, P: EncoderBatchRow> {
-            formation: &'a EncoderBatchFormation<K, P>,
-            key: &'a K,
-            armed: bool,
-        }
-
-        impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> Drop for Abandon<'_, K, P> {
-            fn drop(&mut self) {
-                if self.armed {
-                    let rows = self.formation.queues().remove(self.key);
-                    drop(rows);
-                }
-            }
-        }
-
-        let mut abandon = Abandon {
+        let mut abandon = AbandonEncoderRunner {
             formation: self,
             key,
             armed: true,
@@ -237,6 +258,38 @@ impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> EncoderBatchFormation<K, P> {
         yield_now().await;
         while let Some(batch) = self.next_batch(key, max_width) {
             run_batch(batch).await;
+        }
+        abandon.armed = false;
+    }
+
+    /// [`Self::run`] with each batch's width chosen by `width`, which is
+    /// handed the rows waiting and how long the oldest of them has waited
+    /// and returns the rows to take now (clamped to `1..=max_width`), or
+    /// `None` to look again after [`PACED_ENCODER_POLL`]. Rows already
+    /// runnable in this executor turn are queued before the first look.
+    pub(super) async fn run_paced<W, F, Fut>(
+        &self,
+        key: &K,
+        max_width: usize,
+        mut width: W,
+        mut run_batch: F,
+    ) where
+        W: FnMut(usize, Duration) -> Option<usize>,
+        F: FnMut(Vec<P>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let mut abandon = AbandonEncoderRunner {
+            formation: self,
+            key,
+            armed: true,
+        };
+        yield_now().await;
+        loop {
+            match self.next_paced_batch(key, max_width, &mut width) {
+                PacedEncoderBatch::Run(batch) => run_batch(batch).await,
+                PacedEncoderBatch::Wait => tokio::time::sleep(PACED_ENCODER_POLL).await,
+                PacedEncoderBatch::Retired => break,
+            }
         }
         abandon.armed = false;
     }
@@ -250,10 +303,43 @@ impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> EncoderBatchFormation<K, P> {
             return None;
         }
         let width = queue.len().min(max_width.max(1));
+        Some(Self::take(queue, width))
+    }
+
+    /// What a paced runner does next: run the batch `width` sizes, wait,
+    /// or retire the key's empty queue.
+    fn next_paced_batch(
+        &self,
+        key: &K,
+        max_width: usize,
+        width: &mut impl FnMut(usize, Duration) -> Option<usize>,
+    ) -> PacedEncoderBatch<P> {
+        let mut queues = self.queues();
+        let Some(queue) = queues.get_mut(key) else {
+            return PacedEncoderBatch::Retired;
+        };
+        let Some(oldest) = queue.iter().map(|queued| queued.queued_at).min() else {
+            queues.remove(key);
+            return PacedEncoderBatch::Retired;
+        };
+        match width(queue.len(), oldest.elapsed()) {
+            Some(rows) => {
+                let rows = rows.clamp(1, max_width.max(1)).min(queue.len());
+                PacedEncoderBatch::Run(Self::take(queue, rows))
+            }
+            None => PacedEncoderBatch::Wait,
+        }
+    }
+
+    /// Take `width` rows off a queue: the heaviest workload classes first,
+    /// oldest first within a class, held in arrival order.
+    fn take(queue: &mut VecDeque<QueuedEncoderRow<P>>, width: usize) -> Vec<P> {
         // The sort is stable, so rows of one class stay oldest first and a
         // queue of one class yields its first `width` rows, as it always has.
         let mut order = (0..queue.len()).collect::<Vec<_>>();
-        order.sort_by_key(|&row| std::cmp::Reverse(queue[row].workload_class().service_weight()));
+        order.sort_by_key(|&row| {
+            std::cmp::Reverse(queue[row].row.workload_class().service_weight())
+        });
         let mut taken = order[..width].to_vec();
         taken.sort_unstable();
         // Removing from the back keeps the earlier indices valid; the batch
@@ -261,10 +347,10 @@ impl<K: Eq + std::hash::Hash, P: EncoderBatchRow> EncoderBatchFormation<K, P> {
         let mut batch = taken
             .into_iter()
             .rev()
-            .filter_map(|row| queue.remove(row))
+            .filter_map(|row| queue.remove(row).map(|queued| queued.row))
             .collect::<Vec<_>>();
         batch.reverse();
-        Some(batch)
+        batch
     }
 }
 
@@ -363,6 +449,53 @@ pub(super) struct RumbleEncoderQueueKey {
 pub(super) struct RumbleEncoderBatcher {
     pub(super) coordinator: Arc<InferenceCoordinator>,
     pub(super) formation: EncoderBatchFormation<RumbleEncoderQueueKey, RumbleEncoderPending>,
+    /// Each key's encoded rows that have not finished: an artifact lives
+    /// while its request prefills, decodes or waits for decode rows.
+    outstanding: std::sync::Mutex<
+        HashMap<RumbleEncoderQueueKey, Vec<std::sync::Weak<RumblePreparedPromptArtifact>>>,
+    >,
+}
+
+/// Overrides how long a queued Rumble row waits for a wider encoder pass on
+/// CUDA (default [`RUMBLE_ENCODER_DEFAULT_MAX_WAIT`]).
+pub(super) const RUMBLE_ENCODER_MAX_WAIT_ENV: &str = "IZWI_RUMBLE_ENCODER_MAX_WAIT_MS";
+const RUMBLE_ENCODER_DEFAULT_MAX_WAIT: Duration = Duration::from_millis(40);
+
+fn rumble_encoder_max_wait() -> Duration {
+    static WAIT: crate::env::ReadOnce<Duration> = crate::env::ReadOnce::new(|| {
+        crate::env::value(RUMBLE_ENCODER_MAX_WAIT_ENV)
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map_or(RUMBLE_ENCODER_DEFAULT_MAX_WAIT, Duration::from_millis)
+    });
+    WAIT.get()
+}
+
+/// The rows Rumble's next encoder pass takes from `queued` waiting rows, or
+/// `None` to wait for more.
+///
+/// Encoded rows that have not finished (`outstanding`) hold or await decode
+/// rows; the pipeline absorbs `decode_width` of them decoding plus one pass
+/// of `max_width` waiting, so that is the pass's budget. While the decode
+/// has free rows the pass runs at once (no added latency under light load).
+/// Once it is full, rows queue in front of the encoder until the budget
+/// takes at least half a pass (or every queued row), so the device runs a
+/// few wide passes instead of many narrow ones; no row waits past
+/// `max_wait`.
+fn rumble_encoder_pass_width(
+    queued: usize,
+    max_width: usize,
+    decode_width: usize,
+    outstanding: usize,
+    oldest_wait: Duration,
+    max_wait: Duration,
+) -> Option<usize> {
+    let max_width = max_width.max(1);
+    let budget = (decode_width + max_width).saturating_sub(outstanding);
+    let rows = queued.min(budget).min(max_width);
+    let ready = outstanding < decode_width
+        || (rows > 0 && budget >= queued.min(max_width / 2))
+        || oldest_wait >= max_wait;
+    ready.then_some(rows.max(1))
 }
 
 pub(super) fn granite_speech_deadline_budget_bucket(deadline: Option<Instant>, now: Instant) -> Option<u64> {
@@ -1856,7 +1989,44 @@ impl RumbleEncoderBatcher {
         Self {
             coordinator,
             formation: EncoderBatchFormation::new(),
+            outstanding: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    fn outstanding_rows(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        HashMap<RumbleEncoderQueueKey, Vec<std::sync::Weak<RumblePreparedPromptArtifact>>>,
+    > {
+        self.outstanding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The key's encoded rows whose artifacts are still alive.
+    fn outstanding(&self, key: &RumbleEncoderQueueKey) -> usize {
+        let mut outstanding = self.outstanding_rows();
+        let Some(rows) = outstanding.get_mut(key) else {
+            return 0;
+        };
+        rows.retain(|row| row.strong_count() > 0);
+        let count = rows.len();
+        if count == 0 {
+            outstanding.remove(key);
+        }
+        count
+    }
+
+    fn track(
+        &self,
+        key: &RumbleEncoderQueueKey,
+        artifacts: impl IntoIterator<Item = std::sync::Weak<RumblePreparedPromptArtifact>>,
+    ) {
+        let mut outstanding = self.outstanding_rows();
+        let rows = outstanding.entry(key.clone()).or_default();
+        rows.retain(|row| row.strong_count() > 0);
+        rows.extend(artifacts);
     }
 
     pub(super) async fn submit(
@@ -1877,6 +2047,21 @@ impl RumbleEncoderBatcher {
             binding: binding.key_for_stage(stage.id)?,
         };
         let max_width = stage.max_batch_size.max(1);
+        // On CUDA, where the encoder pass widens to 32 rows, rows queue in
+        // front of the encoder while the decode is full
+        // ([`rumble_encoder_pass_width`]).
+        let paced_decode_width = (pending.contract.execution_profile.backend == BackendKind::Cuda)
+            .then(|| {
+                pending
+                    .contract
+                    .stages
+                    .iter()
+                    .find(|stage| {
+                        stage.selector == crate::engine::StageWorkSelector::SequenceDecode
+                    })
+                    .map(|stage| stage.max_batch_size)
+            })
+            .flatten();
         let cancellation = pending.cancellation.clone();
         let (sender, receiver) = oneshot::channel();
         pending.response = Some(sender);
@@ -1884,10 +2069,31 @@ impl RumbleEncoderBatcher {
         if self.formation.push(key.clone(), pending) {
             let batcher = self.clone();
             tokio::spawn(async move {
-                batcher
-                    .formation
-                    .run(&key, max_width, |batch| batcher.run_batch(batch))
-                    .await;
+                let run_batch = |batch| batcher.run_batch(&key, batch);
+                match paced_decode_width {
+                    Some(decode_width) => {
+                        let max_wait = rumble_encoder_max_wait();
+                        batcher
+                            .formation
+                            .run_paced(
+                                &key,
+                                max_width,
+                                |queued, oldest_wait| {
+                                    rumble_encoder_pass_width(
+                                        queued,
+                                        max_width,
+                                        decode_width,
+                                        batcher.outstanding(&key),
+                                        oldest_wait,
+                                        max_wait,
+                                    )
+                                },
+                                run_batch,
+                            )
+                            .await;
+                    }
+                    None => batcher.formation.run(&key, max_width, run_batch).await,
+                }
             });
         }
 
@@ -1905,7 +2111,11 @@ impl RumbleEncoderBatcher {
     /// Encode the batch's features in one tower pass, each row into its own
     /// prompt artifact. Rows keep their own geometry: the stage is ragged,
     /// so every row is priced at exactly what it materializes.
-    pub(super) async fn run_batch(&self, mut batch: Vec<RumbleEncoderPending>) {
+    pub(super) async fn run_batch(
+        &self,
+        key: &RumbleEncoderQueueKey,
+        mut batch: Vec<RumbleEncoderPending>,
+    ) {
         let now = Instant::now();
         let mut live = Vec::with_capacity(batch.len());
         for mut row in batch.drain(..) {
@@ -2044,6 +2254,16 @@ impl RumbleEncoderBatcher {
             .await;
         match result {
             Ok(outcomes) => {
+                // Counted before a row's submitter can see (or drop) it.
+                self.track(
+                    key,
+                    outcomes.iter().filter_map(|outcome| match outcome {
+                        PreparationRowOutcome::Committed { artifact, .. } => {
+                            Some(Arc::downgrade(&artifact.value))
+                        }
+                        _ => None,
+                    }),
+                );
                 for (sender, outcome) in senders.into_iter().zip(outcomes) {
                     let _ = sender.send(outcome);
                 }
@@ -2460,6 +2680,82 @@ mod tests {
         assert!(runner.await.is_err());
         assert_eq!(dropped.load(Ordering::SeqCst), 3);
         assert!(formation.push(3, Row(dropped.clone())));
+    }
+
+    /// A paced runner takes the width its policy chooses, waits while the
+    /// policy says so, and retires the key once the queue drains.
+    #[tokio::test]
+    async fn a_paced_runner_waits_until_its_policy_takes_the_rows() {
+        let formation = Arc::new(EncoderBatchFormation::<u32, usize>::new());
+        assert!(formation.push(5, 0));
+        let batches = Batches::default();
+        let looks = Arc::new(AtomicUsize::new(0));
+        let runner = {
+            let (formation, recorded, looks) = (formation.clone(), batches.clone(), looks.clone());
+            tokio::spawn(async move {
+                formation
+                    .run_paced(
+                        &5,
+                        4,
+                        |queued, _oldest_wait| {
+                            looks.fetch_add(1, Ordering::SeqCst);
+                            // Hold the first row until three wait, then take
+                            // more than the width allows.
+                            (queued >= 3 || !recorded.lock().unwrap().is_empty()).then_some(9)
+                        },
+                        |batch| {
+                            recorded.lock().unwrap().push(batch);
+                            async {}
+                        },
+                    )
+                    .await;
+            })
+        };
+        while looks.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert!(batches.lock().unwrap().is_empty(), "one row waits");
+        for row in 1..7 {
+            assert!(!formation.push(5, row));
+        }
+        runner.await.unwrap();
+        assert_eq!(
+            *batches.lock().unwrap(),
+            vec![vec![0, 1, 2, 3], vec![4, 5, 6]]
+        );
+        assert!(formation.push(5, 7));
+    }
+
+    /// Rumble's encoder pass runs at once while the decode has free rows;
+    /// once it is full, rows wait until the budget takes half a pass (or
+    /// every queued row), or the oldest row has waited its limit.
+    #[test]
+    fn rumble_encoder_passes_wait_for_width_only_while_the_decode_is_full() {
+        use super::rumble_encoder_pass_width as width;
+        use std::time::Duration;
+        let (fresh, waited, limit) = (
+            Duration::ZERO,
+            Duration::from_millis(40),
+            Duration::from_millis(40),
+        );
+        // Light load: free decode rows, the pass runs now at full width.
+        assert_eq!(width(1, 32, 64, 0, fresh, limit), Some(1));
+        assert_eq!(width(40, 32, 64, 63, fresh, limit), Some(32));
+        // Decode full (64 outstanding): the budget is 32 rows of one pass.
+        assert_eq!(width(5, 32, 64, 64, fresh, limit), Some(5));
+        assert_eq!(width(40, 32, 64, 64, fresh, limit), Some(32));
+        // 84 outstanding leave 12 rows of budget: below half a pass of 40
+        // queued rows, so they wait for rows to finish.
+        assert_eq!(width(40, 32, 64, 84, fresh, limit), None);
+        // ...but every queued row fits, so 10 rows go.
+        assert_eq!(width(10, 32, 64, 84, fresh, limit), Some(10));
+        // The oldest row waited its limit: the pass takes what fits, at
+        // least one row.
+        assert_eq!(width(40, 32, 64, 84, waited, limit), Some(12));
+        assert_eq!(width(40, 32, 64, 200, waited, limit), Some(1));
+        assert_eq!(width(40, 32, 64, 200, fresh, limit), None);
+        // A zero limit never holds a row back.
+        assert_eq!(width(40, 32, 64, 200, fresh, Duration::ZERO), Some(1));
     }
 
     /// Concurrent Nemotron clips of one power-of-two length bucket share a

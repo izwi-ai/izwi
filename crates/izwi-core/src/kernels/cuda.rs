@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 
 use crate::kernels::FusedSiluMulResult;
 
+pub mod bias_rows;
 pub mod decode_step;
 #[cfg(feature = "cuda")]
 mod epilogues;
@@ -22,16 +23,21 @@ pub mod gate;
 pub mod gdn;
 pub mod graphs;
 pub mod kquant;
+pub mod kv_rows;
+pub mod lt_linear;
 pub mod moe;
 pub mod norm;
 pub mod readback;
 pub mod rope;
+pub mod rope_pairs;
 pub mod row_gemv;
 pub mod sampling;
 pub mod segment_graph;
 pub mod shape_graphs;
+pub mod small_attention;
 pub mod split_decode;
 pub mod stretch_graphs;
+pub mod tf32_gemm;
 pub mod timing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

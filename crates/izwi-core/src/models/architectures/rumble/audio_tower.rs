@@ -250,6 +250,91 @@ fn attention_no_mask(
         .map_err(Error::from)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread's tower passes take the padded window plan on
+    /// any device, so CPU tests cover the path CUDA takes.
+    static FORCE_WINDOW_PLAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a tower pass at `dtype` on `device` attends through a
+/// [`WindowPlan`]: on CUDA when FlashAttention cannot take the dtype (it
+/// takes F16 and BF16 only), where the alternative is a host loop of
+/// launches per window. CPU and Metal keep their per-window path.
+fn window_plan_wanted(device: &candle_core::Device, dtype: candle_core::DType) -> bool {
+    #[cfg(test)]
+    if FORCE_WINDOW_PLAN.with(std::cell::Cell::get) {
+        return true;
+    }
+    device.is_cuda() && !matches!(dtype, candle_core::DType::F16 | candle_core::DType::BF16)
+}
+
+/// Every attention window of one tower pass laid out as `windows` padded
+/// slots of a fixed `width`, so each layer attends over all windows in one
+/// batched product instead of one launch sequence per window. The width is
+/// the tower's window (never the batch's longest), so a row's windows have
+/// the same shape alone as beside others; a padding slot gathers token 0
+/// and its key is masked out with a finite bias.
+struct WindowPlan {
+    windows: usize,
+    width: usize,
+    /// `u32 [windows * width]`: the token each slot reads.
+    gather: Tensor,
+    /// `u32 [tokens]`: the slot each token's output is read back from.
+    scatter: Tensor,
+    /// `[windows, 1, 1, width]` at the tower's dtype: 0 for a token's key,
+    /// -1e30 for a padding slot's.
+    key_bias: Tensor,
+}
+
+/// The key bias of a padding slot: finite, so a softmax row never sees
+/// `-inf - -inf`, and far enough below any score that its weight is 0.
+const WINDOW_PADDING_BIAS: f32 = -1e30;
+
+impl WindowPlan {
+    /// The plan for `seq_len` tokens split by `cu_seqlens`, or `None` when
+    /// the boundaries are malformed or a window exceeds `width`.
+    fn new(
+        seq_len: usize,
+        cu_seqlens: &[i64],
+        width: usize,
+        device: &candle_core::Device,
+        dtype: candle_core::DType,
+    ) -> Result<Option<Self>> {
+        let Some(spans) = chunk_spans_from_cu_seqlens(seq_len, cu_seqlens) else {
+            return Ok(None);
+        };
+        if spans.is_empty() || width == 0 || spans.iter().any(|(start, end)| end - start > width) {
+            return Ok(None);
+        }
+        let windows = spans.len();
+        let slots = windows
+            .checked_mul(width)
+            .filter(|slots| u32::try_from(*slots).is_ok())
+            .ok_or_else(|| Error::InvalidInput("Rumble attention window plan overflow".into()))?;
+        let mut gather = vec![0u32; slots];
+        let mut scatter = vec![0u32; seq_len];
+        let mut key_bias = vec![WINDOW_PADDING_BIAS; slots];
+        for (window, &(start, end)) in spans.iter().enumerate() {
+            for (offset, token) in (start..end).enumerate() {
+                let slot = window * width + offset;
+                // Both fit u32: `slots` does and every token is below it.
+                gather[slot] = token as u32;
+                scatter[token] = slot as u32;
+                key_bias[slot] = 0.0;
+            }
+        }
+        Ok(Some(Self {
+            windows,
+            width,
+            gather: Tensor::from_vec(gather, slots, device)?,
+            scatter: Tensor::from_vec(scatter, seq_len, device)?,
+            key_bias: Tensor::from_vec(key_bias, (windows, 1, 1, width), device)?
+                .to_dtype(dtype)?,
+        }))
+    }
+}
+
 struct AudioAttention {
     q_proj: Linear,
     k_proj: Linear,
@@ -276,22 +361,51 @@ impl AudioAttention {
         })
     }
 
-    fn forward(&self, x: &Tensor, cu_seqlens: &[i64]) -> Result<Tensor> {
+    /// Attention inside every window of `plan` in one batched product:
+    /// Q/K/V `[tokens, heads, head_dim]` are gathered into
+    /// `[windows, heads, width, head_dim]`, each query attends over its own
+    /// window's keys (padding keys carry the plan's bias), and the outputs
+    /// are scattered back to token order.
+    fn forward_windows(&self, x: &Tensor, plan: &WindowPlan) -> Result<Tensor> {
+        let seq_len = x.dim(1)?;
+        let (heads, head_dim) = (self.num_heads, self.head_dim);
+        let windowed = |projection: &Linear| -> Result<Tensor> {
+            linear(projection, x, false)?
+                .reshape((seq_len, heads, head_dim))?
+                .index_select(&plan.gather, 0)?
+                .reshape((plan.windows, plan.width, heads, head_dim))?
+                .transpose(1, 2)?
+                .contiguous()
+                .map_err(Error::from)
+        };
+        let q = windowed(&self.q_proj)?;
+        let k = windowed(&self.k_proj)?;
+        let v = windowed(&self.v_proj)?;
+        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? / (head_dim as f64).sqrt())?
+            .broadcast_add(&plan.key_bias)?;
+        let probs = ops::softmax_last_dim(&scores)?;
+        let out = probs
+            .matmul(&v)?
+            .transpose(1, 2)?
+            .reshape((plan.windows * plan.width, heads * head_dim))?
+            .index_select(&plan.scatter, 0)?
+            .unsqueeze(0)?;
+        linear(&self.out_proj, &out, false)
+    }
+
+    fn forward(&self, x: &Tensor, cu_seqlens: &[i64], plan: Option<&WindowPlan>) -> Result<Tensor> {
+        if let Some(plan) = plan {
+            return self.forward_windows(x, plan);
+        }
         let seq_len = x.dim(1)?;
 
-        let q = self
-            .q_proj
-            .forward(x)?
+        let q = linear(&self.q_proj, x, false)?
             .reshape((1, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let k = self
-            .k_proj
-            .forward(x)?
+        let k = linear(&self.k_proj, x, false)?
             .reshape((1, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let v = self
-            .v_proj
-            .forward(x)?
+        let v = linear(&self.v_proj, x, false)?
             .reshape((1, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
@@ -323,7 +437,7 @@ impl AudioAttention {
                             seq_len,
                             self.num_heads * self.head_dim,
                         ))?;
-                        return self.out_proj.forward(&out).map_err(Error::from);
+                        return linear(&self.out_proj, &out, false);
                     }
                 }
             }
@@ -359,7 +473,7 @@ impl AudioAttention {
                 let out =
                     out.transpose(1, 2)?
                         .reshape((1, seq_len, self.num_heads * self.head_dim))?;
-                return self.out_proj.forward(&out).map_err(Error::from);
+                return linear(&self.out_proj, &out, false);
             }
 
             let mut outputs = Vec::with_capacity(spans.len());
@@ -392,7 +506,7 @@ impl AudioAttention {
                 seq_len,
                 self.num_heads * self.head_dim,
             ))?;
-            return self.out_proj.forward(&out).map_err(Error::from);
+            return linear(&self.out_proj, &out, false);
         }
 
         // Fallback: retain original masked full-sequence behavior if chunk metadata
@@ -402,7 +516,7 @@ impl AudioAttention {
         let out = attention_unfused_with_mask(&q, &k, &v, &mask, self.num_heads, self.head_dim)?
             .transpose(1, 2)?
             .reshape((1, seq_len, self.num_heads * self.head_dim))?;
-        self.out_proj.forward(&out).map_err(Error::from)
+        linear(&self.out_proj, &out, false)
     }
 }
 
@@ -430,15 +544,14 @@ impl AudioEncoderLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, cu_seqlens: &[i64]) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cu_seqlens: &[i64], plan: Option<&WindowPlan>) -> Result<Tensor> {
         let normed = self.self_attn_layer_norm.forward(x)?;
-        let attn = self.self_attn.forward(&normed, cu_seqlens)?;
+        let attn = self.self_attn.forward(&normed, cu_seqlens, plan)?;
         let x = x.broadcast_add(&attn)?;
 
         let normed = self.final_layer_norm.forward(&x)?;
-        let hidden = self.fc1.forward(&normed)?;
-        let hidden = gelu(&hidden)?;
-        let hidden = self.fc2.forward(&hidden)?;
+        let hidden = linear(&self.fc1, &normed, true)?;
+        let hidden = linear(&self.fc2, &hidden, false)?;
         let x = x.broadcast_add(&hidden)?;
 
         Ok(x)
@@ -732,138 +845,35 @@ impl AudioTower {
         self.forward_single_feature_sequence(&feature_seq, input_len)
     }
 
+    /// One row's encode: the ragged pass with a single row, so a row takes
+    /// the same chunking, packing and attention windows alone as beside
+    /// others.
     fn forward_single_feature_sequence(
         &self,
         feature_seq: &Tensor,
         input_len: usize,
     ) -> Result<Tensor> {
-        let n_mels = feature_seq.dim(1)?;
-        let n_window = self.cfg.n_window.unwrap_or(50);
-        let n_window_infer = self.cfg.n_window_infer.unwrap_or(800);
-        let chunk_input_len = n_window * 2;
-        if chunk_input_len == 0 {
-            return Err(crate::error::Error::InvalidInput(
-                "Invalid audio chunk size".to_string(),
-            ));
-        }
-
-        // Match upstream: split features into fixed-size chunks before CNN.
-        let mut chunk_lengths = Vec::new();
-        let mut remaining = input_len;
-        while remaining > 0 {
-            let take = remaining.min(chunk_input_len);
-            chunk_lengths.push(take);
-            remaining -= take;
-        }
-
-        // The last chunk reads the frames the caller supplied past the valid
-        // length (the reference pads the waveform with silence before the
-        // STFT, so those frames are the mel of silence, not zeros); only
-        // frames the tensor does not hold are zero.
-        let available = feature_seq.dim(0)?;
-        let mut chunks = Vec::with_capacity(chunk_lengths.len());
-        let mut offset = 0usize;
-        for _ in &chunk_lengths {
-            let len = (available - offset).min(chunk_input_len);
-            let chunk = feature_seq.narrow(0, offset, len)?;
-            offset += len;
-            if len < chunk_input_len {
-                let pad = Tensor::zeros(
-                    (chunk_input_len - len, n_mels),
-                    chunk.dtype(),
-                    chunk.device(),
-                )?;
-                chunks.push(Tensor::cat(&[chunk, pad], 0)?);
-            } else {
-                chunks.push(chunk);
-            }
-        }
-
-        let chunk_refs: Vec<&Tensor> = chunks.iter().collect();
-        let mut x = Tensor::stack(&chunk_refs, 0)?; // [num_chunks, chunk_input_len, n_mels]
-        x = x.transpose(1, 2)?.unsqueeze(1)?; // [num_chunks, 1, n_mels, chunk_input_len]
-
-        x = self.conv_stem(&x)?;
-
-        let num_chunks = x.dim(0)?;
-        let channels = x.dim(1)?;
-        let freq = x.dim(2)?;
-        let frames = x.dim(3)?;
-
-        // [b, c, f, t] -> [b, t, c, f]
-        x = x.transpose(1, 3)?.transpose(2, 3)?;
-        x = x.reshape((num_chunks, frames, channels * freq))?;
-
-        x = self.conv_out.forward(&x)?;
-
-        let pos_emb = self.pos_embed.get(x.dim(1)?)?;
-        let pos_emb = pos_emb.unsqueeze(0)?.to_dtype(x.dtype())?;
-        x = x.broadcast_add(&pos_emb)?;
-
-        // Remove padded chunk tails after CNN and pack chunks back to one sequence.
-        let chunk_out_lens: Vec<usize> = chunk_lengths
-            .iter()
-            .copied()
-            .map(conv_stack_output_len)
-            .collect();
-        let mut packed_chunks = Vec::with_capacity(chunk_out_lens.len());
-        for (idx, &len) in chunk_out_lens.iter().enumerate() {
-            let keep = len.min(frames);
-            if keep == 0 {
-                continue;
-            }
-            let chunk = x.i(idx)?.narrow(0, 0, keep)?;
-            packed_chunks.push(chunk);
-        }
-        let packed_refs: Vec<&Tensor> = packed_chunks.iter().collect();
-        let x = Tensor::cat(&packed_refs, 0)?.unsqueeze(0)?; // [1, total_frames_after_cnn, d_model]
-        let packed_len = x.dim(1)?;
-
-        // Build chunked self-attention windows in the CNN-downsampled domain.
-        let cnn_lengths = vec![packed_len];
-        let max_chunk_after_cnn = conv_stack_output_len(chunk_input_len).max(1);
-        let infer_ratio = (n_window_infer / chunk_input_len).max(1);
-        let window_after_cnn = max_chunk_after_cnn * infer_ratio;
-
-        let mut cu_seqlens = vec![0i64];
-        for &len in &cnn_lengths {
-            let mut rem = len;
-            while rem > window_after_cnn {
-                cu_seqlens.push(*cu_seqlens.last().unwrap() + window_after_cnn as i64);
-                rem -= window_after_cnn;
-            }
-            if rem > 0 {
-                cu_seqlens.push(*cu_seqlens.last().unwrap() + rem as i64);
-            }
-        }
-        let packed_len_i64 = packed_len as i64;
-        for v in &mut cu_seqlens {
-            if *v > packed_len_i64 {
-                *v = packed_len_i64;
-            }
-        }
-        cu_seqlens.dedup();
-        if *cu_seqlens.last().unwrap_or(&0) < packed_len_i64 {
-            cu_seqlens.push(packed_len_i64);
-        }
-        if cu_seqlens.len() < 2 {
-            cu_seqlens = vec![0, packed_len_i64];
-        }
-
-        self.encode_windows(x, &cu_seqlens)
+        let (x, _) = self.encode_ragged_rows(std::slice::from_ref(feature_seq), &[input_len])?;
+        Ok(x)
     }
 
     /// The transformer layers and output projection over a packed
     /// `[1, tokens, d_model]` sequence whose attention windows `cu_seqlens`
-    /// bounds.
+    /// bounds. Where [`window_plan_wanted`], the windows' plan is built once
+    /// here and every layer attends through it.
     fn encode_windows(&self, mut x: Tensor, cu_seqlens: &[i64]) -> Result<Tensor> {
+        let plan = if window_plan_wanted(x.device(), x.dtype()) {
+            let (_, width) = self.preparation_chunk_geometry()?;
+            WindowPlan::new(x.dim(1)?, cu_seqlens, width, x.device(), x.dtype())?
+        } else {
+            None
+        };
         for layer in &self.layers {
-            x = layer.forward(&x, cu_seqlens)?;
+            x = layer.forward(&x, cu_seqlens, plan.as_ref())?;
         }
         let x = self.ln_post.forward(&x)?;
-        let x = self.proj1.forward(&x)?;
-        let x = gelu(&x)?;
-        self.proj2.forward(&x).map_err(Error::from)
+        let x = linear(&self.proj1, &x, true)?;
+        linear(&self.proj2, &x, false)
     }
 
     fn forward_ragged_feature_batch(
@@ -946,6 +956,11 @@ impl AudioTower {
         Ok(outputs)
     }
 
+    /// Mel frames per convolution chunk (`2 * n_window`).
+    pub(crate) fn chunk_frames(&self) -> Result<usize> {
+        self.preparation_chunk_geometry().map(|(chunk, _)| chunk)
+    }
+
     /// The packed encoder output `[1, sum of row tokens, hidden]` of `rows`
     /// (each `[frames, n_mels]`) and each row's token count.
     fn encode_ragged_rows(
@@ -954,39 +969,16 @@ impl AudioTower {
         feature_lens: &[usize],
     ) -> Result<(Tensor, Vec<usize>)> {
         let n_mels = self.cfg.num_mel_bins;
-        let n_window = self.cfg.n_window.unwrap_or(50);
-        let n_window_infer = self.cfg.n_window_infer.unwrap_or(800);
-        let chunk_input_len = n_window
-            .checked_mul(2)
-            .ok_or_else(|| Error::InvalidInput("Rumble audio chunk size overflow".to_string()))?;
-        if chunk_input_len == 0 {
-            return Err(Error::InvalidInput("Invalid audio chunk size".to_string()));
-        }
+        let chunk_input_len = self.chunk_frames()?;
 
-        // Validate every row before launching a kernel. The tower is stateless,
-        // so a rejected batch leaves no partially prepared row to roll back.
-        let mut all_chunk_lengths = Vec::new();
-        let mut row_chunk_counts = Vec::with_capacity(feature_lens.len());
-        for &input_len in feature_lens {
-            let chunks = input_len.div_ceil(chunk_input_len);
-            row_chunk_counts.push(chunks);
-            let full_chunks = input_len / chunk_input_len;
-            all_chunk_lengths.extend(std::iter::repeat_n(chunk_input_len, full_chunks));
-            let tail = input_len % chunk_input_len;
-            if tail > 0 {
-                all_chunk_lengths.push(tail);
-            }
-        }
-
-        let mut chunks = Vec::with_capacity(all_chunk_lengths.len());
-        for (row, &chunk_count) in row_chunk_counts.iter().enumerate() {
-            let feature_row = &rows[row];
+        let mut chunks = Vec::new();
+        for (feature_row, &input_len) in rows.iter().zip(feature_lens) {
             // A row's last chunk reads the frames the caller supplied past
             // its valid length (the reference pads the waveform with silence
             // before the STFT, so those frames are the mel of silence, not
             // zeros); only frames the tensor does not hold are zero.
             let available = feature_row.dim(0)?;
-            for chunk in 0..chunk_count {
+            for chunk in 0..input_len.div_ceil(chunk_input_len) {
                 let offset = chunk * chunk_input_len;
                 let length = (available - offset).min(chunk_input_len);
                 let values = feature_row.narrow(0, offset, length)?;
@@ -1002,15 +994,83 @@ impl AudioTower {
                 }
             }
         }
-
         let chunk_refs: Vec<&Tensor> = chunks.iter().collect();
-        let mut x = Tensor::stack(&chunk_refs, 0)?; // [all_chunks, chunk_input_len, n_mels]
-        x = x.transpose(1, 2)?.unsqueeze(1)?;
+        let chunks = Tensor::stack(&chunk_refs, 0)?; // [all_chunks, chunk_input_len, n_mels]
+        self.encode_chunks(&chunks, feature_lens)
+    }
 
-        // One convolutional launch sequence per slice serves every request row.
+    /// Encode several requests' rows handed over as one tensor of whole
+    /// convolution chunks, `[all chunks, chunk_frames, n_mels]`: row `r`
+    /// holds the next `⌈feature_lens[r] / chunk_frames⌉` chunks (its frames
+    /// past its valid length are the mel of the silence it was padded with).
+    /// One upload serves the whole pass; each output is that row's
+    /// `[1, tokens, hidden]`.
+    pub(crate) fn forward_chunk_rows(
+        &self,
+        chunks: &Tensor,
+        feature_lens: &[usize],
+    ) -> Result<Vec<Tensor>> {
+        let (x, row_output_lengths) = self.encode_chunks(chunks, feature_lens)?;
+        let mut outputs = Vec::with_capacity(row_output_lengths.len());
+        let mut offset = 0usize;
+        for &length in &row_output_lengths {
+            outputs.push(x.narrow(1, offset, length)?);
+            offset += length;
+        }
+        Ok(outputs)
+    }
+
+    /// The packed encoder output `[1, sum of row tokens, hidden]` of the
+    /// rows' whole chunks `[all chunks, chunk_frames, n_mels]` (see
+    /// [`Self::forward_chunk_rows`]) and each row's token count.
+    fn encode_chunks(
+        &self,
+        chunks: &Tensor,
+        feature_lens: &[usize],
+    ) -> Result<(Tensor, Vec<usize>)> {
+        let (chunk_input_len, window_after_cnn) = self.preparation_chunk_geometry()?;
+        if feature_lens.is_empty() {
+            return Err(Error::InvalidInput(
+                "No audio features available for ASR batch".to_string(),
+            ));
+        }
+
+        // Validate every row before launching a kernel. The tower is stateless,
+        // so a rejected batch leaves no partially prepared row to roll back.
+        let mut all_chunk_lengths = Vec::new();
+        let mut row_chunk_counts = Vec::with_capacity(feature_lens.len());
+        for (row, &input_len) in feature_lens.iter().enumerate() {
+            if input_len == 0 {
+                return Err(Error::InvalidInput(format!(
+                    "Rumble audio row {row} has no feature frames"
+                )));
+            }
+            row_chunk_counts.push(input_len.div_ceil(chunk_input_len));
+            let full_chunks = input_len / chunk_input_len;
+            all_chunk_lengths.extend(std::iter::repeat_n(chunk_input_len, full_chunks));
+            let tail = input_len % chunk_input_len;
+            if tail > 0 {
+                all_chunk_lengths.push(tail);
+            }
+        }
+        let (num_chunks, chunk_frames, n_mels) = chunks.dims3()?;
+        if num_chunks != all_chunk_lengths.len()
+            || chunk_frames != chunk_input_len
+            || n_mels != self.cfg.num_mel_bins
+        {
+            return Err(Error::InvalidInput(format!(
+                "Rumble audio chunks have shape {:?}; the rows need [{}, {chunk_input_len}, {}]",
+                chunks.dims(),
+                all_chunk_lengths.len(),
+                self.cfg.num_mel_bins
+            )));
+        }
+
+        // [all_chunks, 1, n_mels, chunk_input_len]; one convolutional launch
+        // sequence per slice serves every request row.
+        let mut x = chunks.transpose(1, 2)?.unsqueeze(1)?;
         x = self.conv_stem(&x)?;
 
-        let num_chunks = x.dim(0)?;
         let channels = x.dim(1)?;
         let freq = x.dim(2)?;
         let frames = x.dim(3)?;
@@ -1024,47 +1084,44 @@ impl AudioTower {
         let pos_emb = pos_emb.unsqueeze(0)?.to_dtype(x.dtype())?;
         x = x.broadcast_add(&pos_emb)?;
 
+        // Drop each chunk's padded tail and pack every row's tokens back to
+        // back with one gather.
         let chunk_output_lengths: Vec<usize> = all_chunk_lengths
             .iter()
-            .copied()
-            .map(conv_stack_output_len)
+            .map(|&length| conv_stack_output_len(length).min(frames))
             .collect();
-        let mut packed_chunks = Vec::with_capacity(chunk_output_lengths.len());
-        for (chunk, &length) in chunk_output_lengths.iter().enumerate() {
-            let keep = length.min(frames);
-            if keep > 0 {
-                packed_chunks.push(x.i(chunk)?.narrow(0, 0, keep)?);
+        let packed_len: usize = chunk_output_lengths.iter().sum();
+        let hidden = x.dim(2)?;
+        let x = x.reshape((num_chunks * frames, hidden))?;
+        let x = if packed_len == num_chunks * frames {
+            x
+        } else {
+            let mut keep = Vec::with_capacity(packed_len);
+            for (chunk, &length) in chunk_output_lengths.iter().enumerate() {
+                let first = u32::try_from(chunk * frames).map_err(|_| {
+                    Error::InvalidInput("Rumble audio packing exceeds u32".to_string())
+                })?;
+                keep.extend((0..length as u32).map(|offset| first + offset));
             }
+            let keep = Tensor::from_vec(keep, packed_len, x.device())?;
+            x.index_select(&keep, 0)?
         }
-        let packed_refs: Vec<&Tensor> = packed_chunks.iter().collect();
-        let x = Tensor::cat(&packed_refs, 0)?.unsqueeze(0)?;
+        .unsqueeze(0)?;
 
         let mut row_output_lengths = Vec::with_capacity(feature_lens.len());
         let mut chunk_cursor = 0usize;
         for &chunk_count in &row_chunk_counts {
-            let row_length = chunk_output_lengths[chunk_cursor..chunk_cursor + chunk_count]
+            let row_length: usize = chunk_output_lengths[chunk_cursor..chunk_cursor + chunk_count]
                 .iter()
                 .copied()
                 .sum();
             row_output_lengths.push(row_length);
             chunk_cursor += chunk_count;
         }
-        let packed_len = x.dim(1)?;
-        let planned_len: usize = row_output_lengths.iter().sum();
-        if packed_len != planned_len {
-            return Err(Error::InferenceError(format!(
-                "Rumble ragged audio packing mismatch: tensor={packed_len}, plan={planned_len}"
-            )));
-        }
 
         // Each row receives its own set of chunked-attention windows. The
         // cumulative boundaries are the ragged attention mask and prohibit
         // cross-request attention while retaining one packed encoder call.
-        let max_chunk_after_cnn = conv_stack_output_len(chunk_input_len).max(1);
-        let infer_ratio = (n_window_infer / chunk_input_len).max(1);
-        let window_after_cnn = max_chunk_after_cnn
-            .checked_mul(infer_ratio)
-            .ok_or_else(|| Error::InvalidInput("Audio attention window overflow".to_string()))?;
         let mut cu_seqlens = vec![0i64];
         let mut cursor = 0usize;
         for &row_length in &row_output_lengths {
@@ -1090,6 +1147,30 @@ impl AudioTower {
 /// `ACT2FN["gelu"]` (upstream `F.gelu`), not the tanh approximation.
 fn gelu(x: &Tensor) -> Result<Tensor> {
     x.gelu_erf().map_err(Error::from)
+}
+
+/// `layer` over `x`, then the exact GELU when `gelu`: Candle's ops, except
+/// that on CUDA the bias and GELU run in one in-place launch with the same
+/// bits ([`crate::kernels::cuda::bias_rows`]), and an F32 product runs in
+/// TF32 on tensor cores unless `IZWI_RUMBLE_AUDIO_TF32` is off.
+fn linear(layer: &Linear, x: &Tensor, gelu: bool) -> Result<Tensor> {
+    use crate::kernels::cuda::{bias_rows, tf32_gemm};
+    if let Some(bias) = layer.bias() {
+        if tf32_gemm::serves(x.device(), x.dtype())
+            && bias_rows::serves(x.device(), x.dtype())
+            && super::precision::audio_tf32_requested()
+        {
+            let dims = x.dims().to_vec();
+            let input = *dims.last().expect("a linear input has a last dim");
+            let rows = x.elem_count() / input;
+            let y = tf32_gemm::matmul_t(&x.reshape((rows, input))?, layer.weight())?;
+            bias_rows::add_bias(&y, bias, gelu)?;
+            let mut shape = dims;
+            *shape.last_mut().expect("a last dim") = y.dim(1)?;
+            return Ok(y.reshape(shape)?);
+        }
+    }
+    bias_rows::linear_forward(layer, x, gelu).map_err(Error::from)
 }
 
 #[cfg(test)]
@@ -1458,6 +1539,89 @@ mod tests {
                 &before.row(row).expect("baseline row"),
                 &after.row(row).expect("retry row"),
             );
+        }
+    }
+
+    /// Run `f` with this thread's tower passes on the padded window plan.
+    fn with_window_plan<T>(f: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FORCE_WINDOW_PLAN.with(|force| force.set(false));
+            }
+        }
+        FORCE_WINDOW_PLAN.with(|force| force.set(true));
+        let _reset = Reset;
+        f()
+    }
+
+    #[test]
+    fn window_plan_pads_every_window_to_the_tower_width() {
+        let plan = WindowPlan::new(7, &[0, 3, 7], 4, &Device::Cpu, DType::F32)
+            .unwrap()
+            .expect("plan");
+        assert_eq!((plan.windows, plan.width), (2, 4));
+        assert_eq!(
+            plan.gather.to_vec1::<u32>().unwrap(),
+            vec![0, 1, 2, 0, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            plan.scatter.to_vec1::<u32>().unwrap(),
+            vec![0, 1, 2, 4, 5, 6, 7]
+        );
+        let bias = plan
+            .key_bias
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(
+            bias,
+            vec![0.0, 0.0, 0.0, WINDOW_PADDING_BIAS, 0.0, 0.0, 0.0, 0.0]
+        );
+        // A window wider than the tower's, or malformed boundaries, keep the
+        // per-window path.
+        assert!(WindowPlan::new(7, &[0, 7], 4, &Device::Cpu, DType::F32)
+            .unwrap()
+            .is_none());
+        assert!(WindowPlan::new(7, &[0, 3, 6], 4, &Device::Cpu, DType::F32)
+            .unwrap()
+            .is_none());
+    }
+
+    /// The padded plan (CUDA's F32 path) encodes every row as the
+    /// per-window path does, packed and alone, up to rounding.
+    #[test]
+    fn window_plan_encodes_rows_as_the_per_window_path_does() {
+        let device = Device::Cpu;
+        let tower = tiny_audio_tower(&device);
+        // Rows of one partial window, one exact window, several windows and
+        // a ragged tail (the tiny tower's window is 26 tokens).
+        let lengths = [1usize, 99, 200, 201, 450];
+        let features = ragged_features(&lengths, 8, &device);
+        let per_window = tower
+            .forward_feature_batch(&features, &lengths)
+            .expect("per-window batch");
+        let (planned, alone) = with_window_plan(|| {
+            let planned = tower
+                .forward_feature_batch(&features, &lengths)
+                .expect("planned batch");
+            let alone = lengths
+                .iter()
+                .enumerate()
+                .map(|(row, &length)| {
+                    tower
+                        .forward_feature_sequence(&features.i(row).unwrap(), length)
+                        .expect("planned lone row")
+                })
+                .collect::<Vec<_>>();
+            (planned, alone)
+        });
+        assert_eq!(planned.output_lengths(), per_window.output_lengths());
+        for row in 0..lengths.len() {
+            let planned_row = planned.row(row).unwrap();
+            assert_close(&planned_row, &per_window.row(row).unwrap());
+            assert_close(&alone[row], &planned_row);
         }
     }
 

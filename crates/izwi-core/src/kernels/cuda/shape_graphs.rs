@@ -17,11 +17,17 @@
 //! intermediates are graph memory, from the device's graph memory pool,
 //! which keeps its physical pages after a launch. Graphs launched on one
 //! stream share those pages, so the pool holds about the largest graph's
-//! working set plus every kept graph's outputs; the cache adds up the
-//! pool's growth across its own launches, and past its budget turns off.
-//! Any graph failure turns the cache off for the process: its graphs are
-//! dropped behind a stream fence, the pool's unused pages are trimmed, and
-//! the segment runs eagerly. An error of the eager segment is the run's.
+//! working set plus every kept graph's outputs. The cache charges the pool's
+//! growth over each capture (and its first launch) to its budget; replays
+//! reuse mapped pages, so growth seen around one is another cache's trim
+//! being undone, never this cache's. A capture that would take the pool past
+//! the budget is dropped and its shape runs eagerly from then on; the other
+//! graphs keep replaying. A caller drops graphs that can never run again
+//! (their buffers were replaced) with [`ShapeGraphs::retain`], so their pages
+//! serve the next capture. Any graph failure turns the cache off for the
+//! process: its graphs are dropped behind a stream fence, the pool's unused
+//! pages are trimmed, and the segment runs eagerly. An error of the eager
+//! segment is the run's.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -43,7 +49,7 @@ pub struct ShapeGraphLimits {
     /// copies and their graph-memory outputs.
     pub retained_bytes: u64,
     /// Most the device's graph memory pool may grow across this cache's
-    /// launches: the largest working set beside every kept graph's outputs.
+    /// captures: the largest working set beside every kept graph's outputs.
     pub pool_bytes: u64,
 }
 
@@ -111,12 +117,27 @@ impl<K: PartialEq, G> Slots<K, G> {
     fn keys(&self) -> impl Iterator<Item = &K> {
         self.slots.iter().map(|slot| &slot.key)
     }
+
+    /// Drops the slots whose key `keep` refuses, and returns how many went.
+    fn retain(&mut self, keep: impl Fn(&K) -> bool) -> usize {
+        let before = self.slots.len();
+        // Dropping a graph fences the stream before its memory goes.
+        self.slots.retain(|slot| keep(&slot.key));
+        before - self.slots.len()
+    }
 }
+
+/// Most shapes a cache remembers as eager (their capture would have taken
+/// the pool past its budget); the oldest is forgotten first.
+const MAX_EAGER_SHAPES: usize = 64;
 
 struct State<K> {
     slots: Slots<K, SegmentGraph>,
-    /// Graph-pool growth over this cache's launches.
+    /// Graph-pool growth over this cache's captures.
     pool_growth: u64,
+    /// Shapes that run eagerly: capturing them would have grown the pool
+    /// past the budget.
+    eager: Vec<K>,
 }
 
 /// One graph failure, or the eager segment's own error.
@@ -148,6 +169,7 @@ pub struct ShapeGraphs<K> {
     replays: AtomicU64,
     evictions: AtomicU64,
     fallbacks: AtomicU64,
+    over_budget: AtomicU64,
 }
 
 impl<K: PartialEq + Clone + std::fmt::Debug> ShapeGraphs<K> {
@@ -168,13 +190,33 @@ impl<K: PartialEq + Clone + std::fmt::Debug> ShapeGraphs<K> {
             state: Mutex::new(Ok(State {
                 slots: Slots::new(),
                 pool_growth: 0,
+                eager: Vec::new(),
             })),
             captures: AtomicU64::new(0),
             verified: AtomicU64::new(0),
             replays: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
+            over_budget: AtomicU64::new(0),
         })
+    }
+
+    /// Drops every kept graph, and forgets every eager shape, whose key
+    /// `keep` refuses: graphs whose captured buffers were replaced (a KV
+    /// arena that grew, a rebuilt table) can never replay, and their pages
+    /// then serve the next capture. Returns how many graphs went; a run
+    /// holding the cache, or a cache turned off, drops nothing.
+    pub fn retain(&self, keep: impl Fn(&K) -> bool) -> usize {
+        let Ok(mut guard) = self.state.try_lock() else {
+            return 0;
+        };
+        let Ok(state) = guard.as_mut() else {
+            return 0;
+        };
+        state.eager.retain(|key| keep(key));
+        let dropped = state.slots.retain(keep);
+        self.evictions.fetch_add(dropped as u64, Relaxed);
+        dropped
     }
 
     /// Whether runs still go through graphs (no failure turned them off).
@@ -241,25 +283,24 @@ impl<K: PartialEq + Clone + std::fmt::Debug> ShapeGraphs<K> {
                 adopt: false,
             })
             .collect::<Vec<_>>();
-        let State { slots, pool_growth } = state;
-        let launch = |pool_growth: &mut u64, graph: &SegmentGraph| {
-            let before = pool::reserved(&self.device);
-            let replayed = graph.replay(&stable).map_err(failed("replay"))?;
-            self.account(pool_growth, before)?;
-            Ok::<_, Failure>(replayed)
-        };
+        let State {
+            slots,
+            pool_growth,
+            eager: eager_shapes,
+        } = state;
+        let launch = |graph: &SegmentGraph| graph.replay(&stable).map_err(failed("replay"));
         if let Some(slot) = slots.touch(key) {
             return match slot.phase {
                 Phase::Verify => {
                     let eager = body(inputs)?;
-                    let replayed = launch(pool_growth, &slot.graph)?;
+                    let replayed = launch(&slot.graph)?;
                     bitwise(&eager, &replayed).map_err(Failure::Graph)?;
                     self.verified.fetch_add(1, Relaxed);
                     slot.phase = Phase::Replay;
                     Ok(Some(eager))
                 }
                 Phase::Replay => {
-                    let replayed = launch(pool_growth, &slot.graph)?;
+                    let replayed = launch(&slot.graph)?;
                     self.replays.fetch_add(1, Relaxed);
                     // Graph memory: the next replay overwrites it.
                     replayed
@@ -270,6 +311,9 @@ impl<K: PartialEq + Clone + std::fmt::Debug> ShapeGraphs<K> {
                         .map_err(failed("output copy"))
                 }
             };
+        }
+        if eager_shapes.contains(key) {
+            return Ok(None);
         }
         let Some(dropped) = slots.make_room(retained, self.limits) else {
             return Ok(None);
@@ -287,9 +331,27 @@ impl<K: PartialEq + Clone + std::fmt::Debug> ShapeGraphs<K> {
             })
             .map_err(failed("capture"))?;
         self.captures.fetch_add(1, Relaxed);
-        self.account(pool_growth, before)?;
-        let replayed = launch(pool_growth, &graph)?;
+        let replayed = launch(&graph)?;
         bitwise(&eager, &replayed).map_err(Failure::Graph)?;
+        let growth = growth_since(before, pool::reserved(&self.device));
+        if !within_budget(*pool_growth, growth, self.limits) {
+            // The capture's pages stay in the pool for the next capture;
+            // this shape runs eagerly instead of growing it further.
+            self.over_budget.fetch_add(1, Relaxed);
+            tracing::info!(
+                "{} runs shape {key:?} eagerly: its CUDA graph grew the graph memory pool {growth} bytes, past the {} bytes priced ({} already charged)",
+                self.label,
+                self.limits.device_bytes(),
+                pool_growth
+            );
+            if eager_shapes.len() >= MAX_EAGER_SHAPES {
+                eager_shapes.remove(0);
+            }
+            eager_shapes.push(key.clone());
+            // The graph drops here, behind its stream fence.
+            return Ok(Some(eager));
+        }
+        *pool_growth += growth;
         slots.slots.push(Slot {
             key: key.clone(),
             retained,
@@ -299,29 +361,9 @@ impl<K: PartialEq + Clone + std::fmt::Debug> ShapeGraphs<K> {
         Ok(Some(eager))
     }
 
-    /// Adds the pool's growth since `before` to `pool_growth`, failing past
-    /// the bytes priced for this cache.
-    fn account(
-        &self,
-        pool_growth: &mut u64,
-        before: Option<u64>,
-    ) -> std::result::Result<(), Failure> {
-        let (Some(before), Some(after)) = (before, pool::reserved(&self.device)) else {
-            return Ok(());
-        };
-        *pool_growth = pool_growth.saturating_add(after.saturating_sub(before));
-        let budget = self.limits.device_bytes();
-        if *pool_growth > budget {
-            return Err(Failure::Graph(format!(
-                "the CUDA graph memory pool grew {pool_growth} bytes over these graphs' launches, past the {budget} bytes priced for them"
-            )));
-        }
-        Ok(())
-    }
-
     pub fn diagnostics(&self) -> serde_json::Value {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (shapes, retained, pool_growth) = match state.as_ref() {
+        let (shapes, retained, pool_growth, eager) = match state.as_ref() {
             Ok(state) => (
                 state
                     .slots
@@ -330,8 +372,9 @@ impl<K: PartialEq + Clone + std::fmt::Debug> ShapeGraphs<K> {
                     .collect::<Vec<_>>(),
                 state.slots.retained(),
                 state.pool_growth,
+                state.eager.len(),
             ),
-            Err(_) => (Vec::new(), 0, 0),
+            Err(_) => (Vec::new(), 0, 0, 0),
         };
         json!({
             "off": state.as_ref().err(),
@@ -348,9 +391,27 @@ impl<K: PartialEq + Clone + std::fmt::Debug> ShapeGraphs<K> {
             "replays": self.replays.load(Relaxed),
             "evictions": self.evictions.load(Relaxed),
             "fallbacks": self.fallbacks.load(Relaxed),
+            "over_budget_captures": self.over_budget.load(Relaxed),
+            "eager_shapes": eager,
             "device_graph_pool": pool::diagnostics(&self.device),
         })
     }
+}
+
+/// Bytes the pool grew from `before` to `after`; nothing when either is
+/// unknown (no driver attribute).
+fn growth_since(before: Option<u64>, after: Option<u64>) -> u64 {
+    match (before, after) {
+        (Some(before), Some(after)) => after.saturating_sub(before),
+        _ => 0,
+    }
+}
+
+/// Whether a capture that grew the pool `growth` bytes keeps the cache's
+/// charged growth (`charged`) within its budget. A capture that reused
+/// mapped pages (no growth) always fits.
+fn within_budget(charged: u64, growth: u64, limits: ShapeGraphLimits) -> bool {
+    growth == 0 || charged.saturating_add(growth) <= limits.device_bytes()
 }
 
 /// The device's CUDA graph memory pool.
@@ -507,6 +568,33 @@ mod tests {
     #[test]
     fn the_priced_bytes_cover_the_retained_and_pool_budgets() {
         assert_eq!(LIMITS.device_bytes(), 1100);
+    }
+
+    #[test]
+    fn retain_drops_only_the_refused_keys_in_order() {
+        let mut kept = slots(&[(1, 10), (2, 10), (3, 10), (4, 10)]);
+        assert_eq!(kept.retain(|key| key % 2 == 0), 2);
+        assert_eq!(keys(&kept), [2, 4]);
+        assert_eq!(kept.retained(), 20);
+        assert_eq!(kept.retain(|_| true), 0);
+    }
+
+    /// Captures are charged by the pool's growth; one that reused mapped
+    /// pages always fits, and one past the budget does not, however little
+    /// it grew (a cache never grows the pool past its price).
+    #[test]
+    fn captures_are_charged_by_growth_and_refused_past_the_budget() {
+        assert_eq!(growth_since(Some(100), Some(160)), 60);
+        // A trim between the readings is no growth of this capture's.
+        assert_eq!(growth_since(Some(160), Some(100)), 0);
+        assert_eq!(growth_since(None, Some(100)), 0);
+        assert_eq!(growth_since(Some(100), None), 0);
+
+        assert!(within_budget(0, 1100, LIMITS));
+        assert!(!within_budget(0, 1101, LIMITS));
+        assert!(within_budget(1000, 100, LIMITS));
+        assert!(!within_budget(1000, 101, LIMITS));
+        assert!(within_budget(5000, 0, LIMITS), "a reused-page capture fits");
     }
 
     #[test]

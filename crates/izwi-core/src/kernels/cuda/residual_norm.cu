@@ -74,12 +74,32 @@ __device__ void rn_row(const R* __restrict__ residual, const D* __restrict__ del
     rn_row<R, D, O>(residual, delta, gain, sum, out, hidden, eps);               \
   }
 
-// residual_delta_output
+// residual_delta_output: every mix of F32/F16/BF16, so any decoder's stream,
+// delta and activation dtypes have a form (`kernels::residual_norm`).
 RN_EXPORT(f32_f32_f32, float, float, float)
 RN_EXPORT(f32_f32_f16, float, float, __half)
-RN_EXPORT(f32_f16_f16, float, __half, __half)
 RN_EXPORT(f32_f32_bf16, float, float, __nv_bfloat16)
-RN_EXPORT(bf16_f32_bf16, __nv_bfloat16, float, __nv_bfloat16)
-RN_EXPORT(bf16_bf16_bf16, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16)
+RN_EXPORT(f32_f16_f32, float, __half, float)
+RN_EXPORT(f32_f16_f16, float, __half, __half)
+RN_EXPORT(f32_f16_bf16, float, __half, __nv_bfloat16)
+RN_EXPORT(f32_bf16_f32, float, __nv_bfloat16, float)
+RN_EXPORT(f32_bf16_f16, float, __nv_bfloat16, __half)
+RN_EXPORT(f32_bf16_bf16, float, __nv_bfloat16, __nv_bfloat16)
+RN_EXPORT(f16_f32_f32, __half, float, float)
 RN_EXPORT(f16_f32_f16, __half, float, __half)
+RN_EXPORT(f16_f32_bf16, __half, float, __nv_bfloat16)
+RN_EXPORT(f16_f16_f32, __half, __half, float)
 RN_EXPORT(f16_f16_f16, __half, __half, __half)
+RN_EXPORT(f16_f16_bf16, __half, __half, __nv_bfloat16)
+RN_EXPORT(f16_bf16_f32, __half, __nv_bfloat16, float)
+RN_EXPORT(f16_bf16_f16, __half, __nv_bfloat16, __half)
+RN_EXPORT(f16_bf16_bf16, __half, __nv_bfloat16, __nv_bfloat16)
+RN_EXPORT(bf16_f32_f32, __nv_bfloat16, float, float)
+RN_EXPORT(bf16_f32_f16, __nv_bfloat16, float, __half)
+RN_EXPORT(bf16_f32_bf16, __nv_bfloat16, float, __nv_bfloat16)
+RN_EXPORT(bf16_f16_f32, __nv_bfloat16, __half, float)
+RN_EXPORT(bf16_f16_f16, __nv_bfloat16, __half, __half)
+RN_EXPORT(bf16_f16_bf16, __nv_bfloat16, __half, __nv_bfloat16)
+RN_EXPORT(bf16_bf16_f32, __nv_bfloat16, __nv_bfloat16, float)
+RN_EXPORT(bf16_bf16_f16, __nv_bfloat16, __nv_bfloat16, __half)
+RN_EXPORT(bf16_bf16_bf16, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16)

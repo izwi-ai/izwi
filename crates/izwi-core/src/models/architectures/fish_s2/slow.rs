@@ -1,9 +1,12 @@
 //! Slow semantic transformer for Fish S2 DualAR generation.
 
 use candle_core::{DType, Tensor};
-use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{ops, Embedding, Linear, Module, VarBuilder};
+
+use crate::kernels::residual_norm::DeviceRmsNorm;
 
 use crate::error::{Error, Result};
+use crate::kernels::cuda::stretch_graphs::StretchGraphs;
 use crate::models::architectures::fish_s2::config::FishS2Config;
 use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::architectures::fish_s2::tokenizer::FishS2ConditioningPrompt;
@@ -39,23 +42,53 @@ pub struct FishS2SlowTransformer {
     embeddings: Embedding,
     codebook_embeddings: Embedding,
     layers: Vec<FishS2SlowLayer>,
-    norm: RmsNorm,
+    norm: DeviceRmsNorm,
     lm_head: Linear,
     semantic_head: Option<(Linear, u32)>,
+    /// On CUDA, the decode step's stretches as graphs (see
+    /// [`Self::forward_embeds_batch`]), or why there are none.
+    graphs: std::result::Result<StretchGraphs, String>,
+}
+
+/// Kill switch for the slow transformer's CUDA decode-step graphs (a
+/// boolean; on when unset, read at load). The global
+/// `IZWI_CUDA_DECODE_GRAPHS=off` turns them off too.
+pub(crate) const FISH_S2_SLOW_GRAPHS_ENV: &str = "IZWI_FISH_S2_SLOW_GRAPHS";
+
+/// Device bytes the slow decode graphs may hold on CUDA: one graph per
+/// stretch (layers + 1) at [`FISH_DECODE_ROWS`] rows, each retaining its
+/// stable inputs (the residual and attention rows, the rotary rows) and
+/// outputs (the residual and the next layer's q/k/v), about 1 MiB a stretch
+/// for the published 36-layer, 2560-wide trunk, beside a working set of
+/// 32-row MLP activations. Priced resident; the graphs allocate on the
+/// first decode steps.
+pub(crate) const FISH_S2_SLOW_GRAPH_DEVICE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// [`FISH_S2_SLOW_GRAPH_DEVICE_BYTES`] on `backend` with the graphs on; zero
+/// elsewhere.
+pub(crate) fn fish_s2_slow_graph_device_bytes(backend: crate::backends::BackendKind) -> u64 {
+    if backend == crate::backends::BackendKind::Cuda
+        && crate::env::flag_or(FISH_S2_SLOW_GRAPHS_ENV, true)
+        && !crate::kernels::cuda::stretch_graphs::decode_graphs_switched_off()
+    {
+        FISH_S2_SLOW_GRAPH_DEVICE_BYTES
+    } else {
+        0
+    }
 }
 
 struct FishS2SlowLayer {
-    input_layernorm: RmsNorm,
+    input_layernorm: DeviceRmsNorm,
     self_attn: FishS2PackedAttention,
-    post_attention_layernorm: RmsNorm,
+    post_attention_layernorm: DeviceRmsNorm,
     mlp: FishS2Mlp,
 }
 
 struct FishS2PackedAttention {
     qkv_proj: Linear,
     o_proj: Linear,
-    q_norm: Option<RmsNorm>,
-    k_norm: Option<RmsNorm>,
+    q_norm: Option<DeviceRmsNorm>,
+    k_norm: Option<DeviceRmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -144,6 +177,15 @@ impl FishS2SlowTransformer {
         } else {
             Linear::new(embeddings.embeddings().clone(), None)
         };
+        // Every CUDA decode step pads to one width (`decode_rows`): one set
+        // of graphs, no per-row state to copy.
+        let graphs = StretchGraphs::resolve(
+            "Fish S2 slow transformer",
+            FISH_S2_SLOW_GRAPHS_ENV,
+            vb.device(),
+            cfg.num_hidden_layers + 1,
+        )
+        .map(|graphs| graphs.with_widths(|rows| rows == FISH_DECODE_ROWS));
         Ok(Self {
             cfg,
             embeddings,
@@ -152,7 +194,24 @@ impl FishS2SlowTransformer {
             norm,
             lm_head,
             semantic_head: None,
+            graphs,
         })
+    }
+
+    /// The decode-step graphs' state and counters, for the diagnostics.
+    pub(crate) fn graphs_diagnostics(&self) -> serde_json::Value {
+        let mut diagnostics = match &self.graphs {
+            Ok(graphs) => graphs.diagnostics(),
+            Err(reason) => serde_json::json!({ "off": reason }),
+        };
+        diagnostics["rows"] = FISH_DECODE_ROWS.into();
+        diagnostics
+    }
+
+    /// Run decode steps eagerly (a test's reference for the graphs).
+    #[cfg(test)]
+    pub(crate) fn turn_off_graphs(&mut self) {
+        self.graphs = Err("turned off by a test".into());
     }
 
     /// Gather the only output rows Fish samples: EOS followed by the semantic
@@ -227,6 +286,19 @@ impl FishS2SlowTransformer {
 
     pub fn config(&self) -> &FishS2SlowConfig {
         &self.cfg
+    }
+
+    /// The device the transformer's weights live on.
+    pub(crate) fn device(&self) -> &candle_core::Device {
+        self.lm_head.weight().device()
+    }
+
+    /// The RoPE tables every slow layer shares.
+    fn rotary(&self) -> Result<&FishS2RotaryCache> {
+        self.layers
+            .first()
+            .map(|layer| &layer.self_attn.rotary)
+            .ok_or_else(|| Error::InvalidInput("Fish S2 slow transformer has no layers".into()))
     }
 
     /// Persistent RoPE table bytes, shared by every slow layer.
@@ -425,20 +497,112 @@ impl FishS2SlowTransformer {
         }
         let mut batch =
             super::batch::FishPhysicalBatch::new(caches, &counts, self.cfg.num_hidden_layers)?;
+        let rows = counts.len();
+        // A decode step on CUDA runs its dense work at a fixed row count, so
+        // cuBLAS picks one kernel whatever the step's width and a request
+        // decodes the same alone and beside others (see `decode_rows`).
+        let padded = decode_rows(inputs[0].device(), &counts);
         let execution = (|| {
+            let real = counts.iter().sum::<usize>();
             let mut hidden = Tensor::cat(inputs, 1)?;
-            for (index, layer) in self.layers.iter().enumerate() {
-                let norm = layer.input_layernorm.forward(&hidden)?;
-                let attn = layer
-                    .self_attn
-                    .forward_batch(&norm, &starts, &counts, caches[0], &mut batch, index)?;
-                hidden = hidden.broadcast_add(&attn)?;
-                let ff = layer
-                    .mlp
-                    .forward(&layer.post_attention_layernorm.forward(&hidden)?)?;
-                hidden = hidden.broadcast_add(&ff)?;
+            if let Some(padded) = padded {
+                hidden = hidden.pad_with_zeros(1, 0, padded - real)?;
             }
-            let hidden = self.norm.forward(&hidden)?;
+            let width = hidden.dim(1)?;
+            // Every packed token's rotary tables at its own position (spare
+            // rows at position 0), once for every layer: one rotation per
+            // projection, not one per row.
+            let positions = starts
+                .iter()
+                .zip(&counts)
+                .flat_map(|(&start, &count)| start..start + count)
+                .collect::<Vec<_>>();
+            let (cos, sin) = self.rotary()?.position_tables(&positions, width)?;
+            // The layers run as `layers + 1` stretches around the paged
+            // attention: the first layer's norm, projections and rotation;
+            // then each layer's residual branches with the next layer's
+            // projections; then the last layer's residual branches and the
+            // final norm. On CUDA a decode step replays each stretch as a
+            // graph at the padded width, captured and checked bit for bit
+            // against the eager stretch first; elsewhere (and for prefill)
+            // the stretches run as they are, in the same order. A graph
+            // replays the eager stretch's kernels at the same shapes, so
+            // the bits are the eager step's; attention reads the real rows
+            // only.
+            let mut run = match (&self.graphs, padded) {
+                (Ok(graphs), Some(padded)) => graphs.begin(padded),
+                _ => None,
+            };
+            let mut stretch = |index: usize,
+                               inputs: Vec<Tensor>,
+                               body: &dyn Fn(&[Tensor]) -> Result<Vec<Tensor>>|
+             -> Result<Vec<Tensor>> {
+                match run.as_mut() {
+                    Some(run) => run.run(index, &inputs, body),
+                    None => body(&inputs),
+                }
+            };
+            let first = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                let (q, k, v) = self.layers[0].pre_attention(&inputs[0], &inputs[1], &inputs[2])?;
+                Ok(vec![q, k, v])
+            };
+            let mut qkv = stretch(0, vec![hidden.clone(), cos.clone(), sin.clone()], &first)?;
+            let last = self.layers.len() - 1;
+            let mut tail = Vec::new();
+            for (index, layer) in self.layers.iter().enumerate() {
+                let attn = layer.self_attn.attend_batch(
+                    &qkv[0], &qkv[1], &qkv[2], real, caches[0], &mut batch, index,
+                )?;
+                if index == last {
+                    // A padded step is a decode step: its tails are its
+                    // first rows, and the logits of all the padded rows are
+                    // one projection of one shape (each row's logits are
+                    // its own: a matmul keeps rows apart).
+                    let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                        let normed = self
+                            .norm
+                            .forward(&layer.post_attention(&inputs[0], &inputs[1])?)?;
+                        if padded.is_none() {
+                            return Ok(vec![normed]);
+                        }
+                        let logits = self.project_logits(&normed.reshape((
+                            width,
+                            1,
+                            self.cfg.hidden_size,
+                        ))?)?;
+                        Ok(vec![normed, logits])
+                    };
+                    tail = stretch(index + 1, vec![hidden, attn], &body)?;
+                    break;
+                }
+                let next = &self.layers[index + 1];
+                let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                    let x = layer.post_attention(&inputs[0], &inputs[1])?;
+                    let (q, k, v) = next.pre_attention(&x, &inputs[2], &inputs[3])?;
+                    Ok(vec![x, q, k, v])
+                };
+                let mut outputs = stretch(
+                    index + 1,
+                    vec![hidden, attn, cos.clone(), sin.clone()],
+                    &body,
+                )?;
+                hidden = outputs.remove(0);
+                qkv = outputs;
+            }
+            let mut tail = tail.into_iter();
+            let hidden = tail.next().ok_or_else(|| {
+                Error::InferenceError("Fish S2 slow step returned nothing".into())
+            })?;
+            if let Some(logits) = tail.next() {
+                return (0..rows)
+                    .map(|row| {
+                        Ok(FishS2SlowOutput {
+                            hidden_states: hidden.narrow(1, row, 1)?.copy()?,
+                            logits: logits.narrow(0, row, 1)?.copy()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>();
+            }
             let mut offset = 0;
             let tails = counts
                 .iter()
@@ -542,6 +706,29 @@ impl FishS2SlowTransformer {
 }
 
 impl FishS2SlowLayer {
+    /// The attention input of `hidden` `[1, tokens, hidden]`: each token's
+    /// rotated query and key and its value (see
+    /// [`FishS2PackedAttention::project_batch`]).
+    fn pre_attention(
+        &self,
+        hidden: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.self_attn
+            .project_batch(&self.input_layernorm.forward(hidden)?, cos, sin)
+    }
+
+    /// The residual branches after attention: `attn` `[1, tokens, q_size]`
+    /// through the output projection onto `hidden`, then the MLP.
+    fn post_attention(&self, hidden: &Tensor, attn: &Tensor) -> Result<Tensor> {
+        let hidden = hidden.broadcast_add(&self.self_attn.o_proj.forward(attn)?)?;
+        let ff = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&hidden)?)?;
+        hidden.broadcast_add(&ff).map_err(Error::from)
+    }
+
     fn load(cfg: &FishS2SlowConfig, rotary: &FishS2RotaryCache, vb: VarBuilder) -> Result<Self> {
         let input_layernorm = load_rms_norm_alias(
             cfg.hidden_size,
@@ -596,7 +783,7 @@ impl FishS2PackedAttention {
             qkv_proj: candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("qkv_proj"))?,
             o_proj: candle_nn::linear_no_bias(cfg.q_size(), cfg.hidden_size, vb.pp("o_proj"))?,
             q_norm: if vb.contains_tensor("q_norm.weight") {
-                Some(candle_nn::rms_norm(
+                Some(DeviceRmsNorm::load(
                     cfg.head_dim,
                     cfg.rms_norm_eps,
                     vb.pp("q_norm"),
@@ -605,7 +792,7 @@ impl FishS2PackedAttention {
                 None
             },
             k_norm: if vb.contains_tensor("k_norm.weight") {
-                Some(candle_nn::rms_norm(
+                Some(DeviceRmsNorm::load(
                     cfg.head_dim,
                     cfg.rms_norm_eps,
                     vb.pp("k_norm"),
@@ -620,31 +807,30 @@ impl FishS2PackedAttention {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn forward_batch(
+    /// Every token of `x` `[1, tokens, hidden]` (spare rows included):
+    /// its query and key rotated at its own position (`cos`/`sin`, one row
+    /// a token) and its value, each `[tokens, heads, head_dim]`. Rows stay
+    /// apart, so a token's bits are its own whatever rows share the call.
+    fn project_batch(
         &self,
         x: &Tensor,
-        starts: &[usize],
-        counts: &[usize],
-        cache: &PhysicalPagedKvCache,
-        batch: &mut super::batch::FishPhysicalBatch,
-        layer: usize,
-    ) -> Result<Tensor> {
-        let total = x.dim(1)?;
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let tokens = x.dim(1)?;
         let qsize = self.num_heads * self.head_dim;
         let kvsize = self.num_kv_heads * self.head_dim;
         let qkv = self.qkv_proj.forward(x)?;
         let q = qkv
             .narrow(2, 0, qsize)?
-            .reshape((1, total, self.num_heads, self.head_dim))?;
+            .reshape((1, tokens, self.num_heads, self.head_dim))?;
         let k =
             qkv.narrow(2, qsize, kvsize)?
-                .reshape((1, total, self.num_kv_heads, self.head_dim))?;
-        let v = qkv.narrow(2, qsize + kvsize, kvsize)?.reshape((
-            total,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
+                .reshape((1, tokens, self.num_kv_heads, self.head_dim))?;
+        let v = qkv
+            .narrow(2, qsize + kvsize, kvsize)?
+            .reshape((tokens, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
         let q = match &self.q_norm {
             Some(norm) => norm.forward(&q)?,
             None => q,
@@ -653,35 +839,48 @@ impl FishS2PackedAttention {
             Some(norm) => norm.forward(&k)?,
             None => k,
         };
-        let mut qs = Vec::new();
-        let mut ks = Vec::new();
-        let mut offset = 0;
-        for (&start, &count) in starts.iter().zip(counts) {
-            qs.push(
-                self.rotary
-                    .apply(&q.narrow(1, offset, count)?, start)?
-                    .squeeze(0)?,
-            );
-            ks.push(
-                self.rotary
-                    .apply(&k.narrow(1, offset, count)?, start)?
-                    .squeeze(0)?,
-            );
-            offset += count;
-        }
-        let q = Tensor::cat(&qs, 0)?.contiguous()?;
-        let k = Tensor::cat(&ks, 0)?.contiguous()?;
+        let q = self.rotary.apply_tables(&q, cos, sin)?.squeeze(0)?;
+        let k = self.rotary.apply_tables(&k, cos, sin)?.squeeze(0)?;
+        Ok((q, k, v))
+    }
+
+    /// Paged attention of the first `total` tokens of `q`/`k`/`v` (from
+    /// [`Self::project_batch`]), whose rows after them are spare rows that
+    /// attention skips: `[1, tokens, q_size]` with zero spare rows.
+    #[allow(clippy::too_many_arguments)]
+    fn attend_batch(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        total: usize,
+        cache: &PhysicalPagedKvCache,
+        batch: &mut super::batch::FishPhysicalBatch,
+        layer: usize,
+    ) -> Result<Tensor> {
+        let width = q.dim(0)?;
+        let real = |t: &Tensor| -> Result<Tensor> {
+            let t = if width > total {
+                t.narrow(0, 0, total)?
+            } else {
+                t.clone()
+            };
+            t.contiguous().map_err(Error::from)
+        };
         let out = batch.attend(
             cache,
             layer,
-            &q,
-            &k,
-            &v.contiguous()?,
+            &real(q)?,
+            &real(k)?,
+            &real(v)?,
             1.0 / (self.head_dim as f32).sqrt(),
         )?;
-        self.o_proj
-            .forward(&out.reshape((1, total, qsize))?)
-            .map_err(Error::from)
+        let out = out.reshape((1, total, self.num_heads * self.head_dim))?;
+        if width > total {
+            Ok(out.pad_with_zeros(1, 0, width - total)?)
+        } else {
+            Ok(out)
+        }
     }
 
     fn forward(
@@ -767,18 +966,37 @@ impl FishS2Mlp {
     }
 }
 
-fn load_rms_norm_alias(dim: usize, eps: f64, vb: &VarBuilder, aliases: &[&str]) -> Result<RmsNorm> {
+fn load_rms_norm_alias(
+    dim: usize,
+    eps: f64,
+    vb: &VarBuilder,
+    aliases: &[&str],
+) -> Result<DeviceRmsNorm> {
     for alias in aliases {
         if vb.contains_tensor(&format!("{alias}.weight")) {
-            return candle_nn::rms_norm(dim, eps, vb.pp(*alias)).map_err(Error::from);
+            return DeviceRmsNorm::load(dim, eps, vb.pp(*alias)).map_err(Error::from);
         }
     }
-    candle_nn::rms_norm(dim, eps, vb.pp(aliases[0])).map_err(Error::from)
+    DeviceRmsNorm::load(dim, eps, vb.pp(aliases[0])).map_err(Error::from)
 }
 
 #[cfg(test)]
 pub(super) fn tiny_for_batch_tests() -> FishS2SlowTransformer {
     tests::tiny_model(&candle_core::Device::Cpu)
+}
+
+/// Rows a decode step's dense work runs at on CUDA.
+pub(crate) const FISH_DECODE_ROWS: usize = 32;
+
+/// The fixed row count a step's dense work runs at, or `None` to run the
+/// rows as they are. On CUDA a decode step (every row one token) of at most
+/// [`FISH_DECODE_ROWS`] rows pads to that count: cuBLAS chooses its kernel,
+/// tiles and split by the row count, so a row's bits depended on how many
+/// requests shared its step. Norms, residuals and activations are row-wise
+/// and attention runs per row, so the padding changes no real row.
+fn decode_rows(device: &candle_core::Device, counts: &[usize]) -> Option<usize> {
+    (device.is_cuda() && counts.len() <= FISH_DECODE_ROWS && counts.iter().all(|&count| count == 1))
+        .then_some(FISH_DECODE_ROWS)
 }
 
 #[cfg(test)]
@@ -1045,6 +1263,98 @@ mod tests {
                 .unwrap();
             assert!(a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-5));
         }
+    }
+
+    /// On CUDA, decode steps through the stretch graphs (warm, capture,
+    /// verify, then replay) give the eager steps' bits, and every row
+    /// decodes the same alone as beside others (the dense work runs at the
+    /// fixed 32 rows either way).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_graphed_decode_steps_match_eager_and_alone_bit_for_bit() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let graphed = tiny_model(&device);
+        assert!(graphed.graphs.is_ok(), "{}", graphed.graphs_diagnostics());
+        let mut eager = tiny_model(&device);
+        eager.turn_off_graphs();
+        let cfg = graphed.config().clone();
+        let bits = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        let input = |row: usize, step: usize, len: usize| {
+            Tensor::from_vec(
+                (0..len * cfg.hidden_size)
+                    .map(|i| ((i * 5 + row * 11 + step * 3) as f32 * 0.17).sin())
+                    .collect::<Vec<_>>(),
+                (1, len, cfg.hidden_size),
+                &device,
+            )
+            .unwrap()
+        };
+        // A model's rows decoded together or each alone, after prompts of
+        // different lengths: every step's outputs as bits, row by row.
+        let run = |model: &FishS2SlowTransformer, together: bool| {
+            let rows = 3;
+            let mut caches =
+                crate::models::shared::attention::physical::test_physical_caches_with_dtype_on(
+                    &device,
+                    DType::F32,
+                    cfg.num_hidden_layers,
+                    cfg.num_key_value_heads,
+                    cfg.head_dim,
+                    cfg.max_seq_len,
+                    rows,
+                );
+            for (row, cache) in caches.iter_mut().enumerate() {
+                model
+                    .forward_embeds_batch(&[input(row, 0, row + 1)], &mut [cache])
+                    .unwrap();
+            }
+            let mut out = vec![Vec::new(); rows];
+            for step in 1..8 {
+                let inputs = (0..rows).map(|row| input(row, step, 1)).collect::<Vec<_>>();
+                let outputs = if together {
+                    model
+                        .forward_embeds_batch(&inputs, &mut caches.iter_mut().collect::<Vec<_>>())
+                        .unwrap()
+                } else {
+                    inputs
+                        .iter()
+                        .zip(caches.iter_mut())
+                        .map(|(input, cache)| {
+                            model
+                                .forward_embeds_batch(std::slice::from_ref(input), &mut [cache])
+                                .unwrap()
+                                .remove(0)
+                        })
+                        .collect()
+                };
+                for (row, output) in outputs.iter().enumerate() {
+                    out[row].push((bits(&output.hidden_states), bits(&output.logits)));
+                }
+            }
+            out
+        };
+        let together = run(&graphed, true);
+        let diagnostics = graphed.graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert!(
+            diagnostics["replays"].as_u64().unwrap_or(0) > 0,
+            "{diagnostics}"
+        );
+        assert_eq!(together, run(&eager, true));
+        assert_eq!(together, run(&graphed, false));
+        assert_eq!(together, run(&eager, false));
     }
 
     #[test]

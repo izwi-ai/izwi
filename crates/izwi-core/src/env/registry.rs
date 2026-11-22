@@ -140,6 +140,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "JSON file of real codebook frames for the ignored Audio8 CUDA codec stream test.",
     ),
     CoreEnvVar::new(
+        "IZWI_AUDIO8_CODEC_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Audio8's streaming codec decodes each row's push alone at one shape per incoming frame count: every convolution history at its full length and the post-module's kept keys and values at the window less one, zero until real, under a mask. The first-chunk (4 frames) and full-chunk (16 frames) pushes run as CUDA graphs, one per length, which a load-time self-check captures and compares with the eager push bit for bit; shorter tails run their fixed shape eagerly. A mismatch, a CUDA error or a graph pool past its budget keeps pushes eager at the same shapes and bits. Loads price 288 MiB for the graphs. Any false value turns the graphs off (pushes stay fixed-shape); `codec_graphs` in the model diagnostics reports why they are off, captures, replays and graphed and eager pushes.",
+    ),
+    CoreEnvVar::new(
         "IZWI_AUDIO8_CODEC_PATH",
         Path,
         "unset (test fails)",
@@ -187,6 +194,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "data/fox.wav",
         TestHarness,
         "Reference voice WAV that conditions Audio8 smoke synthesis; `none` speaks with no reference.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_AUDIO8_SLOW_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, every Audio8 decode step runs its slow transformer as CUDA graphs of the work between two layers' paged attention (the residual branches, norms and the next layer's projections and rotation, and after the last layer the final norm and the semantic logits), at the 32 padded rows every CUDA decode step already has, checked bit for bit against the eager stretch before replaying; attention stays eager over the real rows. Any graph failure keeps every step eager. Loads price 64 MiB for the graphs. Any false value, or cuda.decode_graphs=off, turns them off; `slow_graphs` in the model diagnostics reports why they are off, captures and replays.",
     ),
     CoreEnvVar::new(
         "IZWI_AUDIO8_SMOKE_CONTEXT",
@@ -679,6 +693,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Draws a Fish S2 step's semantic tokens (CUDA and Metal) and fast codes (each depth) for every row from one device pass and one readback, uploading each frame's sampling noise once for all rows; false samples each row on its own.",
     ),
     CoreEnvVar::new(
+        "IZWI_FISH_S2_CODEC_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, Fish S2's streaming codec decodes each row's push alone at one shape per incoming frame count: every convolution history at its full length and the post-module's kept keys and values at the window less one, zero until real, under a mask. The first-chunk (4 frames) and full-chunk (16 frames) pushes run as CUDA graphs, one per length, which a load-time self-check captures and compares with the eager push bit for bit; shorter tails run their fixed shape eagerly. A mismatch, a CUDA error or a graph pool past its budget keeps pushes eager at the same shapes and bits. Loads price 304 MiB for the graphs. Any false value turns the graphs off (pushes stay fixed-shape); `codec_graphs` in the model diagnostics reports why they are off, captures, replays and graphed and eager pushes.",
+    ),
+    CoreEnvVar::new(
         "IZWI_FISH_S2_DTYPE",
         Choice,
         "Fish S2 per-backend dtype policy",
@@ -712,6 +733,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "data/fox.wav",
         TestHarness,
         "Reference voice WAV that conditions Fish S2 smoke synthesis.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_FISH_S2_SLOW_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, every Fish S2 decode step runs its slow transformer as CUDA graphs of the work between two layers' paged attention (the residual branches, norms and the next layer's projections, Q/K norms and rotation, and after the last layer the final norm and the semantic logits), at the 32 padded rows every CUDA decode step already has, checked bit for bit against the eager stretch before replaying; attention stays eager over the real rows. Any graph failure keeps every step eager. Loads price 64 MiB for the graphs. Any false value, or cuda.decode_graphs=off, turns them off; `slow_graphs` in the model diagnostics reports why they are off, captures and replays.",
     ),
     CoreEnvVar::new(
         "IZWI_FISH_S2_SMOKE_CONTEXT",
@@ -1566,11 +1594,25 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Allows Metal SDPA for masked attention when the mask shape is supported.",
     ),
     CoreEnvVar::new(
+        "IZWI_MING_TTS_AUDIO_BATCH",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, decodes the due VAE windows of up to the engine rows in one audio quantum: every request's fixed-shape window is queued before any is read back, so the host's inverse STFT of one overlaps the device's next window. Any false value keeps one window per quantum.",
+    ),
+    CoreEnvVar::new(
         "IZWI_MING_TTS_DECODE_GRAPHS",
         Flag,
         "true",
         Once,
-        "On CUDA, a Ming-3.0-tts decode step of 1 to 4 or 8 rows runs its language model as CUDA graphs of the work between two layers' paged attention (the residual branches, norms and the next layer's projections and rotation), captured per row count and checked bit for bit against the eager stretch before replaying; attention stays eager. Any graph failure keeps every step eager. Any false value, or cuda.decode_graphs=off, turns them off; `decode_graphs` in the model diagnostics reports why they are off, captures and replays.",
+        "On CUDA, every Ming-3.0-tts decode step runs its language model as CUDA graphs of the work between two layers' paged attention (the residual branches, norms and the next layer's projections and rotation), at the 32 padded rows every CUDA projection already has, checked bit for bit against the eager stretch before replaying; attention stays eager over the real rows. Any graph failure keeps every step eager. Any false value, or cuda.decode_graphs=off, turns them off; `decode_graphs` in the model diagnostics reports why they are off, captures and replays.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_MING_TTS_F32_TF32",
+        Flag,
+        "true",
+        Load,
+        "Runs the F32 matmuls of Ming's VAE decoder on CUDA tensor cores in TF32 (F32 tensors and sums, the multiply's inputs rounded to a 10-bit mantissa); the VAE encoder and the language model keep their precision.",
     ),
     CoreEnvVar::new(
         "IZWI_MING_TTS_FLOW_GRAPHS",
@@ -1606,6 +1648,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "cpu",
         TestHarness,
         "Device of the ignored Ming-3.0-tts real-weight tests: cpu (F32), metal (F16 language model and flow path) or metal-f32.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_MING_TTS_VAE_GRAPHS",
+        Flag,
+        "true",
+        Once,
+        "On CUDA, runs each Ming-3.0-tts VAE window at one fixed shape (34 query slots over 63 kept and 34 new keys) as a CUDA graph, checked bit for bit against the eager window at load. Off, a failure or a graph pool past its budget runs the same fixed shape eagerly with the same bits; `vae_graphs` in the model diagnostics reports why they are off, captures and replays.",
     ),
     CoreEnvVar::new(
         "IZWI_MING_TTS_VAE_WINDOW_KEYS",
@@ -2798,11 +2847,25 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the dtype of Rumble's audio tower and projector (f32, f16, bf16); a lowered dtype must pass a load-time probe or the component reloads in F32.",
     ),
     CoreEnvVar::new(
+        "IZWI_RUMBLE_AUDIO_TF32",
+        Flag,
+        "true",
+        Load,
+        "Runs Rumble's F32 audio-tower linear layers on CUDA tensor cores in TF32 (F32 tensors, inputs rounded to a 10-bit mantissa inside the multiply).",
+    ),
+    CoreEnvVar::new(
         "IZWI_RUMBLE_DECODE_GRAPHS",
         Flag,
         "true",
         Once,
-        "On CUDA, Rumble's retained route replays each decode step of its text decoder, from the token embeddings to the logits, as one CUDA graph per padded width (1, 2, 3, 4, 6, 8, 12, 16, 24 or 32 rows), with attention on the split decode. Each graph is checked bit for bit against the eager body on its first two steps, and a width's first step against the standard decode (relative L2 within 0.05, same greedy token per row); a mismatch or CUDA error turns the graphs off for the process. Loads that offer the retained route price 256 MiB for them. Any false value (or cuda.decode_graphs=off) keeps the standard decode; `decode_graph` in the diagnostics reports captures, replays and why the graphs are off.",
+        "On CUDA, Rumble's retained route replays each decode step of its text decoder, from the token embeddings to the logits, as one CUDA graph per padded width (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48 or 64 rows), with attention on the split decode. Each graph is checked bit for bit against the eager body on its first two steps, and a width's first step against the standard decode (relative L2 within 0.05, same greedy token per row); a mismatch or CUDA error turns the graphs off for the process. Loads that offer the retained route price 352 MiB for them. Any false value (or cuda.decode_graphs=off) keeps the standard decode; `decode_graph` in the diagnostics reports captures, replays and why the graphs are off.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_RUMBLE_ENCODER_MAX_WAIT_MS",
+        Duration,
+        "40",
+        Once,
+        "On CUDA, sets the longest a Rumble request waits in front of the audio encoder for a wider pass while the retained decode is full, in milliseconds; while the decode has free rows the encoder runs at once. 0 never holds a request back.",
     ),
     CoreEnvVar::new(
         "IZWI_RUMBLE_RETAINED_DECODE",
@@ -2912,9 +2975,9 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_DECODE_QUANTUM",
         Int,
-        "8 on CUDA",
+        "1 on CUDA, 8 on Metal, 4 on CPU",
         Load,
-        "Decode steps one SOV-Transcribe-1 row runs per engine step while no request waits (1 to 64), fixed per load; the scheduler drops to one step as soon as a request waits. Greedy decoding makes the transcript the same at any value; values outside that range are ignored.",
+        "Decode steps one SOV-Transcribe-1 row runs per engine step (1 to 64), fixed per load. On CUDA one step a quantum lets rows that arrive meanwhile join the next step; longer quanta held each row's steps to itself. Greedy decoding makes the transcript the same at any value; values outside that range are ignored.",
     ),
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_ENCODER_BATCH",
@@ -2931,6 +2994,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "On CUDA, SOV-Transcribe-1's encoder and projector over a batch of 30-second windows replay a CUDA graph per batch size (1 to the encoder batch), each checked bit for bit against the eager run on its first two batches; any mismatch or failure turns them off for the process. A load prices up to 1.7 GiB for them. Any false value runs the encoder eagerly; `encoder_graphs` in the diagnostics reports captures and replays.",
     ),
     CoreEnvVar::new(
+        "IZWI_SOV_TRANSCRIBE_FP8_EXPERTS",
+        Flag,
+        "false",
+        Load,
+        "Stores SOV-Transcribe-1's experts on CUDA as E4M3 rows with an F32 scale each, quantized at load: about 23 GB instead of 45.7, same transcripts, but slower than BF16 on the H100 today.",
+    ),
+    CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_MODEL_DIR",
         Path,
         "unset (test fails)",
@@ -2942,7 +3012,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Choice,
         "auto",
         Load,
-        "How SOV-Transcribe-1 computes its routed experts: `auto` (the default) runs the fused CUDA kernels (`kernels::moe_gelu`: device routing, each used expert's BF16 rows read once, no host readback) for calls of up to 512 routed pairs, so every decode step, and routes prefill spans on the host (each used expert's tokens as one GEMM); `fused` always takes the fused kernels (their CPU reference off CUDA); `host` always routes on the host; `device` takes the portable gathered path. A device path serves only after a load-time check against the host path; `moe_backend` and `moe_check` in the diagnostics report it.",
+        "How SOV-Transcribe-1 computes its routed experts: `auto` (the default) runs the fused CUDA kernels (`kernels::moe_gelu`: device routing, each used expert's BF16 rows read once, no host readback) for calls of up to 512 routed pairs, so every decode step, and prefill spans on the grouped path (every expert's tokens padded into one block and run as two batched GEMMs over the resident weights, in 512-token chunks); off CUDA it routes on the host. `fused` always takes the fused kernels (their CPU reference off CUDA); `grouped` always takes the grouped path; `host` always routes on the host; `device` takes the portable gathered path. A device path serves only after a load-time check against the host path; `moe_backend` and `moe_check` in the diagnostics report it.",
     ),
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_PREFILL_SPAN",
@@ -2950,6 +3020,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "512 on CUDA",
         Load,
         "Prompt tokens one SOV-Transcribe-1 row prefills per engine step (16 to 16384), fixed per load: the scheduler's prefill grid. The default covers the whole prompt of a 30-second request (about 410 tokens) in one step; values outside that range are ignored.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_SOV_TRANSCRIBE_PROFILE",
+        Flag,
+        "false",
+        Once,
+        "Synchronizes the device around each phase of every SOV-Transcribe-1 prefill (projections, attention, dense, experts) and decode step (attention, graphed stretches) and logs where the time went. A diagnostic: the synchronizations slow serving.",
     ),
     CoreEnvVar::new(
         "IZWI_SOV_TRANSCRIBE_REFERENCE",

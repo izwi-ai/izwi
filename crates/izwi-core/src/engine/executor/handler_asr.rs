@@ -78,6 +78,8 @@ mod nemotron;
 mod parakeet;
 #[path = "handler_asr/qwen3.rs"]
 mod qwen3;
+#[path = "handler_asr/rumble.rs"]
+mod rumble;
 #[path = "handler_asr/vibevoice.rs"]
 mod vibevoice;
 #[path = "handler_asr/voxtral.rs"]

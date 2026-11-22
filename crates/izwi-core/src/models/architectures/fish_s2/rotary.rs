@@ -110,16 +110,92 @@ impl FishS2RotaryCache {
                 self.max_seq_len
             )));
         }
+        let (cos, sin) = self.range_tables(start_pos, seq_len)?;
+        self.apply_tables(x, &cos, &sin)
+    }
+
+    /// The tables of the `len` positions from `start`: `[len, head_dim / 2]`
+    /// cos and sin (views of the cache), for [`Self::apply_tables`].
+    pub(crate) fn range_tables(&self, start: usize, len: usize) -> Result<(Tensor, Tensor)> {
+        if start
+            .checked_add(len)
+            .is_none_or(|end| end > self.max_seq_len)
+        {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 rotary positions {start}..+{len} exceed cache capacity {}",
+                self.max_seq_len
+            )));
+        }
+        Ok((
+            self.cos.narrow(0, start, len)?,
+            self.sin.narrow(0, start, len)?,
+        ))
+    }
+
+    /// The tables of packed tokens, each at its own absolute position:
+    /// `[rows, head_dim / 2]` cos and sin, row `i` the table row of
+    /// `positions[i]` and any rows past `positions.len()` (padding) that of
+    /// position 0. Gather once per step; every layer shares them.
+    pub(crate) fn position_tables(
+        &self,
+        positions: &[usize],
+        rows: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        if positions.is_empty() || rows < positions.len() {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 rotary tables need 1..={rows} positions, got {}",
+                positions.len()
+            )));
+        }
+        let mut ids = Vec::with_capacity(rows);
+        for &position in positions {
+            if position >= self.max_seq_len {
+                return Err(Error::InvalidInput(format!(
+                    "Fish S2 rotary position {position} exceeds cache capacity {}",
+                    self.max_seq_len
+                )));
+            }
+            ids.push(position as u32);
+        }
+        ids.resize(rows, 0);
+        let ids = Tensor::from_vec(ids, rows, self.cos.device())?;
+        Ok((
+            self.cos.index_select(&ids, 0)?,
+            self.sin.index_select(&ids, 0)?,
+        ))
+    }
+
+    /// [`Self::apply`] with explicit tables: `x` is `[batch, sequence,
+    /// heads, head_dim]` and `cos`/`sin` are `[sequence, head_dim / 2]`, the
+    /// tables of each position (from [`Self::position_tables`], say). The
+    /// rotation is elementwise, so a token rotated among others has the bits
+    /// it has alone at its position.
+    pub(crate) fn apply_tables(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let (_, seq_len, _, head_dim) = x.dims4()?;
+        let table = [seq_len, self.head_dim / 2];
+        if head_dim != self.head_dim || cos.dims() != table || sin.dims() != table {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 rotary tables must be {table:?} for input {:?}, got {:?} and {:?}",
+                x.dims(),
+                cos.dims(),
+                sin.dims()
+            )));
+        }
         if !matches!(x.dtype(), DType::BF16 | DType::F16 | DType::F32) {
             return Err(Error::InvalidInput(format!(
                 "Fish S2 rotary input must be BF16, F16, or F32, got {:?}",
                 x.dtype()
             )));
         }
-        let cos = self.cos.narrow(0, start_pos, seq_len)?;
-        let sin = self.sin.narrow(0, start_pos, seq_len)?;
+        // On CUDA one launch in this layout, the same F32 rotation rounded
+        // once (`rope_pairs`); elsewhere Candle's rope_i in F32.
+        if crate::kernels::cuda::rope_pairs::serves(x.device(), x.dtype())
+            && cos.dtype() == DType::F32
+        {
+            return Ok(crate::kernels::cuda::rope_pairs::rotate(x, cos, sin)?);
+        }
         let input = x.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
-        let rotated = candle_nn::rotary_emb::rope_i(&input, &cos, &sin)?;
+        let rotated = candle_nn::rotary_emb::rope_i(&input, cos, sin)?;
         rotated
             .transpose(1, 2)?
             .to_dtype(x.dtype())?
@@ -346,6 +422,58 @@ mod tests {
             chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap()
         );
         assert_eq!(cache.storage_bytes(), 64 * 128 * 4);
+    }
+
+    /// Packed tokens rotated in one call, each at its own position (padding
+    /// rows after them), come out bit for bit as each run rotated alone.
+    #[test]
+    fn position_tables_rotate_packed_tokens_as_alone() {
+        let device = Device::Cpu;
+        let cache = FishS2RotaryCache::new(64, 8, 1e6, DType::BF16, &device).unwrap();
+        let runs = [(0usize, 2usize), (17, 1), (40, 3), (63, 1)];
+        let tokens = runs.iter().map(|(_, count)| count).sum::<usize>();
+        let width = tokens + 2;
+        let values = (0..width * 3 * 8)
+            .map(|i| (i % 31) as f32 / 9.0 - 1.5)
+            .collect::<Vec<_>>();
+        let input = Tensor::from_vec(values, (1, width, 3, 8), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let positions = runs
+            .iter()
+            .flat_map(|&(start, count)| start..start + count)
+            .collect::<Vec<_>>();
+        let (cos, sin) = cache.position_tables(&positions, width).unwrap();
+        let packed = cache.apply_tables(&input, &cos, &sin).unwrap();
+        let mut offset = 0;
+        for (start, count) in runs {
+            let alone = cache
+                .apply(&input.narrow(1, offset, count).unwrap(), start)
+                .unwrap();
+            let bits = |t: &Tensor| {
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                bits(&packed.narrow(1, offset, count).unwrap()),
+                bits(&alone),
+                "run at {start}"
+            );
+            offset += count;
+        }
+        assert!(cache.position_tables(&[64], 1).is_err());
+        assert!(cache.position_tables(&[1, 2], 1).is_err());
+        assert!(cache
+            .apply_tables(&input, &cos.narrow(0, 0, 2).unwrap(), &sin)
+            .is_err());
     }
 
     #[test]

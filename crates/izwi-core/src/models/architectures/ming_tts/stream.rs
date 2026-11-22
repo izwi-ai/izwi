@@ -11,7 +11,7 @@
 //! ends is dropped.
 
 use super::config::{LATENT_DIM, SAMPLE_RATE};
-use super::vae::{MingVaeDecodeState, MingVaeDecoder};
+use super::vae::{MingVaeDecodeState, MingVaeDecoder, MingVaePending};
 use crate::error::Result;
 
 /// Latents before the first window (0.32 s): early first audio.
@@ -130,8 +130,48 @@ impl MingAudioStream {
         latents: &[f32],
         window: MingWindow,
     ) -> Result<Vec<f32>> {
+        let pending = self.begin(decoder, latents, window)?;
+        self.finish(decoder, pending, window)
+    }
+
+    /// The first half of [`Self::decode`]: queue `window`'s stack on the
+    /// device ([`MingVaeDecoder::begin`]).
+    pub(crate) fn begin(
+        &mut self,
+        decoder: &MingVaeDecoder,
+        latents: &[f32],
+        window: MingWindow,
+    ) -> Result<MingVaePending> {
         let slice = &latents[window.from * LATENT_DIM..window.to * LATENT_DIM];
-        let decoded = decoder.push(&mut self.vae, slice, window.last)?;
+        decoder.begin(&mut self.vae, slice, window.last)
+    }
+
+    /// The second half of [`Self::decode`]: the queued window's samples,
+    /// trimmed.
+    pub(crate) fn finish(
+        &mut self,
+        decoder: &MingVaeDecoder,
+        pending: MingVaePending,
+        window: MingWindow,
+    ) -> Result<Vec<f32>> {
+        let decoded = decoder.finish(&mut self.vae, pending)?;
+        let mut out = self.trim.push(&decoded);
+        if window.last {
+            out.extend(self.trim.finish());
+        }
+        self.samples += out.len();
+        Ok(out)
+    }
+
+    /// [`Self::finish`] for a window already read back to the host
+    /// ([`MingVaeDecoder::read_back`]): host work only.
+    pub(crate) fn finish_host(
+        &mut self,
+        decoder: &MingVaeDecoder,
+        host: super::vae::MingVaeHostWindow,
+        window: MingWindow,
+    ) -> Result<Vec<f32>> {
+        let decoded = decoder.finish_host(&mut self.vae, host)?;
         let mut out = self.trim.push(&decoded);
         if window.last {
             out.extend(self.trim.finish());

@@ -11,7 +11,7 @@
 //!   `[2 * width, hidden]` with the gate in its first `width` rows and the
 //!   up projection in its last; `down_proj[e]` is `[hidden, width]`.
 //!
-//! Three paths compute the experts, with the same arithmetic:
+//! Four paths compute the experts, with the same arithmetic:
 //!
 //! * **Host-routed** (the reference): the router's probabilities are read to
 //!   the host once per layer and each selected expert runs as two matmuls
@@ -23,6 +23,14 @@
 //!   tokens, so it costs what the host path reads without the readback, and
 //!   a row's result does not depend on the batch. It serves decode steps
 //!   (up to [`FUSED_MAX_PAIRS`] routed pairs) on CUDA.
+//! * **Grouped** ([`SovFeedForward::sparse_grouped`]): device routing read
+//!   back once, each expert's tokens laid out in a padded `[experts, rows,
+//!   hidden]` block, and every expert run as one batched matmul over its
+//!   resident weights (two GEMMs and the scatter back: about a dozen launches
+//!   a layer). It serves prefill spans on CUDA, where the host path's
+//!   per-expert loop cost about 1,800 launches a layer (233 ms for a
+//!   512-token span on the H100) and the fused kernels' warp-per-channel
+//!   dots cannot use tensor cores.
 //! * **Gathered** ([`SovFeedForward::sparse_device`]): device routing from
 //!   composed tensor operations, each choice's expert rows gathered into one
 //!   batched matmul. Portable but it copies the weights; kept for
@@ -40,18 +48,23 @@ use super::norm::RmsNorm;
 use crate::error::Result;
 use crate::models::shared::moe::{ExpertSet, SparseMoeConfig, SparseMoeDispatcher};
 
-/// `IZWI_SOV_TRANSCRIBE_MOE_BACKEND`: `auto` (the default: fused on CUDA
-/// for calls of at most [`FUSED_MAX_PAIRS`] routed pairs, host-routed
-/// otherwise), `fused` (the fused kernels for every call; their CPU
-/// reference off CUDA), `host` (always host-routed) or `device` (always
-/// gathered).
+/// `IZWI_SOV_TRANSCRIBE_MOE_BACKEND`: `auto` (the default: on CUDA fused
+/// for calls of at most [`FUSED_MAX_PAIRS`] routed pairs and grouped above;
+/// host-routed off CUDA), `fused` (the fused kernels for every call; their
+/// CPU reference off CUDA), `grouped` (always grouped), `host` (always
+/// host-routed) or `device` (always gathered).
 pub const MOE_BACKEND_ENV: &str = "IZWI_SOV_TRANSCRIBE_MOE_BACKEND";
 
 /// The most routed pairs (tokens times 8) a fused call takes under `auto`:
 /// every decode width up to 64 rows. Longer prefill spans run each expert's
-/// tokens as one GEMM on the host-routed path, which the per-channel warp
-/// kernels cannot match once an expert has many tokens.
+/// tokens as GEMMs on the grouped path, which the per-channel warp kernels
+/// cannot match once an expert has many tokens.
 pub const FUSED_MAX_PAIRS: usize = 512;
+
+/// The most tokens one grouped call pads its experts' blocks over: with 128
+/// experts of the published geometry, the padded input, activations and
+/// output stay under about 1 GiB of BF16.
+pub const GROUPED_CHUNK_TOKENS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoeBackend {
@@ -59,6 +72,7 @@ pub enum MoeBackend {
     Host,
     Device,
     Fused,
+    Grouped,
 }
 
 /// The expert path one call takes.
@@ -67,6 +81,7 @@ pub enum ExpertPath {
     Host,
     Gathered,
     Fused,
+    Grouped,
 }
 
 impl MoeBackend {
@@ -76,8 +91,9 @@ impl MoeBackend {
             "host" | "legacy" => Ok(Self::Host),
             "device" | "gathered" => Ok(Self::Device),
             "fused" => Ok(Self::Fused),
+            "grouped" => Ok(Self::Grouped),
             other => Err(crate::error::Error::InvalidInput(format!(
-                "{MOE_BACKEND_ENV}={other:?}: expected auto, fused, host or device"
+                "{MOE_BACKEND_ENV}={other:?}: expected auto, fused, grouped, host or device"
             ))),
         }
     }
@@ -95,6 +111,7 @@ impl MoeBackend {
             Self::Host => "host",
             Self::Device => "device",
             Self::Fused => "fused",
+            Self::Grouped => "grouped",
         }
     }
 
@@ -104,9 +121,11 @@ impl MoeBackend {
             Self::Host => ExpertPath::Host,
             Self::Device => ExpertPath::Gathered,
             Self::Fused => ExpertPath::Fused,
+            Self::Grouped => ExpertPath::Grouped,
             Self::Auto if device.is_cuda() && tokens * top_k <= FUSED_MAX_PAIRS => {
                 ExpertPath::Fused
             }
+            Self::Auto if device.is_cuda() => ExpertPath::Grouped,
             Self::Auto => ExpertPath::Host,
         }
     }
@@ -114,7 +133,10 @@ impl MoeBackend {
     /// Whether a call of `tokens` tokens on `device` keeps routing on the
     /// device (no host readback): what a CUDA graph of the step needs.
     pub fn routes_on_device(self, device: &Device, tokens: usize, top_k: usize) -> bool {
-        self.path(device, tokens, top_k) != ExpertPath::Host
+        matches!(
+            self.path(device, tokens, top_k),
+            ExpertPath::Gathered | ExpertPath::Fused
+        )
     }
 }
 
@@ -152,11 +174,78 @@ impl Router {
 
 pub struct Experts {
     /// `[experts, 2 * width, hidden]`.
-    gate_up: Tensor,
+    gate_up: ExpertWeights,
     /// `[experts, hidden, width]`.
-    down: Tensor,
+    down: ExpertWeights,
     per_expert_scale: Vec<f32>,
     width: usize,
+}
+
+/// Opt-in for SOV-Transcribe's FP8 experts on CUDA (a boolean; off when
+/// unset). Read once, at load. FP8 halves the experts' memory (about 23 GB
+/// instead of 45.7) but is slower on the H100 today: at 32 concurrent, 48
+/// against 77 audio-s/s on short clips. Prefill decodes the experts a call
+/// uses to BF16 (28% of kernel time), and the decode kernels re-read each
+/// token's F32 activations once per output channel, so reading half the
+/// weight bytes does not speed them up.
+pub const FP8_EXPERTS_ENV: &str = "IZWI_SOV_TRANSCRIBE_FP8_EXPERTS";
+
+fn fp8_experts_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(FP8_EXPERTS_ENV, false));
+    ON.get()
+}
+
+/// One projection of every expert: the checkpoint's BF16, or on CUDA E4M3
+/// rows with an F32 scale each (`kernels::moe_gelu::Fp8Weights`). The
+/// experts are 45.7 GB of SOV's 52 in BF16, and a decode step at 32 rows
+/// reads nearly all of them, so FP8 halves the step's weight traffic.
+pub(crate) enum ExpertWeights {
+    Bf16(Tensor),
+    Fp8(crate::kernels::moe_gelu::Fp8Weights),
+}
+
+impl ExpertWeights {
+    fn dims3(&self) -> Result<(usize, usize, usize)> {
+        Ok(match self {
+            Self::Bf16(w) => w.dims3()?,
+            Self::Fp8(w) => w.dims3()?,
+        })
+    }
+
+    /// Every expert as a dense tensor (FP8 decoded to BF16): the paths that
+    /// read all of them at once (the gathered path, the padded grouped
+    /// path), which CUDA's serving paths do not take.
+    fn dense(&self) -> Result<Tensor> {
+        match self {
+            Self::Bf16(w) => Ok(w.clone()),
+            Self::Fp8(w) => {
+                let all = (0..w.dims3()?.0 as u32).collect::<Vec<_>>();
+                Ok(crate::kernels::moe_gelu::dequantize_experts(w, &all)?)
+            }
+        }
+    }
+
+    /// One expert's `[rows, cols]`.
+    fn expert(&self, expert: usize) -> Result<Tensor> {
+        match self {
+            Self::Bf16(w) => Ok(w.get(expert)?),
+            Self::Fp8(w) => Ok(
+                crate::kernels::moe_gelu::dequantize_experts(w, &[expert as u32])?.squeeze(0)?,
+            ),
+        }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Bf16(w) => w.elem_count() * w.dtype().size_in_bytes(),
+            Self::Fp8(w) => w.resident_bytes(),
+        }
+    }
+
+    pub(crate) fn is_fp8(&self) -> bool {
+        matches!(self, Self::Fp8(_))
+    }
 }
 
 impl ExpertSet for Experts {
@@ -165,10 +254,10 @@ impl ExpertSet for Experts {
     }
 
     fn apply_expert(&self, expert: usize, tokens: &Tensor) -> Result<Tensor> {
-        let gate_up = linear(tokens, &self.gate_up.get(expert)?, None)?;
+        let gate_up = linear(tokens, &self.gate_up.expert(expert)?, None)?;
         let gate = gate_up.narrow(1, 0, self.width)?.gelu()?;
         let up = gate_up.narrow(1, self.width, self.width)?;
-        let out = linear(&(gate * up)?, &self.down.get(expert)?, None)?;
+        let out = linear(&(gate * up)?, &self.down.expert(expert)?, None)?;
         Ok((out * self.per_expert_scale[expert] as f64)?)
     }
 }
@@ -213,16 +302,37 @@ impl SovFeedForward {
             scale: (get("router.scale", DType::F32)? * (d.hidden as f64).powf(-0.5))?,
             proj: get("router.proj.weight", DType::F32)?,
         };
+        // On CUDA the experts are quantized as each layer loads, so the
+        // BF16 copy of one layer is all that is ever resident beside them.
+        let fp8 = device.is_cuda()
+            && dtype == DType::BF16
+            && fp8_experts_requested()
+            && crate::kernels::moe_gelu::fp8_supported(
+                d.hidden,
+                d.expert_width,
+                d.experts,
+                d.top_k,
+            );
+        let weights = |name: &str| -> Result<ExpertWeights> {
+            let w = get(name, dtype)?;
+            Ok(if fp8 {
+                ExpertWeights::Fp8(crate::kernels::moe_gelu::quantize_rows(&w)?)
+            } else {
+                ExpertWeights::Bf16(w)
+            })
+        };
         let experts = Experts {
-            gate_up: get("experts.gate_up_proj", dtype)?,
-            down: get("experts.down_proj", dtype)?,
+            gate_up: weights("experts.gate_up_proj")?,
+            down: weights("experts.down_proj")?,
             per_expert_scale: checkpoint.host_f32(&format!("{l}.router.per_expert_scale"))?,
             width: d.expert_width,
         };
-        let resident_bytes = [&mlp.gate_up, &mlp.down, &experts.gate_up, &experts.down]
+        let resident_bytes = [&mlp.gate_up, &mlp.down]
             .iter()
             .map(|t| t.elem_count() * dtype.size_in_bytes())
             .sum::<usize>()
+            + experts.gate_up.resident_bytes()
+            + experts.down.resident_bytes()
             + (router.scale.elem_count() + router.proj.elem_count()) * 4;
         let per_expert_scale =
             Tensor::from_vec(experts.per_expert_scale.clone(), d.experts, device)?;
@@ -243,6 +353,11 @@ impl SovFeedForward {
 
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+
+    /// Whether this layer's experts are stored in FP8.
+    pub fn experts_fp8(&self) -> bool {
+        self.experts.gate_up.is_fp8()
     }
 
     /// The dense branch over `pre_feedforward_layernorm(h)`.
@@ -284,11 +399,11 @@ impl SovFeedForward {
             .broadcast_as((tokens, k, hidden))?
             .contiguous()?
             .reshape((tokens * k, 1, hidden))?;
-        let gate_up = e.gate_up.index_select(&flat, 0)?;
+        let gate_up = e.gate_up.dense()?.index_select(&flat, 0)?;
         let gate_up = x.matmul(&gate_up.transpose(1, 2)?)?;
         let gate = gate_up.narrow(2, 0, e.width)?.gelu()?;
         let up = gate_up.narrow(2, e.width, e.width)?;
-        let down = e.down.index_select(&flat, 0)?;
+        let down = e.down.dense()?.index_select(&flat, 0)?;
         let out = (gate * up)?.matmul(&down.transpose(1, 2)?)?;
         let out = out.reshape((tokens, k, hidden))?;
         let weighted = out.broadcast_mul(&weights.to_dtype(out.dtype())?.unsqueeze(2)?)?;
@@ -310,7 +425,189 @@ impl SovFeedForward {
             ExpertPath::Host => self.sparse(h, normed),
             ExpertPath::Gathered => self.sparse_device(h, normed),
             ExpertPath::Fused => self.sparse_fused(h, normed),
+            ExpertPath::Grouped => self.sparse_grouped(h, normed),
         }
+    }
+
+    /// [`Self::sparse`] as two batched matmuls over every expert's resident
+    /// weights: the routing (renormalized, `per_expert_scale` applied) is
+    /// read back once, each expert's tokens are gathered into a block padded
+    /// to the busiest expert's count, and each block row's output is scaled
+    /// by its weight and summed into its token.
+    /// Calls of more than [`GROUPED_CHUNK_TOKENS`] tokens run in chunks of
+    /// that many, which bounds the padded blocks however skewed the routing:
+    /// on tensor cores even every expert padded to the whole chunk costs
+    /// about 2 ms a layer, where the host path's per-expert loop cost 9.
+    /// On CUDA (toolkit 12.5 or later) nothing is padded: each expert's
+    /// tokens run through its weights in one cuBLAS grouped GEMM.
+    pub fn sparse_grouped(&self, h: &Tensor, normed: &Tensor) -> Result<Tensor> {
+        let tokens = normed.dim(0)?;
+        if tokens <= GROUPED_CHUNK_TOKENS {
+            return self.sparse_grouped_chunk(h, normed);
+        }
+        let mut outputs = Vec::with_capacity(tokens.div_ceil(GROUPED_CHUNK_TOKENS));
+        let mut start = 0;
+        while start < tokens {
+            let len = GROUPED_CHUNK_TOKENS.min(tokens - start);
+            outputs.push(
+                self.sparse_grouped_chunk(
+                    &h.narrow(0, start, len)?,
+                    &normed.narrow(0, start, len)?,
+                )?,
+            );
+            start += len;
+        }
+        Ok(Tensor::cat(&outputs, 0)?)
+    }
+
+    fn sparse_grouped_chunk(&self, h: &Tensor, normed: &Tensor) -> Result<Tensor> {
+        let (tokens, hidden) = normed.dims2()?;
+        let k = self.top_k;
+        let experts = self.experts.per_expert_scale.len();
+        let routing =
+            crate::kernels::moe_gelu::route(&self.router.logits(h)?, &self.per_expert_scale, k)?
+                .to_device(&Device::Cpu)?
+                .to_vec2::<f32>()?;
+        // Each expert's tokens, and where each (token, slot) lands among the
+        // padded block rows.
+        let mut by_expert: Vec<Vec<u32>> = vec![Vec::new(); experts];
+        let mut slot_rows = vec![(usize::MAX, 0usize); tokens * k];
+        let mut weights = vec![0f32; tokens * k];
+        for (token, row) in routing.iter().enumerate() {
+            for slot in 0..k {
+                let id = row[slot];
+                if id >= 0.0 && (id as usize) < experts {
+                    let expert = id as usize;
+                    slot_rows[token * k + slot] = (expert, by_expert[expert].len());
+                    by_expert[expert].push(token as u32);
+                    weights[token * k + slot] = row[k + slot];
+                }
+            }
+        }
+        let rows = by_expert.iter().map(Vec::len).max().unwrap_or(0);
+        if rows == 0 {
+            return Ok(normed.zeros_like()?);
+        }
+        if normed.device().is_cuda()
+            && crate::kernels::grouped_gemm::available_on_device(normed.dtype())
+        {
+            return self.exact_grouped(normed, &by_expert, &slot_rows, weights);
+        }
+        let mut ids = vec![0u32; experts * rows];
+        for (expert, choices) in by_expert.iter().enumerate() {
+            ids[expert * rows..expert * rows + choices.len()].copy_from_slice(choices);
+        }
+        // A slot without an expert reads block row 0 at weight zero.
+        let gather = slot_rows
+            .iter()
+            .map(|&(expert, index)| {
+                if expert == usize::MAX {
+                    0
+                } else {
+                    (expert * rows + index) as u32
+                }
+            })
+            .collect::<Vec<_>>();
+        let device = normed.device();
+        let e = &self.experts;
+        let ids = Tensor::from_vec(ids, experts * rows, device)?;
+        let x = normed
+            .index_select(&ids, 0)?
+            .reshape((experts, rows, hidden))?;
+        let gate_up = x.matmul(&e.gate_up.dense()?.transpose(1, 2)?)?;
+        let gate = gate_up.narrow(2, 0, e.width)?.gelu()?;
+        let up = gate_up.narrow(2, e.width, e.width)?;
+        let out = (gate * up)?
+            .matmul(&e.down.dense()?.transpose(1, 2)?)?
+            .reshape((experts * rows, hidden))?;
+        // Each token gathers its slots' rows and sums them by weight (an
+        // index_add over the padded rows scanned every row per column).
+        let gather = Tensor::from_vec(gather, tokens * k, device)?;
+        let weights = Tensor::from_vec(weights, (tokens, k, 1), device)?.to_dtype(out.dtype())?;
+        Ok(out
+            .index_select(&gather, 0)?
+            .reshape((tokens, k, hidden))?
+            .broadcast_mul(&weights)?
+            .sum(1)?)
+    }
+
+    /// The grouped experts with no padding (CUDA): each expert's tokens
+    /// sorted into one contiguous run, every run multiplied by exactly its
+    /// expert's resident weights in one grouped GEMM per projection, and
+    /// each token's slots gathered back and summed by weight.
+    fn exact_grouped(
+        &self,
+        normed: &Tensor,
+        by_expert: &[Vec<u32>],
+        slot_rows: &[(usize, usize)],
+        weights: Vec<f32>,
+    ) -> Result<Tensor> {
+        use crate::kernels::grouped_gemm::{grouped_rows_gemm, RowGroup};
+        let (tokens, _) = normed.dims2()?;
+        let k = self.top_k;
+        let mut first = vec![0usize; by_expert.len()];
+        let mut groups = Vec::new();
+        let mut ids = Vec::with_capacity(tokens * k);
+        for (expert, choices) in by_expert.iter().enumerate() {
+            first[expert] = ids.len();
+            if !choices.is_empty() {
+                groups.push(RowGroup {
+                    expert,
+                    first_row: ids.len(),
+                    rows: choices.len(),
+                });
+                ids.extend_from_slice(choices);
+            }
+        }
+        // A slot without an expert reads row 0 at weight zero.
+        let gather = slot_rows
+            .iter()
+            .map(|&(expert, index)| {
+                if expert == usize::MAX {
+                    0
+                } else {
+                    (first[expert] + index) as u32
+                }
+            })
+            .collect::<Vec<_>>();
+        let device = normed.device();
+        let e = &self.experts;
+        let rows = ids.len();
+        let ids = Tensor::from_vec(ids, rows, device)?;
+        let x = normed.index_select(&ids, 0)?;
+        // FP8 experts: the used ones decoded to BF16 once for the call, the
+        // groups renumbered into that compact set.
+        let (gate_up_w, down_w, groups) = match (&e.gate_up, &e.down) {
+            (ExpertWeights::Fp8(gate_up), ExpertWeights::Fp8(down)) => {
+                let used = groups.iter().map(|g| g.expert as u32).collect::<Vec<_>>();
+                let compact = groups
+                    .iter()
+                    .enumerate()
+                    .map(|(index, g)| RowGroup {
+                        expert: index,
+                        ..*g
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    crate::kernels::moe_gelu::dequantize_experts(gate_up, &used)?,
+                    crate::kernels::moe_gelu::dequantize_experts(down, &used)?,
+                    compact,
+                )
+            }
+            _ => (e.gate_up.dense()?, e.down.dense()?, groups),
+        };
+        let gate_up = grouped_rows_gemm(&x, &gate_up_w, &groups)?;
+        let gate = gate_up.narrow(1, 0, e.width)?.gelu()?;
+        let up = gate_up.narrow(1, e.width, e.width)?;
+        let out = grouped_rows_gemm(&(gate * up)?.contiguous()?, &down_w, &groups)?;
+        let hidden = out.dim(1)?;
+        let gather = Tensor::from_vec(gather, tokens * k, device)?;
+        let weights = Tensor::from_vec(weights, (tokens, k, 1), device)?.to_dtype(out.dtype())?;
+        Ok(out
+            .index_select(&gather, 0)?
+            .reshape((tokens, k, hidden))?
+            .broadcast_mul(&weights)?
+            .sum(1)?)
     }
 
     /// [`Self::sparse`] through `kernels::moe_gelu`: routing and experts on
@@ -321,20 +618,30 @@ impl SovFeedForward {
             &self.per_expert_scale,
             self.top_k,
         )?;
-        let out = crate::kernels::moe_gelu::experts(
-            &normed.to_dtype(DType::F32)?,
-            &routing,
-            &self.experts.gate_up,
-            &self.experts.down,
-        )?;
+        let x = normed.to_dtype(DType::F32)?;
+        let out = match (&self.experts.gate_up, &self.experts.down) {
+            (ExpertWeights::Fp8(gate_up), ExpertWeights::Fp8(down)) => {
+                crate::kernels::moe_gelu::experts_fp8(&x, &routing, gate_up, down)?
+            }
+            (gate_up, down) => {
+                crate::kernels::moe_gelu::experts(&x, &routing, &gate_up.dense()?, &down.dense()?)?
+            }
+        };
         Ok(out.to_dtype(normed.dtype())?)
     }
 
     /// Whether the fused kernels take this layer's geometry and dtype.
     pub fn fused_supported(&self) -> bool {
         let (experts, rows, hidden) = self.experts.gate_up.dims3().unwrap_or((0, 0, 0));
-        crate::kernels::moe_gelu::weight_dtype_supported(&self.experts.gate_up)
-            && crate::kernels::moe_gelu::supported(hidden, rows / 2, experts, self.top_k)
+        match &self.experts.gate_up {
+            ExpertWeights::Fp8(_) => {
+                crate::kernels::moe_gelu::fp8_supported(hidden, rows / 2, experts, self.top_k)
+            }
+            ExpertWeights::Bf16(w) => {
+                crate::kernels::moe_gelu::weight_dtype_supported(w)
+                    && crate::kernels::moe_gelu::supported(hidden, rows / 2, experts, self.top_k)
+            }
+        }
     }
 
     /// Each token's `(expert, weight)` choices, weights as the reference

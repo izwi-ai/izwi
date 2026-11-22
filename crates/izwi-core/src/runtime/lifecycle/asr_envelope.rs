@@ -894,6 +894,22 @@ pub(crate) fn cuda_decode_row_bytes(variant: ModelVariant) -> Result<Option<u64>
                 product(&[geometry.vocab, F32_BYTES])?,
             ])?
         }
+        // One row's 30 s window (`minimum_sequence_tokens`) of the published
+        // Gemma 4 decoder's BF16 KV (220 KiB a token across its sliding and
+        // full layers), and its F32 logits and their sampling copy over the
+        // 262,144-token vocabulary. Unpriced, the decode kept the engine's
+        // eight rows beside 28 GiB of headroom.
+        _ if variant.family() == ModelFamily::SovTranscribeAsr => {
+            const KV_BYTES_PER_TOKEN: u64 = 225_280;
+            const VOCAB: u64 = 262_144;
+            let Some(tokens) = minimum_sequence_tokens(variant) else {
+                return Ok(None);
+            };
+            sum(&[
+                product(&[tokens, KV_BYTES_PER_TOKEN])?,
+                product(&[VOCAB, F32_BYTES, 2])?,
+            ])?
+        }
         _ => {
             let (Some(kv), Some(geometry), Some(tokens)) = (
                 decoder_kv_geometry(variant),
@@ -1222,9 +1238,20 @@ mod tests {
                         | ModelFamily::GraniteSpeechAsr
                         | ModelFamily::GraniteSpeech5Asr
                         | ModelFamily::RumbleAsr
+                        | ModelFamily::SovTranscribeAsr
                 );
             assert_eq!(row(variant).is_some(), wide, "{variant}");
         }
+        // SOV-Transcribe-1: a 1,024-token window of 220 KiB BF16 KV and two
+        // F32 logit rows over 262,144 tokens, about 222 MiB, so 32 rows take
+        // about 7 GiB beside 48 GiB of weights.
+        let sov = crate::model::ModelVariant::all()
+            .iter()
+            .copied()
+            .find(|variant| variant.family() == ModelFamily::SovTranscribeAsr)
+            .expect("SOV in the catalog");
+        assert_eq!(row(sov).unwrap(), 1_024 * 225_280 + 262_144 * 4 * 2);
+        assert_eq!(row(sov).unwrap() / MIB, 222);
         let qwen_17b = row(ModelVariant::Qwen3Asr17BGguf).unwrap();
         assert_eq!(
             qwen_17b,
@@ -1349,7 +1376,8 @@ mod tests {
     /// A Rumble row holds 14 layers' BF16 K and V and a BF16 prompt
     /// embedding over its 1,051-token minimum sequence (the 128-token prompt
     /// reserve, one window's audio tokens and its 512-token budget) and an
-    /// F32 logits row: about 59 MiB, so 32 rows take about 1.9 GiB.
+    /// F32 logits row: about 59 MiB, so 32 rows take about 1.9 GiB and 64
+    /// rows about 3.7 GiB.
     #[test]
     fn a_rumble_cuda_decode_row_is_priced_for_the_width_fit() {
         const MIB: u64 = 1024 * 1024;
@@ -1359,9 +1387,19 @@ mod tests {
             .unwrap();
         assert_eq!(rumble, 1_051 * (2 * 14 * 1024 * 2 + 1024 * 2) + 99_630 * 4);
         assert_eq!(rumble / MIB, 59);
-        for (headroom, width) in [(70 * GIB, 32), (13 * GIB, 32), (3 * GIB, 16), (GIB, 8)] {
+        // Its ceiling on CUDA is 64 rows (about 3.7 GiB of decode rows).
+        let ceiling =
+            crate::catalog::certified_decode_width(ModelFamily::RumbleAsr, BackendKind::Cuda);
+        assert_eq!(ceiling, crate::catalog::CUDA_ASR_MAX_WIDTH);
+        for (headroom, width) in [
+            (70 * GIB, 64),
+            (13 * GIB, 64),
+            (6 * GIB, 32),
+            (3 * GIB, 16),
+            (GIB, 8),
+        ] {
             assert_eq!(
-                crate::catalog::fit_asr_decode_width(32, 8, rumble, headroom),
+                crate::catalog::fit_asr_decode_width(ceiling, 8, rumble, headroom),
                 width,
                 "{headroom}"
             );

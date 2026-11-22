@@ -1059,6 +1059,51 @@ fn batched_asr_families_decode_at_the_asr_width_and_prepare_at_the_engine_rows()
             );
         }
     }
+    // SOV-Transcribe decodes at the fitted width; its prefill keeps the
+    // engine rows. It decoded eight rows on the H100 however wide the load
+    // fitted it, because its adapter never received the decode width.
+    for (fitted, decode_rows) in [(None, 32), (Some(32), 32), (Some(16), 16)] {
+        let contract = sequence_graph(ModelVariant::SovTranscribe1, fitted);
+        let decode = stage(&contract, StageWorkSelector::SequenceDecode);
+        assert_eq!(decode.max_batch_size, decode_rows, "SOV {fitted:?}");
+        assert_eq!(
+            decode.max_workspace_bytes,
+            decode.max_workspace_bytes / decode_rows as u64 * decode_rows as u64
+        );
+        assert_eq!(contract.execution_profile.max_batch_size, decode_rows);
+        assert_eq!(
+            stage(&contract, StageWorkSelector::SequencePrefill).max_batch_size,
+            8,
+            "SOV {fitted:?}"
+        );
+    }
+    // Rumble decodes up to 64 rows on CUDA, and its encoder and batched
+    // prefill widen with the decode up to 32 rows.
+    if crate::models::architectures::rumble::rumble_retained_decode_enabled(BackendKind::Cuda) {
+        let variant = ModelVariant::Rumble2Flash;
+        for (fitted, decode_rows, encoder_rows) in [
+            (None, 64, 32),
+            (Some(64), 64, 32),
+            (Some(32), 32, 32),
+            (Some(16), 16, 16),
+            (Some(8), 8, 8),
+        ] {
+            let contract = sequence_graph(variant, fitted);
+            let decode = stage(&contract, StageWorkSelector::SequenceDecode);
+            assert_eq!(decode.max_batch_size, decode_rows, "{fitted:?}");
+            assert_eq!(
+                stage(&contract, StageWorkSelector::PreSequencePreparation).max_batch_size,
+                encoder_rows,
+                "{fitted:?}"
+            );
+            let prefill = stage(&contract, StageWorkSelector::SequencePrefill);
+            assert_eq!(prefill.max_batch_size, encoder_rows, "{fitted:?}");
+            assert_eq!(
+                prefill.name,
+                crate::models::architectures::rumble::RUMBLE_STATIC_PREFILL_STAGE
+            );
+        }
+    }
     // The encoder batchers form at most the preparation width, with the
     // per-row budget a batch of eight had.
     let parakeet = sequence_graph(ModelVariant::ParakeetTdt06BV3, None);
@@ -2733,7 +2778,10 @@ fn fish_capacity_seals_both_routes_and_rejects_rebinding() {
                 .iter()
                 .find(|stage| stage.selector == StageWorkSelector::SequencePrefill)
                 .unwrap();
-            assert_eq!(prefill.batch_mode, NativeBatchMode::Static);
+            // Prompts prefill one request at a time (a request's bits never
+            // depend on what it was prefilled beside).
+            assert_eq!(prefill.batch_mode, NativeBatchMode::None);
+            assert_eq!(prefill.max_batch_size, 1);
             assert_eq!(prefill.max_work_units, capacity.prefill_tokens);
             let codec = contract
                 .stages
@@ -2783,7 +2831,7 @@ fn batched_fish_workspace_matches_every_loaded_stage() {
                 .iter()
                 .find(|stage| stage.selector == StageWorkSelector::SequencePrefill)
                 .unwrap();
-            assert_eq!(prefill.max_batch_size, 4);
+            assert_eq!(prefill.max_batch_size, 1);
             let spec = crate::models::architectures::fish_s2::fish_s2_physical_state_spec(
                 &config,
                 candle_core::DType::BF16,
@@ -3093,7 +3141,8 @@ fn lfm25_audio_asr_factory_publishes_sealed_retained_graph_and_atomic_long_form(
 
 /// Rumble's normal requirement (with or without native streaming) binds its
 /// retained sequence graph: encoder preparation batched at the engine rows,
-/// scalar exact prefill, and continuous decode priced per row. A long-form
+/// scalar exact prefill (ragged batched on CUDA), and continuous decode
+/// priced per row. A long-form
 /// requirement binds the atomic stage, which chunks long audio inside its
 /// dispatch; with the retained route off (the default on CPU and Metal) it
 /// is the only graph. The model authors state for both graphs.
@@ -3148,6 +3197,9 @@ fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
                 continue;
             }
             assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+            // CUDA prefills a step's rows together once an encoder pass hands
+            // over more than one row.
+            let static_prefill = backend == BackendKind::Cuda && rows > 1;
             let names = normal
                 .stages
                 .iter()
@@ -3161,7 +3213,11 @@ fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
                         StageWorkSelector::PreSequencePreparation
                     ),
                     (
-                        "asr.rumble.prefill.scalar",
+                        if static_prefill {
+                            crate::models::architectures::rumble::RUMBLE_STATIC_PREFILL_STAGE
+                        } else {
+                            "asr.rumble.prefill.scalar"
+                        },
                         StageWorkSelector::SequencePrefill
                     ),
                     (
@@ -3185,7 +3241,21 @@ fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
                 assert_eq!(preparation.shape_policy, StageShapePolicy::Exact);
                 assert_eq!(preparation.concurrency, ConcurrencyClass::Exclusive);
             }
-            assert_eq!(normal.stages[1].max_batch_size, 1);
+            let prefill = &normal.stages[1];
+            if static_prefill {
+                assert_eq!(prefill.max_batch_size, preparation.max_batch_size);
+                assert_eq!(prefill.batch_mode, NativeBatchMode::Static);
+                assert_eq!(prefill.shape_policy, StageShapePolicy::Ragged);
+                assert_eq!(prefill.concurrency, ConcurrencyClass::Batchable);
+                assert_eq!(prefill.max_padding_basis_points, 0);
+                assert_eq!(
+                    normal.execution_profile.prefill_batch,
+                    NativeBatchMode::Static
+                );
+            } else {
+                assert_eq!(prefill.max_batch_size, 1);
+                assert_eq!(prefill.batch_mode, NativeBatchMode::None);
+            }
             let decode = &normal.stages[2];
             assert_eq!(decode.batch_mode, NativeBatchMode::Continuous);
             assert!(decode.max_batch_size >= rows);
@@ -3200,6 +3270,87 @@ fn rumble_asr_offers_its_retained_graph_and_chunked_atomic_graph() {
             assert!(spec.retained.is_some());
         }
     }
+}
+
+/// On CUDA Rumble's encoder preparation widens with its decode, up to 32
+/// rows and never below the engine rows; elsewhere it keeps the engine
+/// rows. Its workspace ceiling is every row's beside the pass's base (the
+/// conv stem's slices on CUDA), which the stage carries as its base.
+#[test]
+fn rumble_encoder_widens_with_the_cuda_decode_and_prices_its_base_once() {
+    use super::sequence_asr::{
+        RumbleAsrExecutionAdapter, RumbleAsrExecutionSeal, RUMBLE_CUDA_ENCODER_MAX_WIDTH,
+    };
+    let metadata = |backend| {
+        LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap(),
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            ModelVariant::Rumble2Flash,
+            backend,
+        )
+        .unwrap()
+        .capabilities
+        .get(&CapabilityKind::Asr)
+        .unwrap()
+        .metadata()
+    };
+    let adapter = |backend, rows, decode| {
+        RumbleAsrExecutionAdapter::new(
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            metadata(backend),
+            backend,
+            rows,
+        )
+        .with_decode_batch_size(decode)
+    };
+    for (backend, rows, decode, encoder) in [
+        (BackendKind::Cuda, 4, 64, RUMBLE_CUDA_ENCODER_MAX_WIDTH),
+        (BackendKind::Cuda, 4, 16, 16),
+        (BackendKind::Cuda, 40, 64, 40),
+        (BackendKind::Metal, 4, 32, 4),
+        (BackendKind::Cpu, 1, 8, 1),
+    ] {
+        assert_eq!(
+            adapter(backend, rows, decode).encoder_batch_size,
+            encoder,
+            "{backend:?} rows {rows} decode {decode}"
+        );
+    }
+
+    let cuda = adapter(BackendKind::Cuda, 4, 64);
+    if !cuda.retained_route {
+        return;
+    }
+    let (per_row, base) = (300 * 1024 * 1024, 512 * 1024 * 1024);
+    cuda.install_preparation_seal(RumbleAsrExecutionSeal {
+        preparation: crate::models::architectures::rumble::RumbleAsrPreparationStageSeal {
+            backend: BackendKind::Cuda,
+            dtype: "bf16".into(),
+            max_work_units: 390,
+            max_materialized_tensor_elements_per_row: 2_000_000,
+            max_workspace_bytes: per_row,
+            workspace_base_bytes: base,
+        },
+        decode_workspace_per_row_bytes: 8_192,
+    })
+    .unwrap();
+    let contract = cuda.contract(StreamingRequirements::NONE).unwrap();
+    let preparation = &contract.stages[0];
+    assert_eq!(preparation.max_batch_size, 32);
+    assert_eq!(preparation.max_work_units, 390 * 32);
+    assert_eq!(preparation.workspace_base_bytes, base);
+    assert_eq!(preparation.max_workspace_bytes, per_row * 32 + base);
+    // A full pass of the longest rows fits the ceiling.
+    let rows = 32;
+    let full = crate::runtime::coordinator::native_preparation_workspace(
+        preparation,
+        crate::engine::WorkCost::new(390 * rows, 1, per_row * rows),
+        rows as usize,
+    )
+    .unwrap();
+    assert_eq!(full.workspace_bytes().unwrap(), per_row * rows + base);
 }
 
 /// Granite Speech 5.0's normal requirement (with or without native
@@ -4243,6 +4394,21 @@ fn batched_tts_families_decode_at_the_tts_width_and_prefill_at_the_engine_rows()
             8,
             "{variant} on Metal"
         );
+    }
+    // Ming's CUDA graph (its batched audio stage included) satisfies the
+    // per-row invocation descriptor a load validates it against: a shared
+    // workspace amount on top of the per-row one failed every CUDA load.
+    {
+        use crate::models::architectures::ming_tts::{config::MingTtsConfig, physical};
+        let ming = sequence_graph(ModelVariant::Ming30Tts05B, BackendKind::Cuda);
+        let retained = physical::ming_retained_contract(
+            &MingTtsConfig::pinned().llm,
+            candle_core::DType::BF16,
+            64,
+        )
+        .unwrap();
+        physical::ming_physical_state_spec(&[ming.stages.as_ref()], retained, 1024)
+            .expect("Ming's CUDA stages satisfy their invocation descriptor");
     }
     for variant in [
         ModelVariant::Kokoro82M,

@@ -43,7 +43,19 @@ pub use contracts::{
     semantic_token_id, FishS2DacContract, FishS2PromptTensorShape,
 };
 pub use dac::{FishS2DacConfig, FishS2DacDecoder};
+#[cfg(test)]
 pub(crate) use fast::fish_s2_fast_graph_device_bytes;
+
+/// Device bytes a load on `backend` prices for Fish S2's CUDA graphs: the
+/// fast AR's frame graphs and the streaming codec's push graphs (which the
+/// load's self-checks allocate) and the slow transformer's decode-step
+/// graphs (which the first decode steps allocate). Zero off CUDA or with
+/// the graphs switched off.
+pub(crate) fn fish_s2_graph_device_bytes(backend: crate::backends::BackendKind) -> u64 {
+    fast::fish_s2_fast_graph_device_bytes(backend)
+        + slow::fish_s2_slow_graph_device_bytes(backend)
+        + dac::fish_s2_codec_graph_device_bytes(backend)
+}
 pub use fast::{FishS2FastConfig, FishS2FastDecoder, FishS2GeneratedFrame, FishS2Sampler};
 #[cfg(test)]
 pub(crate) use physical::fish_s2_physical_state_spec;
@@ -141,6 +153,14 @@ pub struct FishS2TtsDiagnostics {
     /// replays, fallbacks and graphed and eager frames; `None` without the
     /// native runtime.
     pub fast_graphs: Option<serde_json::Value>,
+    /// The slow transformer's CUDA decode-step graphs: why they are off, or
+    /// their widths, captures and replays; `None` without the native
+    /// runtime.
+    pub slow_graphs: Option<serde_json::Value>,
+    /// The streaming codec's fixed-shape CUDA pushes and their graphs: why
+    /// the graphs are off, or their captures and replays and the pushes
+    /// they took; `None` off CUDA or without the native runtime.
+    pub codec_graphs: Option<serde_json::Value>,
 }
 
 /// Model-authored terminal reason. Exhausting a budget is incomplete speech.
@@ -190,7 +210,24 @@ const RAS_HIGH_TEMP: f32 = 1.0;
 const RAS_HIGH_TOP_P: f32 = 0.9;
 static NEXT_FISH_S2_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
+/// The prompt tokens of one Fish S2 prefill span on CUDA. Every span but a
+/// prompt's last is exactly this long whatever else the step runs: a span's
+/// length is its projections' row count, so a span cut to a step's leftover
+/// budget changed the prompt's bits under load.
+pub(crate) const FISH_S2_CUDA_PREFILL_SPAN: usize = 256;
+
 impl FishS2TtsModel {
+    /// The cell of the scheduler's prefill grid for this model's prompts:
+    /// [`FISH_S2_CUDA_PREFILL_SPAN`] on CUDA, where decode runs at fixed rows
+    /// and prefill one request alone; 0 (no grid) on the CPU and Metal, and
+    /// before the weights load.
+    pub fn prefill_grid_tokens(&self) -> usize {
+        match &self.runtime {
+            Some(runtime) if runtime.slow.device().is_cuda() => FISH_S2_CUDA_PREFILL_SPAN,
+            _ => 0,
+        }
+    }
+
     /// Metadata-only fixture for request preparation and admission tests.
     /// Native inference remains unavailable, as for `load_metadata`.
     #[cfg(test)]
@@ -295,6 +332,14 @@ impl FishS2TtsModel {
                 .runtime
                 .as_ref()
                 .map(|runtime| runtime.fast.graphs_diagnostics()),
+            slow_graphs: self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.slow.graphs_diagnostics()),
+            codec_graphs: self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.dac.stream_graphs_diagnostics()),
         }
     }
 
@@ -487,7 +532,9 @@ impl FishS2NativeRuntime {
         // A fast frame's input is the slow transformer's hidden state.
         fast.resolve_graphs(precision.loaded);
         let codec_weights = codec.load_weights(&device, DType::F32)?;
-        let dac = FishS2DacDecoder::load(FishS2DacConfig::current(), codec_weights.var_builder())?;
+        let mut dac =
+            FishS2DacDecoder::load(FishS2DacConfig::current(), codec_weights.var_builder())?;
+        dac.resolve_stream_graphs();
         let semantic_allowed_mask = slow.semantic_allowed_mask(eos)?;
 
         Ok(Self {

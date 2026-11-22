@@ -1063,24 +1063,59 @@ impl LoadedExecutionAdapter for MingTtsExecutionAdapter {
         finalize.max_workspace_bytes = 0;
         // One VAE window per request and quantum, so other requests' quanta
         // run between them: each request's decode keeps its own attention
-        // state, so windows do not share calls.
+        // state, so windows do not share calls. On CUDA the due windows of
+        // up to the engine rows decode in one quantum: each is its own
+        // fixed-shape graph launch, all queued before any is read back, so
+        // the host's inverse STFT of one overlaps the device's next window.
+        let batched_audio = self.backend_kind == BackendKind::Cuda
+            && self.max_batch_size > 1
+            && crate::models::architectures::ming_tts::ming_audio_batching_enabled();
         let mut acoustic = StageDescriptor::from_execution_profile(
             StageId::new(4),
-            "tts.audio.ming_tts.scalar",
+            if batched_audio {
+                "tts.audio.ming_tts.tensor_static"
+            } else {
+                "tts.audio.ming_tts.scalar"
+            },
             &profile,
-            NativeBatchMode::None,
+            if batched_audio {
+                NativeBatchMode::Static
+            } else {
+                NativeBatchMode::None
+            },
         );
         acoustic.selector = StageWorkSelector::SequenceAudioDecode;
         acoustic.progress = StageProgressKind::Iterative;
         acoustic.shape_policy = StageShapePolicy::Exact;
         acoustic.max_padding_basis_points = 0;
-        acoustic.max_batch_size = 1;
-        acoustic.concurrency = ConcurrencyClass::Exclusive;
-        acoustic.max_work_units = 1;
-        // The VAE stack's activations over a window of up to 8 latents (32
-        // frames at width 896) and its 3,530-wide head: a few megabytes;
-        // the last window of a short request may carry more latents.
-        acoustic.max_workspace_bytes = 256 * 1024 * 1024;
+        if batched_audio {
+            let rows = self.max_batch_size;
+            acoustic.max_batch_size = rows;
+            acoustic.concurrency = ConcurrencyClass::Batchable;
+            acoustic.max_work_units = rows as u64;
+            // One window's stack runs at a time (34 frames at width 896
+            // through 24 layers, its widest [34, 4864] F32, a few megabytes
+            // a layer); each queued row holds its head output (0.5 MB),
+            // its kept keys in and out (1.5 MB each) and its inputs until
+            // it is read back.
+            // Ming's invocation workspace is leased per row (the state
+            // descriptor requires the per-row amount times the rows to equal
+            // the stage's maximum), so each row carries an even share of the
+            // one window running at a time.
+            let shared = 64 * 1024 * 1024_u64;
+            let per_row = 8 * 1024 * 1024_u64 + shared.div_ceil(rows as u64);
+            acoustic.workspace_per_row_bytes = per_row;
+            acoustic.max_workspace_bytes = per_row.saturating_mul(rows as u64);
+        } else {
+            acoustic.max_batch_size = 1;
+            acoustic.concurrency = ConcurrencyClass::Exclusive;
+            acoustic.max_work_units = 1;
+            // The VAE stack's activations over a window of up to 8 latents
+            // (32 frames at width 896) and its 3,530-wide head: a few
+            // megabytes; the last window of a short request may carry more
+            // latents.
+            acoustic.max_workspace_bytes = 256 * 1024 * 1024;
+        }
         for stage in [
             &mut preparation,
             &mut prefill,
@@ -1545,24 +1580,20 @@ impl LoadedExecutionAdapter for FishS2TtsExecutionAdapter {
         preparation.max_workspace_bytes =
             crate::models::architectures::fish_s2::codec::maximum_preparation_workspace_bytes()?;
 
+        // Prompts prefill one request at a time, on the model's grid on CUDA
+        // (`FishS2TtsModel::prefill_grid_tokens`): packed prompts shared their
+        // projections' rows, so a request's frames depended on what it was
+        // prefilled beside.
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
             FISH_S2_TTS_PREFILL_STAGE,
             &profile,
-            if capacity.native_batching {
-                NativeBatchMode::Static
-            } else {
-                NativeBatchMode::None
-            },
+            NativeBatchMode::None,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
-        prefill.concurrency = if capacity.native_batching {
-            ConcurrencyClass::Batchable
-        } else {
-            ConcurrencyClass::Exclusive
-        };
+        prefill.concurrency = ConcurrencyClass::Exclusive;
         prefill.shape_policy = StageShapePolicy::Ragged;
-        prefill.max_batch_size = capacity.ar_rows.min(capacity.prefill_tokens as usize);
+        prefill.max_batch_size = 1;
         prefill.max_work_units = capacity.prefill_tokens;
         prefill.workspace_per_row_bytes = 0;
         prefill.workspace_per_work_unit_bytes = capacity.prefill_workspace_per_token;
@@ -1775,24 +1806,21 @@ impl LoadedExecutionAdapter for Audio8TtsExecutionAdapter {
         preparation.max_workspace_bytes =
             crate::models::architectures::audio8::codec::maximum_preparation_workspace_bytes()?;
 
+        // Prompts prefill one request at a time, on the model's grid on CUDA
+        // (`Audio8TtsModel::prefill_grid_tokens`): packed prompts shared their
+        // projections' rows, so a request's first frames, and every frame
+        // after through its KV, depended on what it was prefilled beside.
+        // A prompt is usually one span of a few milliseconds.
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
             AUDIO8_TTS_PREFILL_STAGE,
             &profile,
-            if capacity.native_batching {
-                NativeBatchMode::Static
-            } else {
-                NativeBatchMode::None
-            },
+            NativeBatchMode::None,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
-        prefill.concurrency = if capacity.native_batching {
-            ConcurrencyClass::Batchable
-        } else {
-            ConcurrencyClass::Exclusive
-        };
+        prefill.concurrency = ConcurrencyClass::Exclusive;
         prefill.shape_policy = StageShapePolicy::Ragged;
-        prefill.max_batch_size = capacity.ar_rows.min(capacity.prefill_tokens as usize);
+        prefill.max_batch_size = 1;
         prefill.max_work_units = capacity.prefill_tokens;
         prefill.workspace_per_row_bytes = 0;
         prefill.workspace_per_work_unit_bytes = capacity.prefill_workspace_per_token;

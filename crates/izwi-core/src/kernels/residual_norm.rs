@@ -174,6 +174,49 @@ fn cpu(
     Ok((sum, normed))
 }
 
+/// An RMSNorm layer: Candle's `RmsNorm` everywhere but CUDA, where it runs
+/// as [`rms_norm`] (one block of threads a row; Candle's CUDA kernel gives a
+/// row 32 threads, about 14 µs for 32 rows of 2,048 on the H100). The same
+/// math to rounding, and a row's bits still depend on that row alone.
+#[derive(Clone, Debug)]
+pub struct DeviceRmsNorm {
+    inner: candle_nn::RmsNorm,
+    /// The gain in F32, kept on CUDA only.
+    gain: Option<Tensor>,
+    eps: f32,
+}
+
+impl DeviceRmsNorm {
+    pub fn new(weight: Tensor, eps: f64) -> Result<Self> {
+        let gain = if weight.device().is_cuda() {
+            Some(weight.to_dtype(DType::F32)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            inner: candle_nn::RmsNorm::new(weight, eps),
+            gain,
+            eps: eps as f32,
+        })
+    }
+
+    /// `candle_nn::rms_norm`'s loader: `weight` `[dim]` under `vb`.
+    pub fn load(dim: usize, eps: f64, vb: candle_nn::VarBuilder) -> Result<Self> {
+        Self::new(vb.get(dim, "weight")?, eps)
+    }
+}
+
+impl candle_nn::Module for DeviceRmsNorm {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match &self.gain {
+            Some(gain) if x.device().is_cuda() && dtype_tag(x.dtype()).is_ok() => {
+                rms_norm(x, gain, self.eps, x.dtype())
+            }
+            _ => self.inner.forward(x),
+        }
+    }
+}
+
 /// The eager chain on any device, for devices without a kernel and for tests.
 pub fn reference(
     residual: &Tensor,
@@ -415,24 +458,16 @@ mod cuda_impl {
         )
     }
 
-    /// The kernel name for the dtype mix, or the nearest exported one a plain
-    /// norm (no delta) can use: its delta pointer is null.
+    /// The kernel name for the dtype mix. `residual_norm.cu` exports every
+    /// mix of F32/F16/BF16; a plain norm (no delta) passes its input dtype as
+    /// the delta's and a null delta pointer.
     fn kernel(r: DType, d: DType, out: DType) -> Result<String> {
-        let name = format!("{}_{}_{}", dtype_tag(r)?, dtype_tag(d)?, dtype_tag(out)?);
-        let exported = [
-            "f32_f32_f32",
-            "f32_f32_f16",
-            "f32_f16_f16",
-            "f32_f32_bf16",
-            "bf16_f32_bf16",
-            "bf16_bf16_bf16",
-            "f16_f32_f16",
-            "f16_f16_f16",
-        ];
-        if !exported.contains(&name.as_str()) {
-            candle_core::bail!("the CUDA residual RMSNorm has no {name} form")
-        }
-        Ok(format!("izwi_residual_norm_{name}"))
+        Ok(format!(
+            "izwi_residual_norm_{}_{}_{}",
+            dtype_tag(r)?,
+            dtype_tag(d)?,
+            dtype_tag(out)?
+        ))
     }
 
     pub(super) fn run(
@@ -505,18 +540,31 @@ mod cuda_impl {
             }};
         }
         use half::{bf16, f16};
-        Ok(match (r_dtype, d_dtype, out) {
-            (DType::F32, DType::F32, DType::F32) => go!(f32, f32, f32),
-            (DType::F32, DType::F32, DType::F16) => go!(f32, f32, f16),
-            (DType::F32, DType::F16, DType::F16) => go!(f32, f16, f16),
-            (DType::F32, DType::F32, DType::BF16) => go!(f32, f32, bf16),
-            (DType::BF16, DType::F32, DType::BF16) => go!(bf16, f32, bf16),
-            (DType::BF16, DType::BF16, DType::BF16) => go!(bf16, bf16, bf16),
-            (DType::F16, DType::F32, DType::F16) => go!(f16, f32, f16),
-            (DType::F16, DType::F16, DType::F16) => go!(f16, f16, f16),
-            (r, d, o) => {
-                candle_core::bail!("the CUDA residual RMSNorm has no {r:?}/{d:?}/{o:?} form")
-            }
+        macro_rules! by_out {
+            ($r:ty, $d:ty) => {
+                match out {
+                    DType::F32 => go!($r, $d, f32),
+                    DType::F16 => go!($r, $d, f16),
+                    DType::BF16 => go!($r, $d, bf16),
+                    o => candle_core::bail!("the CUDA residual RMSNorm has no {o:?} output"),
+                }
+            };
+        }
+        macro_rules! by_delta {
+            ($r:ty) => {
+                match d_dtype {
+                    DType::F32 => by_out!($r, f32),
+                    DType::F16 => by_out!($r, f16),
+                    DType::BF16 => by_out!($r, bf16),
+                    d => candle_core::bail!("the CUDA residual RMSNorm has no {d:?} delta"),
+                }
+            };
+        }
+        Ok(match r_dtype {
+            DType::F32 => by_delta!(f32),
+            DType::F16 => by_delta!(f16),
+            DType::BF16 => by_delta!(bf16),
+            r => candle_core::bail!("the CUDA residual RMSNorm has no {r:?} residual"),
         })
     }
 }
@@ -546,17 +594,24 @@ mod tests {
             .unwrap()
     }
 
-    /// The dtype mixes the decoders run: Nemotron-H's F32 stream, Drama 3's
-    /// BF16 stream with F32 and BF16 deltas (CUDA) and F32 stream with F16
-    /// activations and F16 or F32 deltas (Metal).
-    const MIXES: [(DType, DType, DType); 6] = [
-        (DType::F32, DType::F32, DType::F32),
-        (DType::F32, DType::F32, DType::F16),
-        (DType::F32, DType::F16, DType::F16),
-        (DType::BF16, DType::F32, DType::BF16),
-        (DType::BF16, DType::BF16, DType::BF16),
-        (DType::F16, DType::F16, DType::F16),
-    ];
+    /// Every mix of F32/F16/BF16 residual, delta and output. The decoders run
+    /// Nemotron-H's F32 stream, Drama 3's BF16 stream with F32 and BF16 deltas
+    /// (CUDA) and F32 stream with F16 activations (Metal), SOV-Transcribe's
+    /// BF16 input normalized to F32 (`bf16_bf16_f32`) and Ming's F32 stream
+    /// with BF16 deltas (`f32_bf16_f32`); a mix CUDA did not export failed a
+    /// model's load, so every mix is covered.
+    fn all_mixes() -> Vec<(DType, DType, DType)> {
+        let dtypes = [DType::F32, DType::F16, DType::BF16];
+        let mut mixes = Vec::new();
+        for r in dtypes {
+            for d in dtypes {
+                for o in dtypes {
+                    mixes.push((r, d, o));
+                }
+            }
+        }
+        mixes
+    }
 
     fn operands(
         rows: usize,
@@ -594,7 +649,7 @@ mod tests {
     /// to rounding (the square sums run in another order).
     #[test]
     fn the_cpu_kernel_matches_the_eager_chain() {
-        for mix in MIXES {
+        for mix in all_mixes() {
             for (rows, hidden) in [(1usize, 2688usize), (3, 2048), (2, 7)] {
                 let (r, d, g) = operands(rows, hidden, mix, &Device::Cpu);
                 let (sum, normed) = add_rms_norm(&r, &d, &g, 1e-5, mix.2).unwrap();
@@ -625,7 +680,7 @@ mod tests {
     /// A row's output does not depend on how many rows share the call.
     #[test]
     fn a_row_is_the_same_alone_and_in_a_batch() {
-        for mix in MIXES {
+        for mix in all_mixes() {
             let (r, d, g) = operands(5, 2688, mix, &Device::Cpu);
             let (sum, normed) = add_rms_norm(&r, &d, &g, 1e-5, mix.2).unwrap();
             let (one_sum, one) = add_rms_norm(
@@ -643,7 +698,7 @@ mod tests {
 
     #[test]
     fn malformed_operands_are_refused() {
-        let (r, d, g) = operands(2, 64, MIXES[0], &Device::Cpu);
+        let (r, d, g) = operands(2, 64, all_mixes()[0], &Device::Cpu);
         assert!(add_rms_norm(&r, &d.narrow(1, 0, 32).unwrap(), &g, 1e-5, DType::F32).is_err());
         assert!(rms_norm(&r, &g.narrow(0, 0, 32).unwrap(), 1e-5, DType::F32).is_err());
         assert!(rms_norm(&r, &g.to_dtype(DType::F16).unwrap(), 1e-5, DType::F32).is_err());
@@ -700,7 +755,7 @@ mod tests {
             return;
         };
         // Metal runs F32 and F16 activations; it has no BF16 form.
-        let mixes = MIXES
+        let mixes = all_mixes()
             .into_iter()
             .filter(|mix| ![mix.0, mix.1, mix.2].contains(&DType::BF16))
             .collect::<Vec<_>>();
@@ -713,6 +768,6 @@ mod tests {
         let Some(device) = crate::kernels::cuda::cuda_test_device() else {
             return;
         };
-        device_matches_the_cpu(&device, &MIXES);
+        device_matches_the_cpu(&device, &all_mixes());
     }
 }

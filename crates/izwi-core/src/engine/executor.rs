@@ -3703,6 +3703,15 @@ impl ModelExecutor for NativeExecutor {
             if let Ok(Some(model)) = request.prepared_qwen_tts_model_for_executor() {
                 profile.prefill_grid_tokens = model.prefill_grid_tokens();
             }
+            // Audio8 and Fish S2 likewise on CUDA: with their prefill one
+            // request alone and their decode at fixed rows, the grid keeps a
+            // request's bits.
+            if let Ok(Some(model)) = request.prepared_audio8_tts_model_lease_for_executor() {
+                profile.prefill_grid_tokens = model.prefill_grid_tokens();
+            }
+            if let Ok(Some(model)) = request.prepared_fish_s2_tts_model_lease_for_executor() {
+                profile.prefill_grid_tokens = model.prefill_grid_tokens();
+            }
             profile.incremental_decode = true;
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
@@ -4039,6 +4048,25 @@ impl ModelExecutor for NativeExecutor {
                     }) =>
                 {
                     self.execute_static_parakeet_asr_prefill_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        Some(&execution.batch.rows),
+                    )
+                }
+                NativeBatchRoute::Audio {
+                    task: TaskType::ASR,
+                    stage: NativeAudioStage::SequencePrefill,
+                    mode: NativeBatchMode::Static,
+                    ..
+                } if execution.batch.lane.kernel_mode
+                    == crate::models::architectures::rumble::RUMBLE_STATIC_PREFILL_STAGE
+                    && execution.requests.iter().all(|request| {
+                        request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::RumbleAsr
+                        })
+                    }) =>
+                {
+                    self.execute_static_rumble_asr_prefill_requests_with_rows(
                         execution.requests,
                         execution.scheduled,
                         Some(&execution.batch.rows),
@@ -6824,6 +6852,35 @@ mod tests {
             ModelVariant::VibeVoiceAsr,
             StageWorkSelector::SequencePrefill,
             crate::models::architectures::vibevoice::VIBEVOICE_ASR_PREFILL_STAGE,
+            NativeBatchMode::Static,
+            SequencePhase::Prefill,
+        );
+        let requests = [&request];
+        let scheduled = [scheduled];
+        assert_eq!(
+            NativeBatchRoute::resolve(&PhysicalBatchExecution {
+                batch: &batch,
+                requests: &requests,
+                scheduled: &scheduled,
+            })
+            .unwrap(),
+            NativeBatchRoute::Audio {
+                task: TaskType::ASR,
+                stage: NativeAudioStage::SequencePrefill,
+                mode: NativeBatchMode::Static,
+                stage_id: StageId::new(7),
+            }
+        );
+    }
+
+    #[test]
+    fn native_route_authenticates_rumble_static_prefill() {
+        let (request, scheduled, batch) = native_route_fixture(
+            TaskType::ASR,
+            "asr",
+            ModelVariant::Rumble2Flash,
+            StageWorkSelector::SequencePrefill,
+            crate::models::architectures::rumble::RUMBLE_STATIC_PREFILL_STAGE,
             NativeBatchMode::Static,
             SequencePhase::Prefill,
         );

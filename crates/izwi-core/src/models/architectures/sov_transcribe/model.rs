@@ -88,16 +88,21 @@ pub const BATCHED_PREFILL_ENV: &str = "IZWI_SOV_TRANSCRIBE_BATCHED_PREFILL";
 /// one engine quantum (1 to 64).
 pub const DECODE_QUANTUM_ENV: &str = "IZWI_SOV_TRANSCRIBE_DECODE_QUANTUM";
 
-/// Decode steps per engine quantum while nothing waits: 8 on CUDA, 4 on the
-/// CPU test reference, or the environment's.
+/// Decode steps per engine quantum: 1 on CUDA, 8 on Metal, 4 on the CPU
+/// test reference, or the environment's. On the H100 an 8-step quantum held
+/// each row's steps to itself, so rows arriving meanwhile could not join a
+/// step: at 8 and 32 concurrent requests one step a quantum served 22.8 and
+/// 25.3 audio-s/s against 16.0 and 16.2 (the decode step is a CUDA graph, so
+/// a single step costs no extra launches).
 pub fn decode_quantum(backend: BackendKind) -> usize {
     std::env::var(DECODE_QUANTUM_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|steps| (1..=64).contains(steps))
         .unwrap_or(match backend {
+            BackendKind::Cuda => 1,
             BackendKind::Cpu => 4,
-            BackendKind::Cuda | BackendKind::Metal => 8,
+            BackendKind::Metal => 8,
         })
 }
 
@@ -474,6 +479,7 @@ impl SovTranscribeModel {
             MoeBackend::Host => None,
             MoeBackend::Device => Some(ExpertPath::Gathered),
             MoeBackend::Fused => Some(ExpertPath::Fused),
+            MoeBackend::Grouped => Some(ExpertPath::Grouped),
             MoeBackend::Auto if device.is_cuda() => Some(ExpertPath::Fused),
             MoeBackend::Auto => None,
         };
@@ -486,7 +492,12 @@ impl SovTranscribeModel {
                 None
             }
             Some(path) => {
-                let error = decoder.check_expert_path(path, 4)?;
+                let mut error = decoder.check_expert_path(path, 4)?;
+                // `auto` on CUDA also serves prefill spans grouped: that path
+                // must agree too.
+                if decoder.moe_backend() == MoeBackend::Auto {
+                    error = error.max(decoder.check_expert_path(ExpertPath::Grouped, 64)?);
+                }
                 if error.is_nan() || error > MOE_CHECK_LIMIT {
                     tracing::warn!(
                         "SOV-Transcribe: the {path:?} experts deviate from the host-routed reference by {error:.3e}; routing on the host"
@@ -630,6 +641,7 @@ impl SovTranscribeModel {
             "moe_fused_max_pairs": super::decoder::moe::FUSED_MAX_PAIRS,
             "decode_graphs": self.decoder.graph_diagnostics(),
             "moe_check": d.moe_check,
+            "expert_weights": if self.decoder.experts_fp8() { "fp8" } else { "bf16" },
             "prefill_span": self.prefill_span,
             "decode_quantum": self.decode_quantum,
             "encoder_batch": self.encoder_batch,

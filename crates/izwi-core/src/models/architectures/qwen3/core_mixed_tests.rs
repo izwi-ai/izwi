@@ -323,6 +323,92 @@ fn mixed_steps_match_split(model: &Qwen3Model, device: &Device, vocab: (u32, u32
     parity
 }
 
+/// A mixed step over token ids and the same step over their embeddings
+/// write the same pages and sample the same logits, bit for bit: the ids
+/// form only embeds them first.
+#[test]
+fn mixed_steps_over_embeddings_match_mixed_steps_over_ids() {
+    let device = Device::Cpu;
+    let model = tiny_qwen3_model_for_test(&device);
+    let geometry = model.cfg.attention_geometry().unwrap();
+    let world = || {
+        test_physical_caches_with_dtype_on(
+            &device,
+            model.embed_tokens.dtype(),
+            model.cfg.num_hidden_layers,
+            model.cfg.num_key_value_heads,
+            geometry.key_head_dim(),
+            64,
+            2,
+        )
+    };
+    let prompts = [token_ids(9, 7, (0, 8)), token_ids(5, 8, (0, 8))];
+    let layout = || {
+        MixedRowLayout::new(
+            prompts
+                .iter()
+                .map(|prompt| MixedRowSpan {
+                    start_pos: 0,
+                    q_len: prompt.len(),
+                })
+                .collect(),
+            0,
+        )
+        .unwrap()
+    };
+    let ids = prompts.concat();
+    let bits = |logits: &Tensor| {
+        logits
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>()
+    };
+    let (mut by_ids, mut by_embeds) = (world(), world());
+    let from_ids = model
+        .forward_managed_mixed(
+            &ids,
+            layout(),
+            &mut by_ids.iter_mut().collect::<Vec<_>>(),
+            &[0, 1],
+        )
+        .unwrap()
+        .unwrap();
+    let embeds = model
+        .embeddings(&Tensor::from_slice(&ids, (1, ids.len()), &device).unwrap())
+        .unwrap();
+    let from_embeds = model
+        .forward_managed_mixed_with_embeds(
+            &embeds,
+            layout(),
+            &mut by_embeds.iter_mut().collect::<Vec<_>>(),
+            &[0, 1],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(bits(&from_ids), bits(&from_embeds));
+    let pages = |caches: &[PhysicalPagedKvCache]| {
+        page_values(caches[0].arena())
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(pages(&by_ids), pages(&by_embeds));
+    assert_eq!(by_embeds[1].context_len(), prompts[1].len());
+    // Embeddings that do not cover the layout are refused.
+    assert!(model
+        .forward_managed_mixed_with_embeds(
+            &embeds.narrow(1, 0, 4).unwrap(),
+            layout(),
+            &mut world().iter_mut().collect::<Vec<_>>(),
+            &[0],
+        )
+        .is_err());
+}
+
 fn assert_tiny_parity(device: &Device, tolerance: f32) {
     let model = tiny_qwen3_model_for_test(device);
     let parity = mixed_steps_match_split(&model, device, (0, 8));

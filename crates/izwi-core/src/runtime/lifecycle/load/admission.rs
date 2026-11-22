@@ -827,9 +827,9 @@ impl ModelLifecycleController {
     /// `(retained, staged)` rows of a loaded model's ASR state. With
     /// automatic staged rows, one step's launch at its widest continuous ASR
     /// decode stage, which may exceed the engine rows' width (a decode the
-    /// load fitted past the engine rows, `catalog::batch_width`); never
-    /// fewer than the engine's staged rows. Retained rows follow
-    /// ([`asr_state_rows`]).
+    /// load fitted past the engine rows, `catalog::batch_width`), plus
+    /// Rumble's batched prefill rows beside it; never fewer than the
+    /// engine's staged rows. Retained rows follow ([`asr_state_rows`]).
     pub(super) fn asr_state_rows(
         &self,
         bundle_draft: &LoadedModelBundleDraft,
@@ -838,7 +838,8 @@ impl ModelLifecycleController {
         let staged = if engine.automatic_row_limits.staged_transactions {
             engine.max_staged_transactions.max(
                 crate::runtime::service::automatic_staged_transaction_rows(
-                    asr_decode_stage_width(bundle_draft)?,
+                    asr_decode_stage_width(bundle_draft)?
+                        .saturating_add(rumble_prefill_stage_width(bundle_draft)?),
                     engine
                         .resolved_physical_execution_capacity()
                         .candidate_dispatch_limit

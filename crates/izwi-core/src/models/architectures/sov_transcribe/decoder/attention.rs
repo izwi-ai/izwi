@@ -143,6 +143,30 @@ impl SovAttention {
             .reshape((tokens, g.heads * g.head_dim))?)
     }
 
+    /// [`Self::attend`] for one token of every row of a decode step at once
+    /// (`q`, `k`, `v` `[rows, heads or kv_heads, d]`). Returns
+    /// `[rows, heads * d]` in `dtype`.
+    pub(super) fn attend_batch(
+        &self,
+        batch: &mut super::batch::SovDecodeBatch,
+        cache: &PhysicalPagedKvCache,
+        layer: usize,
+        [q, k, v]: [&Tensor; 3],
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let g = &self.geometry;
+        let rows = q.dim(0)?;
+        let kv_dtype = cache.arena().config().dtype;
+        let cast = |t: &Tensor| -> Result<Tensor> { Ok(t.to_dtype(kv_dtype)?.contiguous()?) };
+        let out = batch.attend(
+            cache,
+            layer,
+            [&cast(q)?, &cast(k)?, &cast(v)?],
+            g.window.is_some(),
+        )?;
+        Ok(out.to_dtype(dtype)?.reshape((rows, g.heads * g.head_dim))?)
+    }
+
     pub fn output(&self, attended: &Tensor) -> Result<Tensor> {
         linear(attended, &self.o_proj, None)
     }

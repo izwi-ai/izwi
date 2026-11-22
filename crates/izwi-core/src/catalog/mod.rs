@@ -15,5 +15,7 @@ pub(crate) use batch_width::{
     engine_row_width, fit_asr_decode_width, max_certified_decode_width, non_chat_row_width,
     tts_decode_width, tts_engine_width, CUDA_DEFAULT_WIDTH, EXPLICIT_WIDTH_CEILING,
 };
+#[cfg(test)]
+pub(crate) use batch_width::CUDA_ASR_MAX_WIDTH;
 pub use izwi_model_catalog::catalog::*;
 pub(crate) use mixed_step::mixed_step_enabled;

@@ -66,10 +66,55 @@ pub(crate) fn project_rows(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -
             .collect::<Result<Vec<_>>>()?;
         Tensor::cat(&products, 0)?
     };
+    add_bias(product, bias)
+}
+
+/// Multiplies the F32 matmuls of Ming's VAE decoder on CUDA tensor cores in
+/// TF32 (a boolean; on when unset). Read once. The VAE encoder (a voice
+/// prompt's latents, which steer generation) and the language model keep
+/// their own precision.
+pub(crate) const MING_TTS_F32_TF32_ENV: &str = "IZWI_MING_TTS_F32_TF32";
+
+pub(crate) fn f32_tf32_requested() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(MING_TTS_F32_TF32_ENV, true));
+    ON.get()
+}
+
+/// `product + bias`: on CUDA in place in one launch with the same bits
+/// (`bias_rows`), elsewhere Candle's broadcast add.
+fn add_bias(product: Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    use crate::kernels::cuda::bias_rows;
     match bias {
+        Some(bias)
+            if bias_rows::serves(product.device(), product.dtype()) && product.is_contiguous() =>
+        {
+            bias_rows::add_bias(&product, bias, false)?;
+            Ok(product)
+        }
         Some(bias) => Ok(product.broadcast_add(bias)?),
         None => Ok(product),
     }
+}
+
+/// `x` [rows, in] · `weight` [out, in]ᵀ (+ `bias`): with `tf32`, an F32
+/// product runs in TF32 on CUDA tensor cores (F32 tensors and sums, the
+/// multiply's inputs rounded to a 10-bit mantissa); everything else is
+/// Candle's matmul. The bias goes through [`add_bias`].
+pub(crate) fn product(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    tf32: bool,
+) -> Result<Tensor> {
+    use crate::kernels::cuda::tf32_gemm;
+    let product =
+        if tf32 && tf32_gemm::serves(x.device(), x.dtype()) && weight.dtype() == DType::F32 {
+            tf32_gemm::matmul_t(x, weight)?
+        } else {
+            x.matmul(&weight.t()?)?
+        };
+    add_bias(product, bias)
 }
 
 /// An RMSNorm gain in F32, the form the fused norm takes.
@@ -86,11 +131,7 @@ fn norm_f32(x: &Tensor, gain: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 fn project(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-    let product = x.matmul(&weight.t()?)?;
-    match bias {
-        Some(bias) => Ok(product.broadcast_add(bias)?),
-        None => Ok(product),
-    }
+    product(x, weight, bias, false)
 }
 
 /// One layer's weights, each as the checkpoint stores it (the two norm
@@ -112,6 +153,9 @@ pub(crate) struct MingLayer {
     up: Tensor,
     /// The down projection, F32 under F16 weights (see [`Self::finish`]).
     down: Tensor,
+    /// Whether an F32 product runs in TF32 on CUDA (the VAE decoder's
+    /// layers; see [`MingWindowStack::with_tf32`]).
+    tf32: bool,
 }
 
 impl MingLayer {
@@ -148,6 +192,7 @@ impl MingLayer {
                     weight(down, hidden, cfg.intermediate_size)?
                 }
             },
+            tf32: false,
         })
     }
 
@@ -173,7 +218,7 @@ impl MingLayer {
             if rows_independent {
                 project_rows(&normed, weight, Some(bias))
             } else {
-                project(&normed, weight, Some(bias))
+                product(&normed, weight, Some(bias), self.tf32)
             }
         };
         // Callers build the tables in the layer's dtype; a cast is a no-op.
@@ -206,7 +251,7 @@ impl MingLayer {
             if rows_independent {
                 project_rows(x, weight, None)
             } else {
-                project(x, weight, None)
+                product(x, weight, None, self.tf32)
             }
         };
         let wide = x.dtype();
@@ -334,12 +379,15 @@ impl MingTrunk {
             dtype,
             &device,
         )?;
+        // Every CUDA decode step is padded to one width (see
+        // `Self::forward`): one set of graphs, no per-row state to copy.
         let graphs = StretchGraphs::resolve(
             "Ming TTS language model",
             super::graphs::MING_TTS_DECODE_GRAPHS_ENV,
             &device,
             cfg.num_hidden_layers + 1,
-        );
+        )
+        .map(|graphs| graphs.with_widths(|rows| rows == MAX_DECODE_GROUP));
         Ok(Self {
             cfg,
             dtype,
@@ -376,6 +424,12 @@ impl MingTrunk {
 
     pub fn max_positions(&self) -> usize {
         self.max_positions
+    }
+
+    /// Run decode steps eagerly (a test's reference for the graphs).
+    #[cfg(test)]
+    pub(crate) fn turn_off_graphs(&mut self) {
+        self.graphs = Err("turned off by a test".into());
     }
 
     /// The embeddings of `ids`, [ids, hidden] in the model dtype.
@@ -507,15 +561,38 @@ impl MingTrunk {
             // attention: the first layer's norm, projections and rotation;
             // then each layer's residual branches with the next layer's
             // projections; then the last layer's residual branches. On CUDA
-            // a decode step (one position a row) at a graphed width replays
-            // each stretch as a graph, captured and checked bit for bit
-            // against the eager stretch first; elsewhere the stretches run
-            // as they are, in the same order.
+            // a decode step (one position a row, at most
+            // `MAX_DECODE_GROUP` rows) replays each stretch as a graph,
+            // captured and checked bit for bit against the eager stretch
+            // first; elsewhere the stretches run as they are, in the same
+            // order.
+            //
+            // A graphed step's stretch inputs are padded with zero rows to
+            // `MAX_DECODE_GROUP`, one shape for every width. The bits are
+            // the unpadded step's: the projections already run at that
+            // padded row count (`project_rows`), every other stretch op
+            // keeps rows apart, and attention reads the real rows only.
             let decode_step = spans.iter().all(|span| span.q_len == 1);
             let mut run = match &self.graphs {
-                Ok(graphs) if decode_step => graphs.begin(tokens),
+                Ok(graphs) if decode_step && tokens <= MAX_DECODE_GROUP => {
+                    graphs.begin(MAX_DECODE_GROUP)
+                }
                 _ => None,
             };
+            let width = if run.is_some() {
+                MAX_DECODE_GROUP
+            } else {
+                tokens
+            };
+            let pad = |t: Tensor| -> Result<Tensor> {
+                if width > tokens {
+                    Ok(t.pad_with_zeros(0, 0, width - tokens)?)
+                } else {
+                    Ok(t)
+                }
+            };
+            let (cos, sin) = (pad(cos)?, pad(sin)?);
+            hidden = pad(hidden)?;
             let mut stretch = |index: usize,
                                inputs: Vec<Tensor>,
                                body: &dyn Fn(&[Tensor]) -> Result<Vec<Tensor>>|
@@ -555,12 +632,12 @@ impl MingTrunk {
                     )?);
                     offset += count;
                 }
-                let attn = if outputs.len() == 1 {
+                let attn = pad(if outputs.len() == 1 {
                     outputs.pop().expect("one group")
                 } else {
                     Tensor::cat(&outputs, 0)?
                 }
-                .reshape((tokens, cfg.q_out()))?;
+                .reshape((tokens, cfg.q_out()))?)?;
                 let layer = &self.layers[index];
                 if index == last_layer {
                     let tail = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
@@ -641,11 +718,31 @@ pub struct MingWindowState {
     position: usize,
     /// Per layer: (k, v), each [kept, kv_heads, head_dim].
     kept: Vec<Option<(Tensor, Tensor)>>,
+    /// The fixed-shape path's keys and values ([`MingWindowStack::fixed_forward`]):
+    /// every layer's in one tensor, [layers, 2, window_keys - 1, kv_heads,
+    /// head_dim], the valid ones (the last `min(position, window_keys - 1)`)
+    /// at the end.
+    fixed: Option<Tensor>,
 }
 
 impl MingWindowState {
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// The fixed-shape path's keys and values for the next chunk, taken out
+    /// (fresh zeros from `stack` before the first).
+    pub(crate) fn take_fixed(&mut self, stack: &MingWindowStack) -> Result<Tensor> {
+        match self.fixed.take() {
+            Some(kept) => Ok(kept),
+            None => stack.fixed_empty(),
+        }
+    }
+
+    /// A fixed-shape chunk of `count` positions ran and keeps `kept`.
+    pub(crate) fn advance_fixed(&mut self, count: usize, kept: Tensor) {
+        self.position += count;
+        self.fixed = Some(kept);
     }
 }
 
@@ -681,6 +778,17 @@ impl MingWindowStack {
             cfg,
             window_keys,
         })
+    }
+
+    /// This stack's F32 products in TF32 on CUDA unless
+    /// `IZWI_MING_TTS_F32_TF32` is off: for the VAE decoder, whose output is
+    /// audio only and never feeds generation back.
+    pub fn with_tf32(mut self) -> Self {
+        let tf32 = f32_tf32_requested();
+        for layer in &mut self.layers {
+            layer.tf32 = tf32;
+        }
+        self
     }
 
     pub fn dtype(&self) -> DType {
@@ -740,8 +848,6 @@ impl MingWindowStack {
             .as_ref()
             .map_or(0, |(k, _)| k.dim(0).unwrap_or(0));
         let mask = self.window_mask(kept, count)?;
-        let groups = cfg.num_attention_heads / cfg.num_key_value_heads;
-        let scale = 1.0 / (cfg.head_dim as f64).sqrt();
         let mut hidden = x.to_dtype(DType::F32)?;
         for (layer, slot) in self.layers.iter().zip(state.kept.iter_mut()) {
             let (q, k, v) = layer.qkv(&hidden, &cos, &sin, cfg, false)?;
@@ -753,23 +859,7 @@ impl MingWindowStack {
                 None => (k, v),
             };
             let span = keys.dim(0)?;
-            // q [kv, groups, count, dim] against k, v [kv, 1, span, dim]:
-            // query head h reads KV head h / groups.
-            let q = q
-                .reshape((count, cfg.num_key_value_heads, groups, cfg.head_dim))?
-                .permute((1, 2, 0, 3))?
-                .contiguous()?;
-            let k = keys.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
-            let v = values.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
-            let scores = (q.broadcast_matmul(&k.transpose(2, 3)?)? * scale)?
-                .to_dtype(DType::F32)?
-                .broadcast_add(&mask)?;
-            let weights = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(self.dtype)?;
-            let attn = weights
-                .broadcast_matmul(&v)?
-                .permute((2, 0, 1, 3))?
-                .contiguous()?
-                .reshape((count, cfg.q_out()))?;
+            let attn = self.window_attention(&q, &keys, &values, &mask)?;
             hidden = layer.finish(&hidden, &attn, cfg, false)?;
             // Later positions see at most `window_keys - 1` of these.
             let keep = span.min(self.window_keys - 1);
@@ -780,6 +870,151 @@ impl MingWindowStack {
         }
         state.position = start + count;
         norm_f32(&hidden, &self.norm, cfg.rms_norm_eps)
+    }
+
+    /// Attention of `q` [count, heads, dim] over `keys` and `values` [span,
+    /// kv_heads, dim] under the additive `mask` [count, span] (F32):
+    /// [count, q_out] in the stack's dtype.
+    fn window_attention(
+        &self,
+        q: &Tensor,
+        keys: &Tensor,
+        values: &Tensor,
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let cfg = &self.cfg;
+        let count = q.dim(0)?;
+        let groups = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let scale = 1.0 / (cfg.head_dim as f64).sqrt();
+        // q [kv, groups, count, dim] against k, v [kv, 1, span, dim]:
+        // query head h reads KV head h / groups.
+        let q = q
+            .reshape((count, cfg.num_key_value_heads, groups, cfg.head_dim))?
+            .permute((1, 2, 0, 3))?
+            .contiguous()?;
+        let k = keys.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
+        let v = values.permute((1, 0, 2))?.unsqueeze(1)?.contiguous()?;
+        let scores = (q.broadcast_matmul(&k.transpose(2, 3)?)? * scale)?
+            .to_dtype(DType::F32)?
+            .broadcast_add(mask)?;
+        let weights = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(self.dtype)?;
+        Ok(weights
+            .broadcast_matmul(&v)?
+            .permute((2, 0, 1, 3))?
+            .contiguous()?
+            .reshape((count, cfg.q_out()))?)
+    }
+
+    /// Keys each layer keeps between fixed-shape chunks: all a later
+    /// position can still see.
+    pub(crate) fn fixed_kept(&self) -> usize {
+        self.window_keys - 1
+    }
+
+    /// Columns of [`Self::fixed_tables`] for `queries` query slots: cos,
+    /// sin, then the mask over the kept keys and the slots.
+    pub(crate) fn fixed_table_width(&self, queries: usize) -> usize {
+        self.cfg.head_dim + self.fixed_kept() + queries
+    }
+
+    /// The host-built inputs of a fixed-shape chunk ([`Self::fixed_forward`])
+    /// of `count` positions from `start` in `queries` slots, [queries,
+    /// [`Self::fixed_table_width`]] row-major F32: each slot's RoPE cos and
+    /// sin (zeros past `count`), then its additive mask over the keys
+    /// [kept | slots]. Key `j` holds position `start - kept + j`, so slot `s`
+    /// sees keys `s..=kept + s` (its window) that hold a position (the last
+    /// `min(start, kept)` kept ones, and the slots up to its own). A padding
+    /// slot sees only itself, so its softmax stays finite; no real slot sees
+    /// a padding slot, which comes after it.
+    pub(crate) fn fixed_tables(&self, start: usize, count: usize, queries: usize) -> Vec<f32> {
+        let pairs = self.cfg.head_dim / 2;
+        let kept = self.fixed_kept();
+        let span = kept + queries;
+        let width = self.fixed_table_width(queries);
+        let (cos, sin) = self.freqs.cos_sin_table(start, count);
+        let held = start.min(kept);
+        let mut table = vec![0f32; queries * width];
+        for (slot, row) in table.chunks_exact_mut(width).enumerate() {
+            let (rope, mask) = row.split_at_mut(2 * pairs);
+            mask[..span].fill(f32::NEG_INFINITY);
+            if slot < count {
+                rope[..pairs].copy_from_slice(&cos[slot * pairs..(slot + 1) * pairs]);
+                rope[pairs..].copy_from_slice(&sin[slot * pairs..(slot + 1) * pairs]);
+                mask[slot.max(kept - held)..=kept + slot].fill(0.0);
+            } else {
+                mask[kept + slot] = 0.0;
+            }
+        }
+        table
+    }
+
+    /// One chunk of `state`'s sequence at a fixed shape, whatever its length
+    /// and position: the CUDA VAE decoder's form, which one CUDA graph runs.
+    /// `x` [queries, hidden] holds the chunk's positions then zero padding;
+    /// `tables` is [`Self::fixed_tables`] on the device; `gather` [kept]
+    /// U32 picks the keys the next chunk keeps (`count..count + kept`);
+    /// `kept` is the state's fixed keys and values. Returns the final-norm
+    /// hidden states [queries, hidden] (the padding rows are not meaningful)
+    /// and the keys and values to keep. A row's bits depend only on its own
+    /// sequence, never on what shares a dispatch.
+    pub(crate) fn fixed_forward(
+        &self,
+        x: &Tensor,
+        tables: &Tensor,
+        gather: &Tensor,
+        kept: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let cfg = &self.cfg;
+        let queries = x.dim(0)?;
+        let pairs = cfg.head_dim / 2;
+        let span = self.fixed_kept() + queries;
+        let cos = tables
+            .narrow(1, 0, pairs)?
+            .contiguous()?
+            .to_dtype(self.dtype)?;
+        let sin = tables
+            .narrow(1, pairs, pairs)?
+            .contiguous()?
+            .to_dtype(self.dtype)?;
+        let mask = tables.narrow(1, 2 * pairs, span)?.contiguous()?;
+        let mut hidden = x.to_dtype(DType::F32)?;
+        let mut keep = Vec::with_capacity(self.layers.len());
+        for (index, layer) in self.layers.iter().enumerate() {
+            let (q, k, v) = layer.qkv(&hidden, &cos, &sin, cfg, false)?;
+            let held = kept.get(index)?;
+            let keys = Tensor::cat(&[&held.get(0)?, &k], 0)?;
+            let values = Tensor::cat(&[&held.get(1)?, &v], 0)?;
+            let attn = self.window_attention(&q, &keys, &values, &mask)?;
+            hidden = layer.finish(&hidden, &attn, cfg, false)?;
+            keep.push(Tensor::stack(
+                &[
+                    keys.index_select(gather, 0)?,
+                    values.index_select(gather, 0)?,
+                ],
+                0,
+            )?);
+        }
+        Ok((
+            norm_f32(&hidden, &self.norm, cfg.rms_norm_eps)?,
+            Tensor::stack(&keep, 0)?,
+        ))
+    }
+
+    /// Fresh fixed keys and values for a sequence's first chunk (zeros, all
+    /// masked).
+    pub(crate) fn fixed_empty(&self) -> Result<Tensor> {
+        let cfg = &self.cfg;
+        Ok(Tensor::zeros(
+            (
+                self.layers.len(),
+                2,
+                self.fixed_kept(),
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            ),
+            self.dtype,
+            &self.device,
+        )?)
     }
 
     /// [`Self::forward`] of one chunk from position 0, reporting for each
@@ -828,15 +1063,15 @@ impl MingWindowStack {
                 .contiguous()?
                 .reshape((count, cfg.q_out()))?;
             let attn_in = max(&q)?;
-            let o = project(&attn, &layer.o_proj, None)?;
+            let o = product(&attn, &layer.o_proj, None, layer.tf32)?;
             let mid = hidden.add(&o.to_dtype(DType::F32)?)?;
             let normed =
                 rms_norm(&mid, &layer.post_norm, cfg.rms_norm_eps)?.to_dtype(self.dtype)?;
             let down_dtype = layer.down.dtype();
-            let gate = project(&normed, &layer.gate, None)?.to_dtype(down_dtype)?;
-            let up = project(&normed, &layer.up, None)?.to_dtype(down_dtype)?;
+            let gate = product(&normed, &layer.gate, None, layer.tf32)?.to_dtype(down_dtype)?;
+            let up = product(&normed, &layer.up, None, layer.tf32)?.to_dtype(down_dtype)?;
             let act = candle_nn::ops::silu(&gate)?.mul(&up)?;
-            let mlp = project(&act, &layer.down, None)?;
+            let mlp = product(&act, &layer.down, None, layer.tf32)?;
             hidden = mid.add(&mlp.to_dtype(DType::F32)?)?;
             rows.push([
                 attn_in,

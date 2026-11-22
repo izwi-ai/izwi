@@ -14,13 +14,14 @@
 //! between quanta ([`super::stream`]); a failed window discards the request.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 
 use super::config::LATENT_DIM;
 use super::stack::MingForwardRow;
 use super::stream::{MingAudioStream, MingWindow};
-use super::vae::MingVaeDecoder;
+use super::vae::{MingVaeDecoder, MingVaePending};
 use super::{
     MingGenerationParams, MingLatentInput, MingNoiseStream, MingPrompt, MingRuntime,
     MingStopReason, MIN_LATENTS,
@@ -78,6 +79,29 @@ pub(crate) struct MingRetainedState {
     phase: MingPhase,
     stop_reason: Option<MingStopReason>,
     pub(crate) audio: MingAudioStream,
+    timings: MingTimings,
+}
+
+/// Where a request's host wall time went, for diagnosing plateaus
+/// ([`MingRetainedState::trace_timings`]). A dispatch's time counts for
+/// every row it carried; device work may cross host intervals.
+#[derive(Debug, Clone, Copy, Default)]
+struct MingTimings {
+    prefill_ms: f64,
+    prefill_dispatches: u32,
+    decode_ms: f64,
+    decode_steps: u32,
+    /// Rows of every decode dispatch this request was in, summed.
+    decode_rows: u64,
+    /// Audio dispatches that ran one of this request's windows.
+    vae_ms: f64,
+    /// This request's own inverse STFT (host).
+    istft_ms: f64,
+    windows: u32,
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +153,7 @@ impl MingRetainedState {
             phase: MingPhase::Prefill,
             stop_reason: None,
             audio: MingAudioStream::default(),
+            timings: MingTimings::default(),
         })
     }
 
@@ -175,6 +200,7 @@ impl MingRetainedState {
 
     /// Decode the next window; its samples, or `None` when no window is
     /// due.
+    #[cfg(test)]
     pub(crate) fn decode_window(&mut self, decoder: &MingVaeDecoder) -> Result<Option<Vec<f32>>> {
         let Some(window) = self.next_window() else {
             return Ok(None);
@@ -259,6 +285,27 @@ impl MingRetainedState {
         Ok(())
     }
 
+    /// One log line of where this request's time went: prefill, decode
+    /// (the shared dispatches' wall time and their mean width), the VAE
+    /// windows and their inverse STFTs, and the latents.
+    pub(crate) fn trace_timings(&self, request_id: &str) {
+        let t = &self.timings;
+        tracing::info!(
+            request_id,
+            timing_clock = "host_wall",
+            prefill_ms = t.prefill_ms,
+            prefill_dispatches = t.prefill_dispatches,
+            decode_ms = t.decode_ms,
+            decode_steps = t.decode_steps,
+            mean_decode_width = t.decode_rows as f64 / f64::from(t.decode_steps.max(1)),
+            vae_ms = t.vae_ms,
+            istft_ms = t.istft_ms,
+            windows = t.windows,
+            latents = self.latents_generated(),
+            "Ming execution timing (dispatch wall time counts for every row; GPU work may cross host intervals)"
+        );
+    }
+
     pub(crate) fn mark_finished(&mut self) -> Result<()> {
         if self.phase != MingPhase::Audio || !self.audio.done() {
             return Err(Error::InferenceError(
@@ -268,6 +315,74 @@ impl MingRetainedState {
         self.phase = MingPhase::Finished;
         Ok(())
     }
+}
+
+/// The next audio window of each state, `None` for a state with none due.
+/// Every due window's stack is queued on the device first, then each is
+/// read back and run through the inverse STFT in turn, so the host's work
+/// on one window overlaps the device's on the next. Each window decodes on
+/// its own (the VAE keeps per-request attention state): a request gets the
+/// samples it would alone.
+pub(crate) fn ming_audio_batch(
+    decoder: &MingVaeDecoder,
+    states: &mut [&mut MingRetainedState],
+) -> Result<Vec<Option<Vec<f32>>>> {
+    let started = Instant::now();
+    let mut queued: Vec<Option<(MingWindow, MingVaePending)>> = Vec::with_capacity(states.len());
+    for state in states.iter_mut() {
+        queued.push(match state.next_window() {
+            Some(window) => {
+                let pending = state.audio.begin(decoder, &state.latents, window)?;
+                Some((window, pending))
+            }
+            None => None,
+        });
+    }
+    // Each window is read back on this (the device's) thread, then the
+    // inverse STFTs, pure host work, run on the worker pool side by side: one
+    // after another they held the device thread for about 5 ms a request,
+    // so the GPU sat idle for most of a wide audio quantum.
+    let mut read = Vec::with_capacity(queued.len());
+    for queued in queued {
+        read.push(match queued {
+            Some((window, pending)) => Some((window, decoder.read_back(pending)?)),
+            None => None,
+        });
+    }
+    let finish = |state: &mut MingRetainedState,
+                  read: Option<(MingWindow, super::vae::MingVaeHostWindow)>|
+     -> Result<Option<Vec<f32>>> {
+        let Some((window, host)) = read else {
+            return Ok(None);
+        };
+        let istft = Instant::now();
+        let samples = state.audio.finish_host(decoder, host, window)?;
+        state.timings.istft_ms += elapsed_ms(istft);
+        state.timings.windows += 1;
+        Ok(Some(samples))
+    };
+    let due = read.iter().filter(|read| read.is_some()).count();
+    let out = if due > 1 {
+        use rayon::prelude::*;
+        states
+            .par_iter_mut()
+            .zip(read)
+            .map(|(state, read)| finish(state, read))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        states
+            .iter_mut()
+            .zip(read)
+            .map(|(state, read)| finish(state, read))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let elapsed = elapsed_ms(started);
+    for (state, samples) in states.iter_mut().zip(&out) {
+        if samples.is_some() {
+            state.timings.vae_ms += elapsed;
+        }
+    }
+    Ok(out)
 }
 
 fn hidden_rows(hidden: &Tensor) -> Result<Vec<Vec<f32>>> {
@@ -288,6 +403,7 @@ pub(crate) fn ming_prefill_batch(
             "Ming prefill batch rows do not match".into(),
         ));
     }
+    let started = Instant::now();
     let hidden = runtime.config().llm.hidden_size;
     let mut steps = Vec::with_capacity(rows.len());
     let mut spans = Vec::with_capacity(rows.len());
@@ -318,7 +434,10 @@ pub(crate) fn ming_prefill_batch(
         .collect::<Vec<_>>();
     let states = hidden_rows(&runtime.trunk().forward_batch(&mut forward)?)?;
     drop(forward);
+    let elapsed = elapsed_ms(started);
     for ((row, step), state) in rows.iter_mut().zip(&steps).zip(states) {
+        row.state.timings.prefill_ms += elapsed;
+        row.state.timings.prefill_dispatches += 1;
         row.state.prefill_cursor += step.consumed_tokens;
         if step.complete {
             row.state.phase = MingPhase::Decode;
@@ -331,6 +450,13 @@ pub(crate) fn ming_prefill_batch(
 /// One decode step for each row: sample a latent from its pending hidden
 /// state, then run every row that has not stopped through the language
 /// model in one call.
+///
+/// The device is waited on once. Whether a row stops needs only its pending
+/// hidden state (the stop head runs on the host) and its step, so that is
+/// decided first; the sampled latents stay on the device and feed the
+/// aggregator directly, the language model runs, and one readback brings
+/// the latents and the new hidden states back together. Nothing is
+/// committed before that readback's checks pass.
 pub(crate) fn ming_decode_batch(
     runtime: &MingRuntime,
     rows: &mut [MingStepRow<'_>],
@@ -338,11 +464,13 @@ pub(crate) fn ming_decode_batch(
     if rows.is_empty() {
         return Err(Error::InvalidInput("Ming decode batch has no rows".into()));
     }
+    let started = Instant::now();
     // Every row's inputs first: its hidden state, history and its own
-    // seeded noise. Then one flow-head call for all of them, and one
-    // aggregator call for the rows that go on: each row's values are the
-    // ones it gets alone (see `flow_group`).
+    // seeded noise, and whether this latent is its last. Then one flow-head
+    // call for all of them, and one aggregator call for the rows that go
+    // on: each row's values are the ones it gets alone (see `flow_group`).
     let mut inputs = Vec::with_capacity(rows.len());
+    let mut stops = Vec::with_capacity(rows.len());
     for row in rows.iter_mut() {
         let state = &mut *row.state;
         if state.phase != MingPhase::Decode {
@@ -353,11 +481,19 @@ pub(crate) fn ming_decode_batch(
         let hidden = state.pending.take().ok_or_else(|| {
             Error::InferenceError("Ming decode step has no pending hidden state".into())
         })?;
+        let step = state.latents_generated();
+        stops.push(if runtime.stops_at(&hidden, step) {
+            Some(MingStopReason::EndOfSpeech)
+        } else if step + 1 >= state.budget {
+            Some(MingStopReason::LatentBudget)
+        } else {
+            None
+        });
         let mut noise = state.rng.standard_normals(LATENT_DIM);
         noise.truncate(LATENT_DIM);
         inputs.push((hidden, noise));
     }
-    let latents = runtime.sample_latents(
+    let latents = runtime.sample_latents_device(
         &rows
             .iter()
             .zip(&inputs)
@@ -369,71 +505,84 @@ pub(crate) fn ming_decode_batch(
             })
             .collect::<Vec<_>>(),
     )?;
-    let mut steps = Vec::with_capacity(rows.len());
-    let mut going_on = Vec::with_capacity(rows.len());
-    let mut fed_back = Vec::with_capacity(rows.len() * LATENT_DIM);
-    for ((row, (hidden, _)), latent) in rows.iter_mut().zip(&inputs).zip(latents) {
-        let state = &mut *row.state;
-        let step = state.latents_generated();
-        state.latents.extend_from_slice(&latent);
-        let stop = if runtime.stops_at(hidden, step) {
-            Some(MingStopReason::EndOfSpeech)
-        } else if step + 1 >= state.budget {
-            Some(MingStopReason::LatentBudget)
+    let going_on = stops
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stop)| stop.is_none().then_some(index as u32))
+        .collect::<Vec<_>>();
+    // The latents of the rows that go on, through the aggregator and the
+    // language model; the last latent is kept and never fed back.
+    let hidden = if going_on.is_empty() {
+        None
+    } else {
+        let fed_back = if going_on.len() == rows.len() {
+            latents.clone()
         } else {
-            None
+            let picked = Tensor::from_vec(going_on.clone(), going_on.len(), runtime.device())?;
+            latents.index_select(&picked, 0)?
         };
+        let embeds = runtime.latent_embeddings_device(&fed_back)?;
+        let next = (0..going_on.len())
+            .map(|index| embeds.narrow(0, index, 1))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let mut forward = rows
+            .iter_mut()
+            .zip(&stops)
+            .filter(|(_, stop)| stop.is_none())
+            .zip(&next)
+            .map(|((row, _), embeds)| MingForwardRow {
+                embeds,
+                cache: &mut *row.cache,
+            })
+            .collect::<Vec<_>>();
+        Some(runtime.trunk().forward_batch(&mut forward)?)
+    };
+    // The one readback: every latent, then every new hidden state.
+    let flat = latents.flatten_all()?;
+    let values = match &hidden {
+        Some(hidden) => Tensor::cat(&[&flat, &hidden.to_dtype(DType::F32)?.flatten_all()?], 0)?,
+        None => flat,
+    }
+    .to_device(&Device::Cpu)?
+    .to_vec1::<f32>()?;
+    let (sampled, states) = values.split_at(rows.len() * LATENT_DIM);
+    if sampled.iter().any(|value| !value.is_finite()) {
+        return Err(Error::InferenceError(
+            "Ming flow head produced a non-finite latent".into(),
+        ));
+    }
+    let hidden_size = runtime.config().llm.hidden_size;
+    if states.len() != going_on.len() * hidden_size {
+        return Err(Error::InferenceError(
+            "Ming decode step lost a row's hidden state".into(),
+        ));
+    }
+    let mut states = states.chunks_exact(hidden_size);
+    let mut steps = Vec::with_capacity(rows.len());
+    let (elapsed, width) = (elapsed_ms(started), rows.len() as u64);
+    for ((row, latent), stop) in rows
+        .iter_mut()
+        .zip(sampled.as_chunks::<LATENT_DIM>().0)
+        .zip(stops)
+    {
+        let state = &mut *row.state;
+        state.timings.decode_ms += elapsed;
+        state.timings.decode_steps += 1;
+        state.timings.decode_rows += width;
+        state.latents.extend_from_slice(latent);
         match stop {
             Some(reason) => {
-                // The last latent is kept and never fed back.
                 state.phase = MingPhase::Audio;
                 state.stop_reason = Some(reason);
             }
             None => {
-                fed_back.extend_from_slice(&latent);
-                state.history = latent;
+                state.history = latent.to_vec();
+                state.pending = states.next().map(<[f32]>::to_vec);
             }
         }
-        going_on.push(stop.is_none());
         steps.push(MingDecodeStep {
             finished: stop.is_some(),
         });
-    }
-    let embeds = if fed_back.is_empty() {
-        None
-    } else {
-        Some(runtime.latent_embeddings(&fed_back)?)
-    };
-    let mut next = Vec::with_capacity(rows.len());
-    let mut fed = 0usize;
-    for &goes_on in &going_on {
-        next.push(match (&embeds, goes_on) {
-            (Some(embeds), true) => {
-                fed += 1;
-                Some(embeds.narrow(0, fed - 1, 1)?)
-            }
-            _ => None,
-        });
-    }
-    let mut forward = rows
-        .iter_mut()
-        .zip(&next)
-        .filter_map(|(row, embeds)| {
-            embeds.as_ref().map(|embeds| MingForwardRow {
-                embeds,
-                cache: &mut *row.cache,
-            })
-        })
-        .collect::<Vec<_>>();
-    if !forward.is_empty() {
-        let states = hidden_rows(&runtime.trunk().forward_batch(&mut forward)?)?;
-        drop(forward);
-        let mut states = states.into_iter();
-        for (row, embeds) in rows.iter_mut().zip(&next) {
-            if embeds.is_some() {
-                row.state.pending = states.next();
-            }
-        }
     }
     Ok(steps)
 }
@@ -560,15 +709,18 @@ mod tests {
         assert_eq!(latents, expected);
     }
 
-    #[test]
-    fn rows_decoded_together_match_each_alone() {
-        let runtime = tiny_runtime();
-        let texts = ["first row here", "another one", "and the third row of text"];
+    /// Each text's latents decoded alone, and all of them decoded together
+    /// (the rows that are still decoding share each step), on caches of the
+    /// runtime's device and dtype.
+    fn latents_alone_and_together(
+        runtime: &MingRuntime,
+        texts: &[&str],
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         let cfg = runtime.trunk().config();
         let caches = |rows: usize| {
             crate::models::shared::attention::physical::test_physical_caches_with_dtype_on(
                 runtime.device(),
-                DType::F32,
+                runtime.lm_dtype(),
                 cfg.num_hidden_layers,
                 cfg.num_key_value_heads,
                 cfg.head_dim,
@@ -579,19 +731,19 @@ mod tests {
         let alone = texts
             .iter()
             .map(|text| {
-                let mut retained = state(&runtime, text, 7);
+                let mut retained = state(runtime, text, 7);
                 let mut cache = caches(1).pop().unwrap();
-                run(&runtime, &mut retained, &mut cache, usize::MAX)
+                run(runtime, &mut retained, &mut cache, usize::MAX)
             })
             .collect::<Vec<_>>();
         let mut states = texts
             .iter()
-            .map(|text| state(&runtime, text, 7))
+            .map(|text| state(runtime, text, 7))
             .collect::<Vec<_>>();
         let mut caches = caches(texts.len());
         for (state, cache) in states.iter_mut().zip(caches.iter_mut()) {
             let span = state.prompt_tokens();
-            ming_prefill_batch(&runtime, &mut [MingStepRow { state, cache }], &[span]).unwrap();
+            ming_prefill_batch(runtime, &mut [MingStepRow { state, cache }], &[span]).unwrap();
         }
         loop {
             let mut rows = states
@@ -603,27 +755,155 @@ mod tests {
             if rows.is_empty() {
                 break;
             }
-            ming_decode_batch(&runtime, &mut rows).unwrap();
+            ming_decode_batch(runtime, &mut rows).unwrap();
         }
+        let together = states.into_iter().map(|state| state.latents).collect();
+        (alone, together)
+    }
+
+    fn bits(rows: &[Vec<f32>]) -> Vec<Vec<u32>> {
+        rows.iter()
+            .map(|row| row.iter().map(|value| value.to_bits()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn rows_decoded_together_match_each_alone() {
+        let runtime = tiny_runtime();
+        let texts = ["first row here", "another one", "and the third row of text"];
         // On caches of one kind a row's latents are the bits it gets alone
         // (a scratch cache pages differently and rounds in the sixth place).
-        for (state, alone) in states.iter().zip(&alone) {
-            assert_eq!(state.latents.len(), alone.len());
-            let worst = state
-                .latents
-                .iter()
-                .zip(alone)
-                .map(|(a, b)| {
-                    let d = (a - b).abs();
-                    if d.is_finite() {
-                        d
-                    } else {
-                        f32::INFINITY
-                    }
-                })
-                .fold(0f32, f32::max);
-            assert_eq!(worst, 0.0);
+        let (alone, together) = latents_alone_and_together(&runtime, &texts);
+        assert!(alone.iter().all(|latents| !latents.is_empty()));
+        assert_eq!(bits(&together), bits(&alone));
+    }
+
+    /// On CUDA, with the decode stretches graphed at their one padded width:
+    /// from eleven rows down to one, a row's latents are the bits it gets
+    /// alone, and the bits the eager (ungraphed) steps give.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_rows_decoded_together_match_each_alone_and_eager() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let texts = [
+            "first row here",
+            "another one",
+            "and the third row of text",
+            "one two three",
+            "keep going",
+            "hello there friend",
+            "the text",
+            "row of text here",
+            "two one",
+            "three two one friend",
+            "first another third",
+        ];
+        let synthetic = crate::models::architectures::ming_tts::synthetic::tiny_runtime_on;
+        let graphed = synthetic(&device, DType::BF16);
+        let (alone, together) = latents_alone_and_together(&graphed, &texts);
+        assert_eq!(bits(&together), bits(&alone));
+        let diagnostics = graphed.decode_graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert_eq!(
+            diagnostics["widths"],
+            serde_json::json!([32]),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics["replays"].as_u64().unwrap_or(0) > 0,
+            "{diagnostics}"
+        );
+        let mut eager = synthetic(&device, DType::BF16);
+        eager.turn_off_decode_graphs();
+        let (eager_alone, eager_together) = latents_alone_and_together(&eager, &texts);
+        assert_eq!(bits(&eager_alone), bits(&alone));
+        assert_eq!(bits(&eager_together), bits(&alone));
+    }
+
+    /// Every state's windows through [`ming_audio_batch`], `together` in one
+    /// batch per round or each state alone; each state's samples as bits.
+    fn audio_bits(
+        decoder: &MingVaeDecoder,
+        states: &mut [MingRetainedState],
+        together: bool,
+    ) -> Vec<Vec<u32>> {
+        let mut out = vec![Vec::new(); states.len()];
+        if together {
+            loop {
+                let mut refs = states.iter_mut().collect::<Vec<_>>();
+                let windows = ming_audio_batch(decoder, &mut refs).unwrap();
+                if windows.iter().all(Option::is_none) {
+                    break;
+                }
+                for (samples, window) in out.iter_mut().zip(windows) {
+                    samples.extend(window.unwrap_or_default().into_iter().map(f32::to_bits));
+                }
+            }
+        } else {
+            for (samples, state) in out.iter_mut().zip(states.iter_mut()) {
+                while let Some(window) = ming_audio_batch(decoder, &mut [state]).unwrap().remove(0)
+                {
+                    samples.extend(window.into_iter().map(f32::to_bits));
+                }
+            }
         }
+        assert!(states.iter().all(|state| state.audio.done()));
+        out
+    }
+
+    /// Windows queued together are each request's samples alone, bit for
+    /// bit (on the CPU, at each window's own length).
+    #[test]
+    fn audio_windows_together_match_each_alone() {
+        let runtime = tiny_runtime();
+        let fresh = || {
+            ["first row here", "another one", "and the third row of text"]
+                .iter()
+                .map(|text| {
+                    let mut retained = state(&runtime, text, 20);
+                    let mut cache = runtime.scratch_cache(256).unwrap();
+                    run(&runtime, &mut retained, &mut cache, usize::MAX);
+                    retained
+                })
+                .collect::<Vec<_>>()
+        };
+        let alone = audio_bits(runtime.decoder(), &mut fresh(), false);
+        assert!(alone.iter().all(|samples| !samples.is_empty()));
+        assert_eq!(audio_bits(runtime.decoder(), &mut fresh(), true), alone);
+    }
+
+    /// On CUDA, through the VAE window's graph: windows queued together are
+    /// each request's samples alone, bit for bit, and the graph replays.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_audio_windows_together_match_each_alone() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let mut runtime =
+            crate::models::architectures::ming_tts::synthetic::tiny_runtime_on(&device, DType::F32);
+        runtime.resolve_graphs();
+        let fresh = || {
+            ["first row here", "another one", "and the third row of text"]
+                .iter()
+                .map(|text| {
+                    let mut retained = state(&runtime, text, 20);
+                    let mut cache = runtime.scratch_cache(256).unwrap();
+                    run(&runtime, &mut retained, &mut cache, usize::MAX);
+                    retained
+                })
+                .collect::<Vec<_>>()
+        };
+        let alone = audio_bits(runtime.decoder(), &mut fresh(), false);
+        assert_eq!(audio_bits(runtime.decoder(), &mut fresh(), true), alone);
+        let diagnostics = runtime.vae_graphs_diagnostics();
+        assert!(diagnostics["off"].is_null(), "{diagnostics}");
+        assert!(
+            diagnostics["replays"].as_u64().unwrap_or(0) > 0,
+            "{diagnostics}"
+        );
     }
 
     #[test]

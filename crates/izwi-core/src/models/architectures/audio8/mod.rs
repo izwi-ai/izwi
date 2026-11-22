@@ -60,7 +60,16 @@ pub use contracts::{
     Audio8DacContract, Audio8PromptTensorShape,
 };
 pub use dac::{Audio8DacConfig, Audio8DacDecoder};
-pub(crate) use fast::audio8_fast_graph_device_bytes;
+/// Device bytes a load on `backend` prices for Audio8's CUDA graphs: the
+/// fast AR's frame graphs and the streaming codec's push graphs (which the
+/// load's self-checks allocate) and the slow transformer's decode-step
+/// graphs (which the first decode steps allocate). Zero off CUDA or with
+/// the graphs switched off.
+pub(crate) fn audio8_graph_device_bytes(backend: crate::backends::BackendKind) -> u64 {
+    fast::audio8_fast_graph_device_bytes(backend)
+        + slow::audio8_slow_graph_device_bytes(backend)
+        + dac::audio8_codec_graph_device_bytes(backend)
+}
 pub use fast::{Audio8FastConfig, Audio8FastDecoder, Audio8GeneratedFrame, Audio8Sampler};
 pub(crate) use physical::{Audio8PhysicalStateSpec, AUDIO8_SLOW_STATE_GROUP};
 #[allow(unused_imports)]
@@ -80,6 +89,12 @@ pub(crate) const AUDIO8_TTS_PREPARATION_STAGE: &str = "tts.prepare.audio8";
 pub(crate) const AUDIO8_TTS_PREFILL_STAGE: &str = "tts.prefill.audio8";
 pub(crate) const AUDIO8_TTS_DECODE_STAGE: &str = "tts.decode.audio8";
 pub(crate) const AUDIO8_AUDIO_CHUNK_FRAMES: usize = 16;
+
+/// The prompt tokens of one Audio8 prefill span on CUDA. Every span but a
+/// prompt's last is exactly this long whatever else the step runs: a span's
+/// length is its projections' row count, so a span cut to a step's leftover
+/// budget changed the prompt's bits under load. Most prompts are one span.
+pub(crate) const AUDIO8_CUDA_PREFILL_SPAN: usize = 256;
 pub(crate) const AUDIO8_FIRST_AUDIO_FRAMES: usize = 4;
 pub(crate) const AUDIO8_TTS_AUDIO_DECODE_STAGE: &str = "tts.audio_decode.audio8";
 pub(crate) const AUDIO8_TTS_FINALIZE_STAGE: &str = "tts.codec.audio8.scalar";
@@ -156,6 +171,14 @@ pub struct Audio8TtsDiagnostics {
     /// replays, fallbacks and graphed and eager frames; `None` without the
     /// native runtime.
     pub fast_graphs: Option<serde_json::Value>,
+    /// The slow transformer's CUDA decode-step graphs: why they are off, or
+    /// their widths, captures and replays; `None` without the native
+    /// runtime.
+    pub slow_graphs: Option<serde_json::Value>,
+    /// The streaming codec's fixed-shape CUDA pushes and their graphs: why
+    /// the graphs are off, or their captures and replays and the pushes
+    /// they took; `None` off CUDA or without the native runtime.
+    pub codec_graphs: Option<serde_json::Value>,
 }
 
 /// Model-authored terminal reason. Exhausting a budget is incomplete speech.
@@ -206,6 +229,17 @@ const RAS_HIGH_TOP_P: f32 = 0.9;
 static NEXT_AUDIO8_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 impl Audio8TtsModel {
+    /// The cell of the scheduler's prefill grid for this model's prompts:
+    /// [`AUDIO8_CUDA_PREFILL_SPAN`] on CUDA, where decode runs row-invariant
+    /// (`slow::decode_rows`) and prefill one request alone; 0 (no grid) on
+    /// the CPU and Metal, and before the weights load.
+    pub fn prefill_grid_tokens(&self) -> usize {
+        match &self.runtime {
+            Some(runtime) if runtime.slow.device().is_cuda() => AUDIO8_CUDA_PREFILL_SPAN,
+            _ => 0,
+        }
+    }
+
     /// Metadata-only fixture for request preparation and admission tests.
     /// Native inference remains unavailable, as for `load_metadata`.
     #[cfg(test)]
@@ -310,6 +344,14 @@ impl Audio8TtsModel {
                 .runtime
                 .as_ref()
                 .map(|runtime| runtime.fast.graphs_diagnostics()),
+            slow_graphs: self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.slow.graphs_diagnostics()),
+            codec_graphs: self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.dac.stream_graphs_diagnostics()),
         }
     }
 
@@ -500,7 +542,9 @@ impl Audio8NativeRuntime {
         // A fast frame's input is the slow transformer's hidden state.
         fast.resolve_graphs(precision.loaded);
         let codec_weights = codec.load_weights(&device, DType::F32)?;
-        let dac = Audio8DacDecoder::load(Audio8DacConfig::current(), codec_weights.var_builder())?;
+        let mut dac =
+            Audio8DacDecoder::load(Audio8DacConfig::current(), codec_weights.var_builder())?;
+        dac.resolve_stream_graphs();
         let semantic_allowed_mask = slow.semantic_allowed_mask(eos)?;
 
         Ok(Self {

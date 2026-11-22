@@ -3471,7 +3471,7 @@ impl NativeAsrModel {
                 | Self::VibeVoice(_)
                 | Self::NemotronTranscribe(_)
                 | Self::SovTranscribe(_)
-        )
+        ) || matches!(self, Self::Rumble(model) if model.supports_static_prefill_batch())
     }
 
     pub fn continuous_decode_is_tensor_batched(&self) -> bool {
@@ -4129,6 +4129,31 @@ impl NativeAsrModel {
             }
             _ => Err(Error::InvalidInput(
                 "ASR resumable-prefill state does not match loaded ASR model".to_string(),
+            )),
+        }
+    }
+
+    /// Prefill several retained rows' spans `(state, start, end)` in one
+    /// model call (Rumble on CUDA); whether each row's prefill is complete.
+    pub(crate) fn continue_resumable_prefill_batch(
+        &self,
+        rows: &mut [(&mut NativeAsrDecodeState, usize, usize)],
+    ) -> Result<Vec<bool>> {
+        match self {
+            Self::Rumble(model) => {
+                let mut typed = rows
+                    .iter_mut()
+                    .map(|(state, start, end)| match &mut **state {
+                        NativeAsrDecodeState::Rumble(state) => Ok((state, *start, *end)),
+                        _ => Err(Error::InvalidInput(
+                            "Rumble prefill batch contains a foreign state".to_string(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                model.continue_resumable_prefill_batch(&mut typed)
+            }
+            _ => Err(Error::InvalidInput(
+                "Loaded ASR model does not prefill rows together".to_string(),
             )),
         }
     }
@@ -8687,15 +8712,22 @@ impl ModelRegistry {
             let guard = self.ming_tts_models.read().await;
             for (variant, entry) in guard.iter() {
                 if let Some(model) = entry.ready_model() {
+                    let model_diagnostics = model.diagnostics();
+                    let device_kind = format!("{:?}", self.device.kind);
                     diagnostics.push(loaded_model_diagnostics_entry(
                         &self.device,
                         *variant,
                         "ming_tts",
                         "ming_tts",
-                        LoadedModelActualRuntime::default(),
+                        // The language model's dtype: what the device runs
+                        // after the load's precision probe.
+                        LoadedModelActualRuntime::from_values(
+                            Some(&device_kind),
+                            Some(&model_diagnostics.dtype),
+                        ),
                         None,
                         None,
-                        serde_json::to_value(model.diagnostics()).ok(),
+                        serde_json::to_value(model_diagnostics).ok(),
                     ));
                 }
             }

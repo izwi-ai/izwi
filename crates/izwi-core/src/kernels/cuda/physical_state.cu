@@ -1382,3 +1382,29 @@ extern "C" __global__ void lfm_shortconv_gated_ring_step_rows_f32(
                                         y + r * (long long)hidden, hidden, capacity, e[2],
                                         e[3], h);
 }
+
+// Paged KV writes: row r of `src` (`units` elements of the copy unit) lands
+// in row `slots[r]` of `dst` (a slot of u32::MAX writes nothing). One thread
+// per unit, every row in parallel; the caller picks the widest unit that
+// divides the row and both offsets, and bounds-checks the slots.
+#define IZWI_KV_WRITE_ROWS(SUFFIX, T)                                           \
+  extern "C" __global__ void izwi_kv_write_rows_##SUFFIX(                      \
+      T *__restrict__ dst, const T *__restrict__ src,                          \
+      const unsigned int *__restrict__ slots, unsigned long long rows,         \
+      unsigned long long units) {                                              \
+    const unsigned long long total = rows * units;                             \
+    for (unsigned long long i =                                                \
+             (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;        \
+         i < total; i += (unsigned long long)blockDim.x * gridDim.x) {         \
+      const unsigned long long row = i / units;                                \
+      const unsigned int slot = slots[row];                                    \
+      if (slot != 0xffffffffu) {                                               \
+        dst[(unsigned long long)slot * units + (i - row * units)] = src[i];    \
+      }                                                                        \
+    }                                                                          \
+  }
+
+IZWI_KV_WRITE_ROWS(u128, uint4)
+IZWI_KV_WRITE_ROWS(u32, unsigned int)
+IZWI_KV_WRITE_ROWS(u16, unsigned short)
+IZWI_KV_WRITE_ROWS(u8, unsigned char)

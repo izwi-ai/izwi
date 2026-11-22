@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use super::config::{vae_window_keys, CONTEXT_POSITIONS, MAX_NEW_LATENTS, SAMPLE_RATE};
 use super::physical::{ming_physical_state_spec, ming_retained_contract, MingPhysicalStateSpec};
 use super::retained::{
-    ming_decode_batch, ming_prefill_batch, MingDecodeStep, MingPhase, MingPrefillStep,
-    MingPreparedArtifact, MingRetainedState, MingStepRow,
+    ming_audio_batch, ming_decode_batch, ming_prefill_batch, MingDecodeStep, MingPhase,
+    MingPrefillStep, MingPreparedArtifact, MingRetainedState, MingStepRow,
 };
 use super::{MingGenerationParams, MingPrecision, MingReferenceVoice, MingRequest, MingRuntime};
 use crate::backends::{BackendKind, DTypeSelection, DTypeSelectionRequest, DeviceProfile};
@@ -34,6 +34,9 @@ pub struct MingTtsModel {
     /// (digest of the clip and its transcript, the encoded voice), most
     /// recently used last.
     references: Mutex<Vec<([u8; 32], Arc<MingReferenceVoice>)>>,
+    /// Each precision the load tried before the one it kept, and why it was
+    /// refused (empty when the device's precision passed its probe).
+    precision_fallbacks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +59,24 @@ pub struct MingTtsDiagnostics {
     pub flow_graphs: serde_json::Value,
     /// The language model's decode-step CUDA graphs, likewise.
     pub decode_graphs: serde_json::Value,
+    /// The VAE window's CUDA graph, likewise.
+    pub vae_graphs: serde_json::Value,
+    /// Each precision the load refused before the kept one, and why: a
+    /// device that should run BF16 (CUDA) or F16 (Metal) but lists one here
+    /// runs slower than it should.
+    pub precision_fallbacks: Vec<String>,
+}
+
+/// Kill switch for the batched audio stage on CUDA (a boolean; on when
+/// unset): off, each request's VAE window is a quantum of its own.
+pub(crate) const MING_TTS_AUDIO_BATCH_ENV: &str = "IZWI_MING_TTS_AUDIO_BATCH";
+
+/// Whether CUDA decodes several requests' due VAE windows in one audio
+/// quantum ([`MingTtsModel::retained_audio_batch`]).
+pub(crate) fn ming_audio_batching_enabled() -> bool {
+    static ON: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(MING_TTS_AUDIO_BATCH_ENV, true));
+    ON.get()
 }
 
 /// What one audio-window quantum did.
@@ -96,6 +117,7 @@ impl MingTtsModel {
         let ladder = MingPrecision::ladder(selection.dtype);
         let last = ladder.len() - 1;
         let mut loaded = None;
+        let mut precision_fallbacks = Vec::new();
         for (step, precision) in ladder.into_iter().enumerate() {
             let runtime = MingRuntime::load(model_dir, &device.device, precision)?;
             if step == last {
@@ -113,12 +135,16 @@ impl MingTtsModel {
                 BackendKind::from(device.kind),
                 report.reason
             );
+            precision_fallbacks.push(format!(
+                "lm {:?}, flow {:?}: {}",
+                precision.lm, precision.flow, report.reason
+            ));
             // Free this attempt's weights before loading the next.
             drop(runtime);
             device.device.synchronize()?;
         }
         let (mut runtime, precision, report) = loaded.expect("the ladder ends in F32");
-        runtime.resolve_flow_graphs();
+        runtime.resolve_graphs();
         tracing::info!(
             "Ming TTS on {:?}: language model {:?}, flow path {:?}, VAE {:?} ({}; {}); {} keys per VAE frame",
             BackendKind::from(device.kind),
@@ -134,6 +160,7 @@ impl MingTtsModel {
             variant,
             runtime,
             references: Mutex::new(Vec::new()),
+            precision_fallbacks,
         })
     }
 
@@ -175,6 +202,8 @@ impl MingTtsModel {
             voice_cloning: self.runtime.can_clone_voices(),
             flow_graphs: self.runtime.flow_graphs_diagnostics(),
             decode_graphs: self.runtime.decode_graphs_diagnostics(),
+            vae_graphs: self.runtime.vae_graphs_diagnostics(),
+            precision_fallbacks: self.precision_fallbacks.clone(),
         }
     }
 
@@ -288,31 +317,32 @@ impl MingTtsModel {
         ming_decode_batch(&self.runtime, rows)
     }
 
-    /// Decode the request's next audio window, waiting for the device so
-    /// the window's cost lands in its own quantum.
+    /// Decode the request's next audio window. Its samples are read back
+    /// from the device, so the window's cost lands in its own quantum.
     pub(crate) fn retained_audio_step(
         &self,
         state: &mut MingRetainedState,
     ) -> Result<MingAudioProgress> {
-        let samples = state.decode_window(self.runtime.decoder())?;
-        self.runtime.device().synchronize()?;
-        Ok(match samples {
-            Some(samples) => MingAudioProgress::Window(samples),
-            None => MingAudioProgress::Idle,
-        })
+        self.retained_audio_batch(&mut [state])?
+            .pop()
+            .ok_or_else(|| Error::InferenceError("Ming audio window lost its result".into()))
     }
 
-    /// [`Self::retained_audio_step`] for several requests: each request's
-    /// window decodes on its own (the VAE keeps per-request attention
-    /// state), so every request gets the samples it would alone.
+    /// [`Self::retained_audio_step`] for several requests (the batched
+    /// audio stage on CUDA): every due window is queued before any is read
+    /// back ([`ming_audio_batch`]); each request's window decodes on its
+    /// own, so every request gets the samples it would alone.
     pub(crate) fn retained_audio_batch(
         &self,
         states: &mut [&mut MingRetainedState],
     ) -> Result<Vec<MingAudioProgress>> {
-        states
-            .iter_mut()
-            .map(|state| self.retained_audio_step(state))
-            .collect()
+        Ok(ming_audio_batch(self.runtime.decoder(), states)?
+            .into_iter()
+            .map(|samples| match samples {
+                Some(samples) => MingAudioProgress::Window(samples),
+                None => MingAudioProgress::Idle,
+            })
+            .collect())
     }
 
     /// Mark a request whose last window is out as finished.
