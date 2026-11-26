@@ -1,0 +1,412 @@
+[
+ {
+  "name": "one_user_turn",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|>"
+ },
+ {
+  "name": "system_then_user",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Why is the sky blue?"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Why is the sky blue?<|end_message|>"
+ },
+ {
+  "name": "two_system_messages",
+  "messages": [
+   {
+    "role": "system",
+    "content": "One."
+   },
+   {
+    "role": "system",
+    "content": "Two."
+   },
+   {
+    "role": "user",
+    "content": "Go"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>One.<|end_message|><|message_system|><|content_text|>Two.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Go<|end_message|>"
+ },
+ {
+  "name": "multi_turn",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "assistant",
+    "content": "Hello! How can I help?"
+   },
+   {
+    "role": "user",
+    "content": "Tell me a joke — a short one."
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_text|>Hello! How can I help?<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Tell me a joke — a short one.<|end_message|>"
+ },
+ {
+  "name": "assistant_with_reasoning",
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Simple sum.",
+    "content": "4"
+   },
+   {
+    "role": "user",
+    "content": "And 3+3?"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>2+2?<|end_message|><|message_model|><|content_thinking|>Simple sum.<|end_message|><|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And 3+3?<|end_message|>"
+ },
+ {
+  "name": "effort_none",
+  "reasoning_effort": "none",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_minimal",
+  "reasoning_effort": "minimal",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_low",
+  "reasoning_effort": "low",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_medium",
+  "reasoning_effort": "medium",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_high",
+  "reasoning_effort": "high",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_xhigh",
+  "reasoning_effort": "xhigh",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort_number",
+  "reasoning_effort": 0.35,
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.35<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "only_system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Standing by."
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Standing by.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+ },
+ {
+  "name": "tools_declared",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "now",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Harare?"
+   }
+  ],
+  "rendered": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Current weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"now\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Harare?<|end_message|>"
+ },
+ {
+  "name": "tool_round_trip",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Harare?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "unit": "c",
+        "city": "Harare"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "{\"temp\": 27}"
+   },
+   {
+    "role": "assistant",
+    "content": "It is 27 °C in Harare."
+   },
+   {
+    "role": "user",
+    "content": "Thanks"
+   }
+  ],
+  "rendered": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Current weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Use tools.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Harare?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Harare\",\"unit\":\"c\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 27}<|end_message|><|message_model|><|content_text|>It is 27 °C in Harare.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks<|end_message|>"
+ },
+ {
+  "name": "two_tool_calls_with_text",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "now",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Time and weather?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Two calls.",
+    "content": "Checking both.",
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "now",
+       "arguments": {}
+      }
+     },
+     {
+      "id": "b",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Bulawayo",
+        "nested": {
+         "b": 1,
+         "a": [
+          1,
+          2
+         ]
+        }
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "name": "now",
+    "content": "12:00"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "b",
+    "content": "sunny"
+   }
+  ],
+  "rendered": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Current weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"now\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Time and weather?<|end_message|><|message_model|><|content_thinking|>Two calls.<|end_message|><|message_model|><|content_text|>Checking both.<|end_message|><|message_model|>now<|content_invoke_tool_json|>{\"name\":\"now\",\"args\":{}}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Bulawayo\",\"nested\":{\"b\":1,\"a\":[1,2]}}}<|end_message|><|content_model_end_sampling|><|message_tool|>now<|content_text|>12:00<|end_message|><|message_tool|>get_weather<|content_text|>sunny<|end_message|>"
+ },
+ {
+  "name": "image_parts",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "What animal is this?"
+     }
+    ]
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>What animal is this?<|end_message|>"
+ },
+ {
+  "name": "text_parts",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Part one."
+     },
+     {
+      "type": "text",
+      "text": "Part two."
+     }
+    ]
+   }
+  ],
+  "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Part one.<|end_message|><|message_user|><|content_text|>Part two.<|end_message|>"
+ }
+]
