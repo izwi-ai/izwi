@@ -17,9 +17,11 @@ checkpoint with transformers itself and compares the logits, for whoever has
 that release.
 
 The tiny geometry covers every layer class: sliding and full attention, inside
-and outside the loop, a block boundary in the loop, both expert formats, a
-window shorter than the sequence, and thresholds low enough that the L2 clips,
-the log scale and the softcaps all act.
+and outside the loop, both expert formats, a window shorter than the sequence,
+and thresholds low enough that the L2 clips, the log scale and the softcaps all
+act. The loop spans two depth-residual blocks, so a loop pass leaves a block
+state behind and the message read has two states to weigh: with one block the
+read would return the same message whatever its query.
 
 Usage:
 
@@ -48,7 +50,7 @@ TEXT_CONFIG = {
     "model_max_length": 4096,
     "torch_dtype": "bfloat16",
     "hidden_size": 64,
-    "num_hidden_layers": 6,
+    "num_hidden_layers": 8,
     "vocab_size": 160,
     "num_attention_heads": 4,
     "num_key_value_heads": 2,
@@ -63,7 +65,7 @@ TEXT_CONFIG = {
     "use_value_norm_no_gamma": True,
     "qk_l2_clip_threshold": 2.0,
     "rel_l2_clip_threshold": 1.0,
-    "local_layer_ids": [0, 1, 3, 4],
+    "local_layer_ids": [0, 1, 3, 4, 6],
     "sconv_kernel_size": 4,
     "unpadded_vocab_size": 150,
     "final_logit_softcapping": 30.0,
@@ -81,7 +83,7 @@ TEXT_CONFIG = {
     "mlp_up_softcap": 25.0,
     "route_scale": 8.0,
     "use_gate_bias": True,
-    "loop_config": {"core_start": 2, "core_end": 4, "num_passes": 3, "gate_rank": 8, "is_varloop": False},
+    "loop_config": {"core_start": 2, "core_end": 6, "num_passes": 3, "gate_rank": 8, "is_varloop": False},
 }
 CONFIG = {
     "dtype": "bfloat16",
@@ -93,7 +95,7 @@ CONFIG = {
 }
 # Layers whose experts are stored as MXFP8; the rest are NVFP4 (as published:
 # the last layers carry no `_amax` tensors).
-MXFP8_LAYERS = {4, 5}
+MXFP8_LAYERS = {6, 7}
 NVFP4_DENOMINATOR = 2688.0  # 6 * 448, the value in the published checkpoint
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
@@ -404,6 +406,8 @@ class Reference:
         message_queries = torch.cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1)  # query, key, value, mlp
         for _ in range(1, self.passes):
             previous_states = block_states[len(pre_states) + 1 :]
+            if not previous_states:
+                raise SystemExit("the loop spans one block: message queries would not matter")
             previous_hidden = hidden
             hidden, block_states = pre_hidden, pre_states
             for index, layer in enumerate(range(self.loop_start, self.loop_end)):
