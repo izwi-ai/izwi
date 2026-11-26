@@ -88,8 +88,25 @@ fn max_error_does_not_hide_a_nan() {
 
 #[test]
 fn composed_trunk_matches_the_reference_logits() {
+    trunk_matches_the_reference(&Device::Cpu, 2e-4, 2e-3);
+}
+
+/// The same composed trunk on the Metal device (F32 activations; Candle's
+/// Metal kernels use fast math, so the tolerance is wider).
+#[cfg(feature = "metal")]
+#[test]
+fn composed_trunk_matches_the_reference_logits_on_metal() {
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "composed_trunk_matches_the_reference_logits_on_metal",
+    ) else {
+        return;
+    };
+    trunk_matches_the_reference(&device, 5e-3, 5e-2);
+}
+
+fn trunk_matches_the_reference(device: &Device, activation_tolerance: f32, logit_tolerance: f32) {
     let golden = golden();
-    let trunk = tiny_trunk(&Device::Cpu);
+    let trunk = tiny_trunk(device);
     let mut state = trunk.new_state().unwrap();
     let mut trace = Inkling2Trace::default();
     let hidden = trunk
@@ -108,13 +125,14 @@ fn composed_trunk_matches_the_reference_logits() {
         let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
         let error = max_error(&values(tensor), want);
         assert!(
-            error <= 2e-4 * scale,
+            error <= activation_tolerance * scale,
             "{name}: error {error} at scale {scale}"
         );
     }
     let logits = values(&trunk.logits(&hidden).unwrap());
     let error = max_error(&logits, &golden.logits);
-    assert!(error <= 2e-3, "logit error {error}");
+    eprintln!("{device:?}: logit error {error}");
+    assert!(error <= logit_tolerance, "logit error {error}");
     // The fixture is not degenerate: logits spread over several units.
     let spread = golden.logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     assert!(spread > 5.0);

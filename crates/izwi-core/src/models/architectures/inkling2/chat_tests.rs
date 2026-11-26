@@ -17,6 +17,10 @@ use crate::models::shared::attention::physical::{
 use crate::models::shared::chat::ChatGenerationConfig;
 
 fn tiny_model() -> Inkling2ChatModel {
+    tiny_model_on(DeviceProfile::cpu())
+}
+
+fn tiny_model_on(profile: DeviceProfile) -> Inkling2ChatModel {
     let mut config = tiny();
     // ASCII byte tokens, then the special tokens.
     let tokenizer = test_tokenizer_sized(128);
@@ -24,7 +28,7 @@ fn tiny_model() -> Inkling2ChatModel {
     let checkpoint = Inkling2Checkpoint::open(&fixture("inkling2_golden"), &tiny()).unwrap();
     Inkling2ChatModel::from_parts(
         ModelVariant::Inkling2Mini,
-        DeviceProfile::cpu(),
+        profile,
         config,
         tokenizer,
         &checkpoint,
@@ -33,11 +37,20 @@ fn tiny_model() -> Inkling2ChatModel {
 }
 
 fn caches(model: &Inkling2ChatModel, rows: usize) -> Vec<PhysicalPagedKvCache> {
+    caches_on(model, &Device::Cpu, DType::F32, rows)
+}
+
+fn caches_on(
+    model: &Inkling2ChatModel,
+    device: &Device,
+    dtype: DType,
+    rows: usize,
+) -> Vec<PhysicalPagedKvCache> {
     let config = model.config();
     let layers = (0..config.application_count() as u32).collect::<Vec<_>>();
     test_physical_caches_for_model_layers_on(
-        &Device::Cpu,
-        DType::F32,
+        device,
+        dtype,
         &layers,
         config.full.kv_heads,
         config.full.head_dim,
@@ -256,5 +269,56 @@ fn batch_rows_decode_as_they_do_alone() {
     }
     for (state, alone) in states.iter().zip(&alone) {
         assert_eq!(state.generated_ids_for_test(), alone);
+    }
+}
+
+/// On Metal. With keys and values stored in F32 the served path tracks the
+/// reference and greedy decode picks the CPU model's tokens. With F16 keys
+/// and values, as served, the logits stay close; the random fixture routes
+/// experts on near-ties, so its greedy tokens are not compared.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_prefill_and_decode_track_the_reference() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("metal_prefill_and_decode_track_the_reference")
+    else {
+        return;
+    };
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let golden = golden();
+    let model = tiny_model_on(profile).without_turn_end_for_test();
+    let vocab = model.config().unpadded_vocab;
+    let config = ChatGenerationConfig::default();
+    let prompt = &golden.tokens[..golden.prompt_tokens];
+    let row = prompt.len() - 1;
+    let want_logits = &golden.logits[row * vocab..(row + 1) * vocab];
+    for (dtype, tolerance) in [(DType::F32, 5e-2f32), (DType::F16, 0.3)] {
+        let mut state = model
+            .begin_resumable_prefill_managed(
+                prompt,
+                8,
+                &config,
+                caches_on(&model, &device, dtype, 1).remove(0),
+            )
+            .unwrap();
+        model
+            .continue_resumable_prefill(&mut state, prompt, 0, 9)
+            .unwrap();
+        model
+            .continue_resumable_prefill(&mut state, prompt, 9, prompt.len())
+            .unwrap();
+        let error = max_error(&values(state_logits(&state)), want_logits);
+        eprintln!("Metal {dtype:?}-key prefill logit error {error}");
+        assert!(error <= tolerance, "{dtype:?} keys: logit error {error}");
+        let got = generate(&model, &mut state, 8);
+        assert_eq!(got.len(), 8);
+        if dtype == DType::F32 {
+            assert_eq!(got, reference_greedy(prompt, 8));
+        }
     }
 }

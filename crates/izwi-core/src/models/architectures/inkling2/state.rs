@@ -201,9 +201,13 @@ impl Inkling2Context for Inkling2PagedContext<'_> {
                 self.cache.context_len()
             )));
         }
+        // The arena stores keys and values in its own dtype (F16 on Metal,
+        // BF16 on CUDA); activations are F32.
+        let storage = self.cache.arena().config().dtype;
+        let (keys, values) = (keys.to_dtype(storage)?, values.to_dtype(storage)?);
         let (keys, values, oldest) =
             self.cache
-                .write_and_gather(application, self.prepared, keys, values, window)?;
+                .write_and_gather(application, self.prepared, &keys, &values, window)?;
         Ok((
             keys.to_dtype(DType::F32)?,
             values.to_dtype(DType::F32)?,

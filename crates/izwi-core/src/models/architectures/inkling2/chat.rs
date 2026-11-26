@@ -468,7 +468,11 @@ impl Inkling2ChatModel {
         let hidden = match hidden {
             Ok(hidden) => hidden,
             Err(error) => {
-                cache.abort_prepared(prepared)?;
+                // The trunk's error is the one to report; an abort that
+                // also fails must not replace it.
+                if let Err(abort) = cache.abort_prepared(prepared) {
+                    tracing::warn!("Inkling 2: aborting a failed span also failed: {abort}");
+                }
                 return Err(error);
             }
         };
