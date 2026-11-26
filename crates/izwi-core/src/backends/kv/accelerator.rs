@@ -2744,6 +2744,42 @@ impl KvArena for CandleAcceleratorKvArena {
         Ok(output)
     }
 
+    fn gather_context(
+        &self,
+        binding: KvLayerBinding,
+        table: &crate::kv::KvSequenceBlockTable,
+    ) -> Result<(Tensor, Tensor)> {
+        probe_device_op("kv.gather_context");
+        let page_tokens = self.config.page_tokens as usize;
+        let offset = table.first_page_offset as usize;
+        let context = table.context_len as usize;
+        if context == 0
+            || offset >= page_tokens
+            || table.blocks.len() != (offset + context).div_ceil(page_tokens)
+        {
+            return Err(Error::InferenceError(
+                "accelerator context gather received an inconsistent block table".into(),
+            ));
+        }
+        let pages = table
+            .blocks
+            .iter()
+            .map(|block| self.validate_block(*block).map(|page| page as u32))
+            .collect::<Result<Vec<_>>>()?;
+        let _guard = self.mutation_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+        })?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
+        let layer = self.layer_from(&layers, binding)?;
+        Ok((
+            super::gather_pages(&layer.keys, &pages, offset, context)?,
+            super::gather_pages(&layer.values, &pages, offset, context)?,
+        ))
+    }
+
     fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {
         self.paged_decode_partitioned(
             binding,

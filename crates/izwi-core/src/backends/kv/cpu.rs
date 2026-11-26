@@ -10,7 +10,10 @@ use rayon::prelude::*;
 
 use crate::backends::{probe_device_op, BackendKind};
 use crate::error::Error;
-use crate::kv::{CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding, KvSlotRef};
+use crate::kv::{
+    CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding, KvSequenceBlockTable,
+    KvSlotRef,
+};
 use crate::Result;
 
 use super::{
@@ -400,6 +403,36 @@ impl KvArena for CpuKvArena {
             binding,
             args.slots.logical_slots(),
             ready_fence(),
+        ))
+    }
+
+    fn gather_context(
+        &self,
+        binding: KvLayerBinding,
+        table: &KvSequenceBlockTable,
+    ) -> Result<(Tensor, Tensor)> {
+        probe_device_op("kv.gather_context");
+        let layer = self.layer(binding)?;
+        let tables = self.lower_decode_tables(&KvDecodeBatchMetadata {
+            sequences: vec![table.clone()],
+        })?;
+        let row = &tables.rows[0];
+        let pages = tables.pages[row.page_start..row.page_start + row.page_len]
+            .iter()
+            .map(|page| *page as u32)
+            .collect::<Vec<_>>();
+        let _guard = self
+            .mutation_lock
+            .read()
+            .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
+        Ok((
+            super::gather_pages(&layer.keys, &pages, row.first_page_offset, row.context_len)?,
+            super::gather_pages(
+                &layer.values,
+                &pages,
+                row.first_page_offset,
+                row.context_len,
+            )?,
         ))
     }
 

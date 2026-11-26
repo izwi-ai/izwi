@@ -21,7 +21,8 @@ use candle_core::{DType, DeviceLocation, Tensor};
 
 use crate::backends::BackendKind;
 use crate::kv::{
-    CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvGroupId, KvLayerBinding, KvSlotRef,
+    CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvGroupId, KvLayerBinding,
+    KvSequenceBlockTable, KvSlotRef,
 };
 use crate::{Error, Result};
 
@@ -338,6 +339,22 @@ impl KvWriteCompletion {
     pub(crate) fn wait(&self) -> Result<()> {
         self.fence.wait()
     }
+}
+
+/// Pages `pages` of `storage` (`[pages, page_tokens, kv_heads, head_dim]`)
+/// laid end to end, then tokens `offset..offset + len`.
+pub(super) fn gather_pages(
+    storage: &Tensor,
+    pages: &[u32],
+    offset: usize,
+    len: usize,
+) -> Result<Tensor> {
+    let (_, page_tokens, kv_heads, head_dim) = storage.dims4()?;
+    let index = Tensor::from_vec(pages.to_vec(), pages.len(), storage.device())?;
+    Ok(storage
+        .index_select(&index, 0)?
+        .reshape((pages.len() * page_tokens, kv_heads, head_dim))?
+        .narrow(0, offset, len)?)
 }
 
 /// Submit an arena operation ordered after one physical write without forcing
@@ -758,6 +775,24 @@ pub trait KvArena: Send + Sync {
     ) -> Result<Vec<KvWriteCompletion>> {
         Err(Error::InferenceError(format!(
             "{:?} KV arenas do not take graph writes",
+            self.backend_kind()
+        )))
+    }
+    /// The stored keys and values of one sequence's visible context as dense
+    /// tensors, `[context_len, kv_heads, head_dim]` each, oldest token first,
+    /// in the arena's storage dtype.
+    ///
+    /// For attention forms the paged kernels do not implement (an additive
+    /// per-query bias, a sink logit): the model composes its own attention
+    /// over the gathered context. The gather is ordered after every write
+    /// submitted through this arena before it.
+    fn gather_context(
+        &self,
+        _layer: KvLayerBinding,
+        _table: &KvSequenceBlockTable,
+    ) -> Result<(Tensor, Tensor)> {
+        Err(Error::InferenceError(format!(
+            "{:?} KV arenas do not gather a context",
             self.backend_kind()
         )))
     }

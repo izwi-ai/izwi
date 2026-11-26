@@ -928,6 +928,79 @@ impl PhysicalPagedKvCache {
         Ok(output)
     }
 
+    /// Write one layer's projected K/V into its prepared slots and return the
+    /// layer's context as dense tensors, for a model that composes its own
+    /// attention ([`KvArena::gather_context`]).
+    ///
+    /// Returns `(keys, values, oldest)`: `[context, kv_heads, head_dim]` each,
+    /// in the arena's storage dtype, ending with the tokens just written;
+    /// `oldest` is the sequence position of the first row. With
+    /// `window_tokens`, the context starts where the first written token's
+    /// window does, so later tokens of a multi-token write see extra rows the
+    /// caller must mask.
+    pub(crate) fn write_and_gather(
+        &self,
+        layer_idx: usize,
+        prepared: &mut PreparedPhysicalPagedStep,
+        keys: &Tensor,
+        values: &Tensor,
+        window_tokens: Option<usize>,
+    ) -> Result<(Tensor, Tensor, usize)> {
+        let token_count = keys.dim(0)?;
+        if token_count == 0 || values.dim(0)? != token_count {
+            return Err(Error::InvalidInput(
+                "physical paged gather requires matching non-empty token dimensions".into(),
+            ));
+        }
+        if prepared.arena != self.arena.id()
+            || prepared.logical_generation != self.logical_generation
+            || prepared.start_pos != self.context_len
+            || prepared.token_count != token_count
+            || prepared.slots.len() != token_count
+        {
+            return Err(Error::InvalidInput(
+                "physical paged gather received a stale or incompatible prepared step".into(),
+            ));
+        }
+        let end_pos = prepared.start_pos + token_count;
+        let table = match window_tokens {
+            Some(0) => {
+                return Err(Error::InvalidInput(
+                    "physical paged sliding window cannot be zero".into(),
+                ))
+            }
+            Some(window) => self.sequence_table_from(
+                (prepared.start_pos + 1)
+                    .saturating_sub(window)
+                    .max(self.window_start),
+                end_pos,
+            )?,
+            None => self.sequence_table_from(self.window_start, end_pos)?,
+        };
+        let oldest = end_pos - table.context_len as usize;
+        let binding = self.layer_binding(layer_idx)?;
+        let completion = self.arena.write_slots(
+            binding,
+            KvWriteArgs {
+                keys,
+                values,
+                slots: prepared.slots.as_ref(),
+            },
+        )?;
+        if completion.arena() != self.arena.id()
+            || completion.layer() != binding
+            || completion.slots() != token_count
+        {
+            return Err(Error::InferenceError(
+                "physical paged write returned a mismatched backend completion".into(),
+            ));
+        }
+        let ((keys, values), completion) =
+            submit_ordered_after_write(completion, || self.arena.gather_context(binding, &table))?;
+        prepared.completions.collect(completion)?;
+        Ok((keys, values, oldest))
+    }
+
     /// Decode one token whose rotated key and value a fused kernel writes
     /// straight into this layer's paged cache, then attend against the same
     /// pages.
@@ -1981,6 +2054,90 @@ mod tests {
                 .is_err(),
             "room for whole pages only"
         );
+    }
+
+    /// What a model that composes its own attention reads back equals what
+    /// it wrote, across page boundaries and uneven spans, with and without a
+    /// window.
+    fn gathered_context_is_what_was_written(device: &candle_core::Device) {
+        let (kv_heads, dim, capacity) = (2usize, 4usize, 64usize);
+        let mut caches = test_physical_caches_on(device, 2, kv_heads, dim, capacity, 1);
+        let mut cache = caches.remove(0);
+        let page_tokens = cache.arena().config().page_tokens as usize;
+        let noise = |tokens: usize, seed: u32| {
+            let mut state = seed;
+            let values = (0..tokens * kv_heads * dim)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+                })
+                .collect::<Vec<_>>();
+            (
+                Tensor::from_vec(values.clone(), (tokens, kv_heads, dim), device).unwrap(),
+                values,
+            )
+        };
+        let host = |tensor: &Tensor| {
+            tensor
+                .to_dtype(candle_core::DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let row = kv_heads * dim;
+        let window = 5usize;
+        let (mut all_keys, mut all_values) = (Vec::new(), Vec::new());
+        let mut position = 0usize;
+        // Spans that cross a page boundary mid-span.
+        for (index, span) in [3usize, 1, page_tokens + 2, 1, 4, 1]
+            .into_iter()
+            .enumerate()
+        {
+            let (keys, key_values) = noise(span, 17 + index as u32);
+            let (values, value_values) = noise(span, 91 + index as u32);
+            all_keys.extend(key_values);
+            all_values.extend(value_values);
+            let mut step = cache.prepare_append(position, span).unwrap();
+            // Layer 0 reads everything; layer 1 a window.
+            let (got_keys, got_values, oldest) = cache
+                .write_and_gather(0, &mut step, &keys, &values, None)
+                .unwrap();
+            assert_eq!(oldest, 0);
+            assert_eq!(got_keys.dims(), [position + span, kv_heads, dim]);
+            assert_eq!(host(&got_keys), all_keys);
+            assert_eq!(host(&got_values), all_values);
+            let (got_keys, got_values, oldest) = cache
+                .write_and_gather(1, &mut step, &values, &keys, Some(window))
+                .unwrap();
+            // From the first written token's window to the end of the span.
+            assert_eq!(oldest, (position + 1).saturating_sub(window));
+            assert_eq!(host(&got_keys), all_values[oldest * row..]);
+            assert_eq!(host(&got_values), all_keys[oldest * row..]);
+            cache.commit_prepared(step).unwrap();
+            position += span;
+        }
+        // The long span crossed at least one page boundary.
+        assert!(position > page_tokens + 4);
+    }
+
+    #[test]
+    fn cpu_gathered_context_is_what_was_written() {
+        gathered_context_is_what_was_written(&candle_core::Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_gathered_context_is_what_was_written() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_gathered_context_is_what_was_written",
+        ) else {
+            return;
+        };
+        gathered_context_is_what_was_written(&device);
     }
 
     #[test]
