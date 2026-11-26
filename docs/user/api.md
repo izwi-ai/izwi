@@ -350,6 +350,9 @@ Tool behavior:
 - Qwen3.5, Qwen3.6 and Qwen3.8 use Qwen's XML tool format (`<tool_call>`,
   `<function=…>`, `<parameter=…>`); consecutive tool results share one user
   turn, as their templates write them.
+- Inkling 2 declares tools in a system message and writes each call as its
+  own JSON message; `tool` messages become its native tool turns, named after
+  the call they answer. The API shape is the same as for the other models.
 - LFM2.5 models use their own format: tools are listed in the system turn,
   `tool` messages become native tool turns, and calls the model writes as
   `<|tool_call_start|>[name(arg="v")]<|tool_call_end|>` are returned as

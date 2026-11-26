@@ -202,7 +202,7 @@ model's memory need. The catalog includes:
 | Speech recognition | Parakeet TDT 0.6B v3, Whisper Large v3 Turbo, Qwen3-ASR (0.6B, 1.7B), Rumble 2 Flash, Nemotron 3.5 ASR Streaming 0.6B, Voxtral Mini 4B Realtime, Granite Speech 4.1 2B and 4.1 2B Plus (speaker-attributed), Granite Speech 5.0 2B (translation, keyword biasing), Nemotron 3.5 Transcribe 30B-A4B (translation, keywords, speaker labels, word timestamps), VibeVoice ASR |
 | Voice chat (speech in, speech out) | LFM2.5 Audio 1.5B, LFM3 Audio 2B (with tools); both also do TTS and speech recognition |
 | Diarization and alignment | Streaming Sortformer 4spk v2.1, Nemotron 3 Diarization (up to 8 speakers), Qwen3-ForcedAligner 0.6B; Nemotron 3.5 Transcribe also labels speakers on its own |
-| Chat | Qwen3.5 (0.8B, 2B, 4B, 9B; image and video input), Qwen3.6 35B-A3B FP8, Qwen3.8 27B FP8, LFM2.5 1.2B (Instruct, Thinking), LFM3 1.7B |
+| Chat | Qwen3.5 (0.8B, 2B, 4B, 9B; image and video input), Qwen3.6 35B-A3B FP8, Qwen3.8 27B FP8, Inkling 2 Mini, LFM2.5 1.2B (Instruct, Thinking), LFM3 1.7B |
 
 Model weights and bundled assets have their own licenses. Check the
 [Models Guide](https://izwiai.com/docs/models) before redistributing them or

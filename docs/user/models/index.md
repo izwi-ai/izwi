@@ -223,8 +223,16 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | Qwen3.5 GGUF | `Qwen3.5-0.8B`, `Qwen3.5-2B`, `Qwen3.5-4B`, `Qwen3.5-9B` |
 | Qwen3.6 FP8 | `Qwen3.6-35B-A3B-FP8` (text chat) |
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text chat; 28.74 GiB checkpoint payload) |
+| Inkling 2 | `Inkling-2-Mini` (text chat; 18.21 GiB download) |
 | LFM2.5 text | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
 | LFM3 text | `LFM3-1.7B-GGUF` (QAD Q4_0, default), `LFM3-1.7B-Q8_0-GGUF` |
+
+`Inkling-2-Mini` is Thinking Machines' looped sparse-expert model
+(`thinkingmachines/Inkling-2-Mini`, Apache-2.0). Its expert weights are published
+in 4-bit (NVFP4) and 8-bit (MXFP8) form and stay that way in memory: a loaded
+model holds about 14.6 GiB of experts read from the downloaded file and 6 GiB of
+other weights, so plan for 24 GB of memory. It answers in text; image input is
+not available yet. A conversation can hold up to 32,768 tokens.
 
 `Qwen3.8-27B-FP8` uses the separate `Qwen38Chat` architecture/model family.
 Qwen3.5 compatibility or backend evidence is not applied to it implicitly.
