@@ -621,10 +621,7 @@ impl Inkling2ChatModel {
             pending_token: None,
             generated_ids: Vec::new(),
             sampler: ChatSampler::new(config.clone(), prompt_ids),
-            reply: Inkling2Reply::new(
-                self.reply_tokens.clone(),
-                forced.as_ref().map(|(_, json)| json.as_str()),
-            ),
+            reply: Inkling2Reply::new(self.reply_tokens.clone(), forced.as_ref()),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             position: 0,

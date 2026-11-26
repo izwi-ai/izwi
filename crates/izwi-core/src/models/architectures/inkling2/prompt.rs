@@ -114,7 +114,8 @@ pub fn special_id(tokenizer: &Tokenizer, token: &str) -> Result<u32> {
 
 /// The effort number a request asks for. Thinking switched off is effort 0.
 pub fn thinking_effort(request: &ChatRequestConfig) -> f64 {
-    if request.enable_thinking == Some(false) {
+    // A turn that must be a tool call does not think first.
+    if request.enable_thinking == Some(false) || !request.response_prefix.is_empty() {
         return 0.0;
     }
     match request.reasoning_effort {
@@ -300,10 +301,21 @@ pub fn parse_assistant_text(text: &str) -> PastAssistantTurn {
     turn
 }
 
-/// A forced tool call (`tool_choice`): the function it names and the call
-/// JSON the prompt opens for the model to continue. The server writes the
-/// request as the opening of a Hermes call, `<tool_call>\n{"name": "f", ...`.
-pub fn forced_call(request: &ChatRequestConfig) -> Result<Option<(String, String)>> {
+/// A tool call the answer must make (`tool_choice`). The server states it
+/// as the opening of a Hermes call it has already written for the client:
+/// `<tool_call>\n{"name": "f", "arguments": ` for a named function, or
+/// `<tool_call>\n{"name": "` when any function will do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForcedCall {
+    /// The prompt opens the call message; `json` is the call JSON it writes
+    /// for the model to continue.
+    Named { name: String, json: String },
+    /// The model must call something; the prompt cannot open a call without
+    /// its name, so only the reply is held to it.
+    Any,
+}
+
+pub fn forced_call(request: &ChatRequestConfig) -> Result<Option<ForcedCall>> {
     let prefix = request.response_prefix.as_str();
     if prefix.is_empty() {
         return Ok(None);
@@ -314,13 +326,17 @@ pub fn forced_call(request: &ChatRequestConfig) -> Result<Option<(String, String
         let after = after.strip_prefix('"')?;
         let end = after.find('"')?;
         Some(after[..end].to_string())
-    })()
-    .ok_or_else(|| Error::InvalidInput("the forced tool call names no function".to_string()))?;
-    let json = format!(
-        "{{\"name\":{},\"args\":",
-        compact(&Value::String(name.clone()))?
-    );
-    Ok(Some((name, json)))
+    })();
+    Ok(Some(match name {
+        Some(name) => ForcedCall::Named {
+            json: format!(
+                "{{\"name\":{},\"args\":",
+                compact(&Value::String(name.clone()))?
+            ),
+            name,
+        },
+        None => ForcedCall::Any,
+    }))
 }
 
 /// Renders a conversation.
@@ -394,9 +410,9 @@ pub fn render_prompt(
     if !effort_written {
         prompt.message(MESSAGE_SYSTEM, "", CONTENT_TEXT, &effort);
     }
-    // A forced tool call: open the call for the model, which continues with
-    // the arguments.
-    if let Some((name, json)) = forced_call(request)? {
+    // A forced call to a named function: open the call for the model, which
+    // continues with the arguments.
+    if let Some(ForcedCall::Named { name, json }) = forced_call(request)? {
         prompt.special(MESSAGE_MODEL);
         prompt.text(name);
         prompt.special(CONTENT_TOOL_JSON);
@@ -545,6 +561,16 @@ mod tests {
         assert!(rendered.ends_with(
             "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":"
         ));
+        assert!(rendered.contains("Thinking effort level: 0<|end_message|>"));
+        // Any function: the prompt cannot open the call, so it ends at the
+        // conversation.
+        let request = ChatRequestConfig {
+            response_prefix: "<tool_call>\n{\"name\": \"".to_string(),
+            ..ChatRequestConfig::default()
+        };
+        assert_eq!(forced_call(&request).unwrap(), Some(ForcedCall::Any));
+        let rendered = render_prompt(&messages, &request).unwrap().rendered();
+        assert!(rendered.ends_with("<|content_text|>Weather?<|end_message|>"));
     }
 
     #[test]

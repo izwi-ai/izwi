@@ -19,7 +19,7 @@
 use serde_json::Value;
 
 use super::prompt::{
-    special_id, CONTENT_IMAGE, CONTENT_TEXT, CONTENT_THINKING, CONTENT_TOOL_ERROR,
+    special_id, ForcedCall, CONTENT_IMAGE, CONTENT_TEXT, CONTENT_THINKING, CONTENT_TOOL_ERROR,
     CONTENT_TOOL_JSON, CONTENT_TOOL_TEXT, CONTENT_XML, END_MESSAGE, END_SAMPLING, MESSAGE_MODEL,
     MESSAGE_SYSTEM, MESSAGE_TOOL, MESSAGE_USER, THINK_CLOSE, THINK_OPEN, TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
@@ -91,22 +91,37 @@ pub struct Inkling2Reply {
     /// Everything emitted so far.
     text: String,
     finished: bool,
+    /// What the first tool call still owes the opening the server wrote.
+    owed: Option<Owed>,
+}
+
+/// The part of a forced call the server's own opening leaves to the reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    /// The server wrote `<tool_call>\n{"name": "f", "arguments": `.
+    Arguments,
+    /// The server wrote `<tool_call>\n{"name": "`. Until the call arrives,
+    /// nothing else is shown: text there would land inside the call.
+    Name,
 }
 
 impl Inkling2Reply {
-    /// A reply that starts at the model's own header. `forced_call` is the
-    /// JSON the prompt already wrote for a forced tool call, if any: the
-    /// reply continues inside that call.
-    pub fn new(tokens: Inkling2ReplyTokens, forced_call: Option<&str>) -> Self {
+    /// A reply that starts at the model's own header, or inside the call a
+    /// forced tool choice opened.
+    pub fn new(tokens: Inkling2ReplyTokens, forced: Option<&ForcedCall>) -> Self {
         Self {
             tokens,
-            section: match forced_call {
-                Some(prefix) => Section::ToolCall(prefix.to_string()),
-                None => Section::Idle,
+            section: match forced {
+                Some(ForcedCall::Named { json, .. }) => Section::ToolCall(json.clone()),
+                _ => Section::Idle,
             },
             decoder: IncrementalDecoder::new(false),
             text: String::new(),
             finished: false,
+            owed: forced.map(|forced| match forced {
+                ForcedCall::Named { .. } => Owed::Arguments,
+                ForcedCall::Any => Owed::Name,
+            }),
         }
     }
 
@@ -126,18 +141,22 @@ impl Inkling2Reply {
     fn close_message(&mut self, tokenizer: &Tokenizer, out: &mut String) -> Result<()> {
         let tail = tokenizer.finish_incremental_decode(&mut self.decoder)?;
         self.decoder = IncrementalDecoder::new(false);
+        let held = self.owed == Some(Owed::Name);
         match std::mem::replace(&mut self.section, Section::Idle) {
-            Section::Thinking => {
+            Section::Thinking if !held => {
                 self.emit(&tail, out);
                 self.emit(THINK_CLOSE, out);
             }
-            Section::Text => self.emit(&tail, out),
+            Section::Text if !held => self.emit(&tail, out),
             Section::ToolCall(mut json) => {
                 json.push_str(&tail);
-                let block = tool_call_block(&json);
+                let block = match self.owed.take() {
+                    Some(owed) => forced_call_rest(&json, owed),
+                    None => tool_call_block(&json),
+                };
                 self.emit(&block, out);
             }
-            Section::Idle | Section::Header => {}
+            Section::Thinking | Section::Text | Section::Idle | Section::Header => {}
         }
         Ok(())
     }
@@ -161,7 +180,9 @@ impl Inkling2Reply {
         } else if token == t.thinking {
             self.close_message(tokenizer, &mut out)?;
             self.section = Section::Thinking;
-            self.emit(THINK_OPEN, &mut out);
+            if self.owed != Some(Owed::Name) {
+                self.emit(THINK_OPEN, &mut out);
+            }
         } else if token == t.text || t.plain.contains(&token) {
             self.close_message(tokenizer, &mut out)?;
             self.section = Section::Text;
@@ -175,7 +196,9 @@ impl Inkling2Reply {
                 Section::Header | Section::Idle => {}
                 Section::Thinking | Section::Text => {
                     let delta = tokenizer.decode_incrementally(&mut self.decoder, token)?;
-                    self.emit(&delta, &mut out);
+                    if self.owed != Some(Owed::Name) {
+                        self.emit(&delta, &mut out);
+                    }
                 }
                 Section::ToolCall(_) => {
                     let delta = tokenizer.decode_incrementally(&mut self.decoder, token)?;
@@ -199,26 +222,44 @@ impl Inkling2Reply {
     }
 }
 
+/// A native call body's name and arguments, when it is the expected JSON.
+fn native_call(native: &str) -> Option<(String, String)> {
+    let value = serde_json::from_str::<Value>(native.trim()).ok()?;
+    let name = value.get("name")?.as_str()?.to_string();
+    let arguments = match value.get("args").or_else(|| value.get("arguments")) {
+        Some(Value::Object(map)) => Value::Object(map.clone()),
+        None | Some(Value::Null) => Value::Object(serde_json::Map::new()),
+        Some(_) => return None,
+    };
+    Some((name, serde_json::to_string(&arguments).ok()?))
+}
+
 /// A native call body as a Hermes `<tool_call>` block. A body that is not
 /// the expected JSON is passed through unchanged inside the block, for the
 /// server's parser to report.
 pub fn tool_call_block(native: &str) -> String {
-    let body = serde_json::from_str::<Value>(native.trim())
-        .ok()
-        .and_then(|value| {
-            let name = value.get("name")?.as_str()?.to_string();
-            let arguments = match value.get("args").or_else(|| value.get("arguments")) {
-                Some(Value::Object(map)) => Value::Object(map.clone()),
-                None | Some(Value::Null) => Value::Object(serde_json::Map::new()),
-                Some(_) => return None,
-            };
-            let mut call = serde_json::Map::new();
-            call.insert("name".into(), Value::String(name));
-            call.insert("arguments".into(), arguments);
-            serde_json::to_string(&Value::Object(call)).ok()
-        })
-        .unwrap_or_else(|| native.trim().to_string());
+    let body = match native_call(native) {
+        Some((name, arguments)) => format!(
+            "{{\"name\":{},\"arguments\":{arguments}}}",
+            Value::String(name)
+        ),
+        None => native.trim().to_string(),
+    };
     format!("{TOOL_CALL_OPEN}\n{body}\n{TOOL_CALL_CLOSE}")
+}
+
+/// The rest of a forced call after the opening the server already wrote.
+fn forced_call_rest(native: &str, owed: Owed) -> String {
+    let rest = match (native_call(native), owed) {
+        (Some((_, arguments)), Owed::Arguments) => format!("{arguments}}}"),
+        (Some((name, arguments)), Owed::Name) => {
+            // The opening ends inside the name's string.
+            let quoted = Value::String(name).to_string();
+            format!("{}, \"arguments\": {arguments}}}", &quoted[1..])
+        }
+        (None, _) => native.trim().to_string(),
+    };
+    format!("{rest}\n{TOOL_CALL_CLOSE}")
 }
 
 #[cfg(test)]
@@ -385,13 +426,49 @@ pub(crate) mod tests {
     fn a_forced_call_continues_the_prompt() {
         let tokenizer = test_tokenizer();
         let tokens = Inkling2ReplyTokens::load(&tokenizer).unwrap();
-        let mut reply = Inkling2Reply::new(tokens, Some("{\"name\":\"f\",\"args\":"));
+        let forced = ForcedCall::Named {
+            name: "f".into(),
+            json: "{\"name\":\"f\",\"args\":".into(),
+        };
+        let mut reply = Inkling2Reply::new(tokens.clone(), Some(&forced));
         for id in ids(&tokenizer, &["{\"k\":1}}", END_MESSAGE, END_SAMPLING]) {
+            reply.push(&tokenizer, id).unwrap();
+        }
+        // The server already wrote `<tool_call>\n{"name": "f", "arguments": `.
+        assert_eq!(reply.text(), "{\"k\":1}}\n</tool_call>");
+
+        // Any function: text before the call is not shown, the call continues
+        // the server's `<tool_call>\n{"name": "`, and later calls are whole.
+        let mut reply = Inkling2Reply::new(tokens, Some(&ForcedCall::Any));
+        for id in ids(
+            &tokenizer,
+            &[
+                MESSAGE_MODEL,
+                CONTENT_THINKING,
+                "hm",
+                END_MESSAGE,
+                MESSAGE_MODEL,
+                CONTENT_TEXT,
+                "Sure",
+                END_MESSAGE,
+                MESSAGE_MODEL,
+                "g",
+                CONTENT_TOOL_JSON,
+                "{\"name\":\"g\",\"args\":{}}",
+                END_MESSAGE,
+                MESSAGE_MODEL,
+                "h",
+                CONTENT_TOOL_JSON,
+                "{\"name\":\"h\",\"args\":{\"a\":2}}",
+                END_MESSAGE,
+                END_SAMPLING,
+            ],
+        ) {
             reply.push(&tokenizer, id).unwrap();
         }
         assert_eq!(
             reply.text(),
-            "<tool_call>\n{\"name\":\"f\",\"arguments\":{\"k\":1}}\n</tool_call>"
+            "g\", \"arguments\": {}}\n</tool_call><tool_call>\n{\"name\":\"h\",\"arguments\":{\"a\":2}}\n</tool_call>"
         );
     }
 
