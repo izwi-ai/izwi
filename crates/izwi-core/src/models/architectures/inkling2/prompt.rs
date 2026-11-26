@@ -300,14 +300,27 @@ pub fn parse_assistant_text(text: &str) -> PastAssistantTurn {
     turn
 }
 
-/// The function a forced tool call names, read from the response prefix the
-/// server writes for `tool_choice` (`<tool_call>\n{"name": "f", ...`).
-fn forced_tool_name(prefix: &str) -> Option<String> {
-    let after = prefix.split_once("\"name\"")?.1;
-    let after = after.trim_start().strip_prefix(':')?.trim_start();
-    let after = after.strip_prefix('"')?;
-    let end = after.find('"')?;
-    Some(after[..end].to_string())
+/// A forced tool call (`tool_choice`): the function it names and the call
+/// JSON the prompt opens for the model to continue. The server writes the
+/// request as the opening of a Hermes call, `<tool_call>\n{"name": "f", ...`.
+pub fn forced_call(request: &ChatRequestConfig) -> Result<Option<(String, String)>> {
+    let prefix = request.response_prefix.as_str();
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+    let name = (|| {
+        let after = prefix.split_once("\"name\"")?.1;
+        let after = after.trim_start().strip_prefix(':')?.trim_start();
+        let after = after.strip_prefix('"')?;
+        let end = after.find('"')?;
+        Some(after[..end].to_string())
+    })()
+    .ok_or_else(|| Error::InvalidInput("the forced tool call names no function".to_string()))?;
+    let json = format!(
+        "{{\"name\":{},\"args\":",
+        compact(&Value::String(name.clone()))?
+    );
+    Ok(Some((name, json)))
 }
 
 /// Renders a conversation.
@@ -383,17 +396,11 @@ pub fn render_prompt(
     }
     // A forced tool call: open the call for the model, which continues with
     // the arguments.
-    if !request.response_prefix.is_empty() {
-        let name = forced_tool_name(&request.response_prefix).ok_or_else(|| {
-            Error::InvalidInput("the forced tool call names no function".to_string())
-        })?;
+    if let Some((name, json)) = forced_call(request)? {
         prompt.special(MESSAGE_MODEL);
-        prompt.text(name.clone());
+        prompt.text(name);
         prompt.special(CONTENT_TOOL_JSON);
-        prompt.text(format!(
-            "{{\"name\":{},\"args\":",
-            compact(&Value::String(name))?
-        ));
+        prompt.text(json);
     }
     Ok(prompt)
 }

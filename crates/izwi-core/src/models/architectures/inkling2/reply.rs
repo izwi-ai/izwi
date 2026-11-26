@@ -228,6 +228,12 @@ pub(crate) mod tests {
     /// A byte-level test tokenizer: ids 0..=255 are bytes, then the special
     /// tokens.
     pub(crate) fn test_tokenizer() -> Tokenizer {
+        test_tokenizer_sized(256)
+    }
+
+    /// [`test_tokenizer`] with only the first `bytes` byte tokens (128:
+    /// ASCII), for models with a small vocabulary.
+    pub(crate) fn test_tokenizer_sized(bytes: u32) -> Tokenizer {
         let specials = [
             MESSAGE_USER,
             MESSAGE_MODEL,
@@ -244,7 +250,7 @@ pub(crate) mod tests {
             END_SAMPLING,
         ];
         let mut vocab = serde_json::Map::new();
-        for byte in 0u32..256 {
+        for byte in 0u32..bytes {
             // The ByteLevel alphabet: each byte as one character.
             let ch = byte_level_char(byte as u8);
             vocab.insert(ch.to_string(), Value::from(byte));
@@ -254,13 +260,13 @@ pub(crate) mod tests {
             .enumerate()
             .map(|(index, token)| {
                 serde_json::json!({
-                    "id": 256 + index, "content": token, "single_word": false, "lstrip": false,
+                    "id": bytes as usize + index, "content": token, "single_word": false, "lstrip": false,
                     "rstrip": false, "normalized": false, "special": true
                 })
             })
             .collect::<Vec<_>>();
         for (index, token) in specials.iter().enumerate() {
-            vocab.insert(token.to_string(), Value::from(256 + index as u32));
+            vocab.insert(token.to_string(), Value::from(bytes + index as u32));
         }
         let json = serde_json::json!({
             "version": "1.0",

@@ -3360,6 +3360,18 @@ impl ModelExecutor for NativeExecutor {
                 _ => "f32",
             }
             .into();
+        } else if variant.family() == crate::catalog::ModelFamily::Inkling2Chat {
+            // Inkling 2 activations are F32 on every backend; its paged KV is
+            // stored as `inkling2::state::kv_dtype` picks.
+            profile.compute_dtype = "f32".into();
+            profile.kv_dtype =
+                match crate::models::architectures::inkling2::state::kv_dtype(self.config.backend)
+                {
+                    crate::kv::v2::StateDType::F16 => "f16",
+                    crate::kv::v2::StateDType::Bf16 => "bf16",
+                    _ => "f32",
+                }
+                .into();
         } else {
             profile.compute_dtype = self.config.dtype.clone();
             profile.kv_dtype = self.config.kv_cache_dtype.clone();
@@ -6125,6 +6137,7 @@ mod tests {
         for family in [
             ModelFamily::Qwen3Chat,
             ModelFamily::Gemma3Chat,
+            ModelFamily::Inkling2Chat,
             ModelFamily::NemotronTranscribeAsr,
             ModelFamily::Lfm25Audio,
             ModelFamily::Lfm3Audio,

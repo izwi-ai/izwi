@@ -14,23 +14,36 @@
 //! * `trunk`: the text trunk composed from plain tensor operations, the
 //!   reference every faster path is checked against;
 //! * `prompt`: the chat prompt, matching the published template;
-//! * `reply`: the model's reply messages as the text the server reads.
+//! * `reply`: the model's reply messages as the text the server reads;
+//! * `memory`: what a loaded model holds, from the checkpoint header;
+//! * `state`: the engine-owned state contract (paged keys and values, a ring
+//!   of convolution inputs);
+//! * `chat`: the served chat model.
 //!
 //! Nothing here imports another family: the family may use `kernels`,
 //! `models::shared`, `kv`, `backends` and `engine`, and builds its own state
 //! contract. The isolation test at the bottom of this file holds that line.
 
+pub mod chat;
 pub mod checkpoint;
 pub mod config;
 pub mod experts;
+pub mod memory;
 pub mod prompt;
 pub mod quant;
 pub mod reply;
+pub(crate) mod state;
 pub mod trunk;
 
 #[cfg(test)]
+mod chat_tests;
+#[cfg(test)]
 mod tests;
 
+pub use chat::{
+    ChatDecodeState as Inkling2ChatDecodeState, ChatDecodeStep as Inkling2ChatDecodeStep,
+    Inkling2ChatModel,
+};
 pub use checkpoint::Inkling2Checkpoint;
 pub use config::{Inkling2Config, Inkling2LayerKind};
 pub use trunk::{Inkling2SequenceState, Inkling2Trunk};

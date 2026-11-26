@@ -540,6 +540,9 @@ pub(crate) const CAPABILITY_TABLE: &[CapabilityRow] = {
         chat(F::Lfm2Chat).resumable(),
         chat(F::Lfm3Chat).resumable(),
         chat(F::Gemma3Chat),
+        // Inkling 2 prefills in spans: each span commits its keys, values
+        // and convolution ring together (`inkling2::chat_tests`).
+        chat(F::Inkling2Chat).resumable(),
         // Pipelines and artifacts.
         row(
             F::SortformerDiarization,

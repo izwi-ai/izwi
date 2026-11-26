@@ -215,6 +215,13 @@ impl ModelFamily {
                     "default-on by operator decision ahead of CUDA evidence; the GPU pre-flight runs the qwen36moe device attach test (cuda_attached_prefill_matches_the_fresh_run); IZWI_ENABLE_PREFIX_CACHING=0 turns it off",
                 ),
             },
+            // Inkling 2 keeps a ring of convolution inputs and three passes of
+            // loop state beside its keys and values. Its contract publishes
+            // neither committed pages nor snapshots yet, so nothing is shared.
+            Self::Inkling2Chat => not_enabled(
+                PrefixReuseEvidenceLevel::NotRun,
+                "the state contract declares no prefix policy; sharing waits for an exact snapshot-restore test over keys, values and the convolution ring",
+            ),
             // Hybrid snapshots: attention publishes committed pages and the
             // ShortConv ring a snapshot at each page, at the conversation's
             // history boundary (before the final `<|im_start|>`).

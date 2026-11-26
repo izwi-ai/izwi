@@ -34,7 +34,10 @@ use candle_core::{DType, Device, Tensor, D};
 use candle_nn::ops::{sigmoid, softmax};
 
 use super::checkpoint::{layer_prefix, ExpertProjection, Inkling2Checkpoint, TEXT_PREFIX};
-use super::config::{Inkling2Application, Inkling2Config, Inkling2Heads, Inkling2LayerKind};
+use super::config::{
+    Inkling2Application, Inkling2Config, Inkling2Heads, Inkling2LayerKind,
+    CONV_STATES_PER_APPLICATION,
+};
 use super::experts::Inkling2Moe;
 use crate::error::{Error, Result};
 
@@ -288,24 +291,109 @@ struct Layer {
     controllers: Option<Controllers>,
 }
 
-/// Attention and convolution state of one layer application of one
-/// sequence.
+/// The four convolution histories of one layer application: the last
+/// `kernel - 1` inputs of the key, value, attention-output and MLP-output
+/// convolutions, `[kernel - 1, channels]` each, oldest first.
 #[derive(Debug, Clone)]
-struct ApplicationState {
-    /// `[keys, kv_heads, head_dim]`, normalised, oldest first.
-    keys: Option<Tensor>,
-    values: Option<Tensor>,
-    key_history: Tensor,
-    value_history: Tensor,
-    attention_history: Tensor,
-    mlp_history: Tensor,
+pub struct Inkling2ConvHistory {
+    pub key: Tensor,
+    pub value: Tensor,
+    pub attention: Tensor,
+    pub mlp: Tensor,
 }
 
-/// Everything a sequence carries from one token to the next.
+impl Inkling2ConvHistory {
+    pub fn tensors(&self) -> [&Tensor; CONV_STATES_PER_APPLICATION] {
+        [&self.key, &self.value, &self.attention, &self.mlp]
+    }
+
+    pub fn from_tensors(tensors: [Tensor; CONV_STATES_PER_APPLICATION]) -> Self {
+        let [key, value, attention, mlp] = tensors;
+        Self {
+            key,
+            value,
+            attention,
+            mlp,
+        }
+    }
+}
+
+/// Convolution state of a sequence: one history set per layer application.
+#[derive(Debug, Clone)]
+pub struct Inkling2ConvState {
+    pub histories: Vec<Inkling2ConvHistory>,
+}
+
+/// Where a sequence's keys and values live. The trunk appends a span's keys
+/// and values and gets back the context its queries attend over.
+pub trait Inkling2Context {
+    /// Appends `keys` and `values` (`[seq, kv_heads, head_dim]`, F32) of
+    /// layer application `application` at positions `first..first + seq`
+    /// and returns `(keys, values, oldest)`: the context in F32, oldest
+    /// first, ending with the span, and the position of its first row. With
+    /// a `window`, the context holds at least the `window` keys the span's
+    /// first query sees.
+    fn append(
+        &mut self,
+        application: usize,
+        keys: &Tensor,
+        values: &Tensor,
+        window: Option<usize>,
+        first: usize,
+    ) -> Result<(Tensor, Tensor, usize)>;
+}
+
+/// Keys and values held as plain tensors (the reference state).
+#[derive(Debug, Clone)]
+pub struct Inkling2DenseContext {
+    /// Per application: `[keys, kv_heads, head_dim]` keys and values.
+    held: Vec<Option<(Tensor, Tensor)>>,
+}
+
+impl Inkling2Context for Inkling2DenseContext {
+    fn append(
+        &mut self,
+        application: usize,
+        keys: &Tensor,
+        values: &Tensor,
+        window: Option<usize>,
+        first: usize,
+    ) -> Result<(Tensor, Tensor, usize)> {
+        let seq = keys.dim(0)?;
+        let slot = self
+            .held
+            .get_mut(application)
+            .ok_or_else(|| trunk_error("the state belongs to another model"))?;
+        let (mut keys, mut values) = match slot.as_ref() {
+            Some((held_keys, held_values)) => (
+                Tensor::cat(&[held_keys, keys], 0)?,
+                Tensor::cat(&[held_values, values], 0)?,
+            ),
+            None => (keys.clone(), values.clone()),
+        };
+        // Drop what no later query can see: the span's first query sees
+        // `window` keys, itself included.
+        let held = keys.dim(0)?;
+        if let Some(window) = window {
+            let needed = (window + seq - 1).min(held);
+            if needed < held {
+                keys = keys.narrow(0, held - needed, needed)?;
+                values = values.narrow(0, held - needed, needed)?;
+            }
+        }
+        let oldest = first + seq - keys.dim(0)?;
+        *slot = Some((keys.clone(), values.clone()));
+        Ok((keys, values, oldest))
+    }
+}
+
+/// Everything a sequence carries from one token to the next, held by the
+/// trunk itself.
 #[derive(Debug, Clone)]
 pub struct Inkling2SequenceState {
     position: usize,
-    applications: Vec<ApplicationState>,
+    conv: Inkling2ConvState,
+    context: Inkling2DenseContext,
 }
 
 impl Inkling2SequenceState {
@@ -316,9 +404,10 @@ impl Inkling2SequenceState {
 
     /// Keys held by each layer application.
     pub fn held_keys(&self) -> Vec<usize> {
-        self.applications
+        self.context
+            .held
             .iter()
-            .map(|state| state.keys.as_ref().map_or(0, |keys| keys.dims()[0]))
+            .map(|held| held.as_ref().map_or(0, |(keys, _)| keys.dims()[0]))
             .collect()
     }
 }
@@ -518,27 +607,33 @@ impl Inkling2Trunk {
             .sum()
     }
 
-    pub fn new_state(&self) -> Result<Inkling2SequenceState> {
+    /// Zeroed convolution histories (the state before the first token).
+    pub fn new_conv_state(&self) -> Result<Inkling2ConvState> {
         let history = self.config.conv_kernel - 1;
         let zeros = |channels: usize| Tensor::zeros((history, channels), DType::F32, &self.device);
-        let applications = self
+        let histories = self
             .applications
             .iter()
-            .map(|application| -> Result<ApplicationState> {
+            .map(|application| -> Result<Inkling2ConvHistory> {
                 let kv = self.config.heads(application.layer).kv_width();
-                Ok(ApplicationState {
-                    keys: None,
-                    values: None,
-                    key_history: zeros(kv)?,
-                    value_history: zeros(kv)?,
-                    attention_history: zeros(self.config.hidden)?,
-                    mlp_history: zeros(self.config.hidden)?,
+                Ok(Inkling2ConvHistory {
+                    key: zeros(kv)?,
+                    value: zeros(kv)?,
+                    attention: zeros(self.config.hidden)?,
+                    mlp: zeros(self.config.hidden)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        Ok(Inkling2ConvState { histories })
+    }
+
+    pub fn new_state(&self) -> Result<Inkling2SequenceState> {
         Ok(Inkling2SequenceState {
             position: 0,
-            applications,
+            conv: self.new_conv_state()?,
+            context: Inkling2DenseContext {
+                held: vec![None; self.applications.len()],
+            },
         })
     }
 
@@ -575,12 +670,12 @@ impl Inkling2Trunk {
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
+        index: usize,
         layer: &Layer,
-        query_input: &Tensor,
-        key_input: &Tensor,
-        value_input: &Tensor,
+        [query_input, key_input, value_input]: [&Tensor; 3],
         first: usize,
-        state: &mut ApplicationState,
+        history: &mut Inkling2ConvHistory,
+        context: &mut dyn Inkling2Context,
     ) -> Result<Tensor> {
         let c = &self.config;
         let g = layer.heads;
@@ -605,12 +700,12 @@ impl Inkling2Trunk {
         let values = value_input.matmul(&layer.value_proj)?;
         let (keys, values) = match &layer.kv_conv {
             KvConv::Static { key, value } => (
-                short_conv(&keys, key, &mut state.key_history)?,
-                short_conv(&values, value, &mut state.value_history)?,
+                short_conv(&keys, key, &mut history.key)?,
+                short_conv(&values, value, &mut history.value)?,
             ),
             KvConv::Dynamic { key, value } => (
-                key.forward(&keys, key_input, &mut state.key_history)?,
-                value.forward(&values, value_input, &mut state.value_history)?,
+                key.forward(&keys, key_input, &mut history.key)?,
+                value.forward(&values, value_input, &mut history.value)?,
             ),
         };
         let keys = l2_clip(
@@ -622,28 +717,13 @@ impl Inkling2Trunk {
             c.rms_norm_eps,
         )?;
 
-        // Append, then drop what no later query can see.
-        let (mut keys, mut values) = match (&state.keys, &state.values) {
-            (Some(held_keys), Some(held_values)) => (
-                Tensor::cat(&[held_keys, &keys], 0)?,
-                Tensor::cat(&[held_values, &values], 0)?,
-            ),
-            _ => (keys, values),
-        };
-        let held = keys.dim(0)?;
-        // Position of the oldest held key.
-        let oldest = first + seq - held;
-        if let Some(window) = g.window {
-            // The first query of this span sees `window` keys, itself
-            // included.
-            let needed = (window + seq - 1).min(held);
-            if needed < held {
-                keys = keys.narrow(0, held - needed, needed)?;
-                values = values.narrow(0, held - needed, needed)?;
-            }
-        }
+        let (keys, values, oldest) = context.append(index, &keys, &values, g.window, first)?;
         let held_now = keys.dim(0)?;
-        let oldest = oldest + (held - held_now);
+        if values.dim(0)? != held_now || oldest + held_now != first + seq {
+            return Err(trunk_error(
+                "the attention context does not end at the span",
+            ));
+        }
 
         // Per (query, key): the bank column to read, whether the bias
         // applies, and whether the key is visible.
@@ -712,9 +792,6 @@ impl Inkling2Trunk {
             .transpose(0, 1)?
             .reshape((seq, g.query_width()))?;
 
-        state.keys = Some(keys);
-        state.values = Some(values);
-
         let gate = sigmoid(&query_input.matmul(&layer.output_gate)?)?;
         Ok((attended * gate)?.matmul(&layer.output_proj)?)
     }
@@ -739,7 +816,8 @@ impl Inkling2Trunk {
         block_states: &[Tensor],
         messages: Option<&Tensor>,
         first: usize,
-        state: &mut ApplicationState,
+        history: &mut Inkling2ConvHistory,
+        context: &mut dyn Inkling2Context,
         trace: &mut Option<&mut Inkling2Trace>,
     ) -> Result<Tensor> {
         let layer = &self.layers[self.applications[index].layer];
@@ -787,13 +865,15 @@ impl Inkling2Trunk {
             ),
         };
 
-        let attended =
-            self.attention(layer, &query_input, &key_input, &value_input, first, state)?;
-        let attended = short_conv(
-            &attended,
-            &layer.attention_conv,
-            &mut state.attention_history,
+        let attended = self.attention(
+            index,
+            layer,
+            [&query_input, &key_input, &value_input],
+            first,
+            history,
+            context,
         )?;
+        let attended = short_conv(&attended, &layer.attention_conv, &mut history.attention)?;
         if let Some(trace) = trace.as_deref_mut() {
             trace
                 .entries
@@ -814,7 +894,7 @@ impl Inkling2Trunk {
             mlp_input = controllers()?.mlp.forward(&mlp_input, &mlp_message, eps)?;
         }
         let mlp = self.moe(layer, &rms_norm(&mlp_input, &layer.mlp_norm, eps)?)?;
-        let mlp = short_conv(&mlp, &layer.mlp_conv, &mut state.mlp_history)?;
+        let mlp = short_conv(&mlp, &layer.mlp_conv, &mut history.mlp)?;
         let out = (residual + mlp)?;
         if let Some(trace) = trace.as_deref_mut() {
             trace
@@ -830,6 +910,31 @@ impl Inkling2Trunk {
         &self,
         embeddings: &Tensor,
         state: &mut Inkling2SequenceState,
+        trace: Option<&mut Inkling2Trace>,
+    ) -> Result<Tensor> {
+        let seq = embeddings.dim(0)?;
+        let out = self.forward_span(
+            embeddings,
+            state.position,
+            &mut state.conv,
+            &mut state.context,
+            trace,
+        )?;
+        state.position += seq;
+        Ok(out)
+    }
+
+    /// [`Self::forward_embeddings`] over state the caller owns: `conv` is
+    /// advanced in place and the span's keys and values go to `context`.
+    /// `first` is the sequence position of the span's first token. On an
+    /// error `conv` may be part-way through the span; callers that need to
+    /// retry run on a clone.
+    pub fn forward_span(
+        &self,
+        embeddings: &Tensor,
+        first: usize,
+        conv: &mut Inkling2ConvState,
+        context: &mut dyn Inkling2Context,
         mut trace: Option<&mut Inkling2Trace>,
     ) -> Result<Tensor> {
         let c = &self.config;
@@ -837,10 +942,9 @@ impl Inkling2Trunk {
         if seq == 0 || hidden_size != c.hidden {
             return Err(trunk_error("empty span or wrong embedding width"));
         }
-        if state.applications.len() != self.applications.len() {
+        if conv.histories.len() != self.applications.len() {
             return Err(trunk_error("the state belongs to another model"));
         }
-        let first = state.position;
         if let Some(trace) = trace.as_deref_mut() {
             trace
                 .entries
@@ -858,7 +962,8 @@ impl Inkling2Trunk {
                     &block_states,
                     $messages,
                     first,
-                    &mut state.applications[index],
+                    &mut conv.histories[index],
+                    &mut *context,
                     &mut trace,
                 )?;
                 if self.layers[$layer].boundary {
@@ -899,7 +1004,6 @@ impl Inkling2Trunk {
 
         let read = depth_read(&self.output_query, &block_states, &hidden)?.squeeze(1)?;
         let out = rms_norm(&read, &self.final_norm, c.rms_norm_eps)?;
-        state.position += seq;
         if let Some(trace) = trace.as_deref_mut() {
             trace
                 .entries

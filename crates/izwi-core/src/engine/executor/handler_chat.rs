@@ -501,6 +501,14 @@ impl NativeExecutor {
                             cache,
                         )
                     })?,
+                    NativeChatModel::Inkling2(_) => Self::run_blocking(|| {
+                        model.start_inkling2_decode_state_managed(
+                            &request.prompt_tokens,
+                            max_new_tokens,
+                            &generation_config,
+                            cache,
+                        )
+                    })?,
                 },
                 None => {
                     return Err(Error::InferenceError(

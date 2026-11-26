@@ -19,10 +19,14 @@ const CLOSE: &str = "</think>";
 /// whose template opens it when thinking is on (Qwen3.5/3.6/3.8). The LFM2.5
 /// Thinking model writes its own opener.
 pub fn reasoning_opened_in_prompt(variant: ModelVariant, enable_thinking: Option<bool>) -> bool {
-    variant.family() != ModelFamily::Lfm2Chat
-        && variant.chat_capabilities().is_some_and(|caps| {
-            caps.supports_thinking && enable_thinking.unwrap_or(caps.default_thinking_enabled)
-        })
+    !matches!(
+        variant.family(),
+        // These write their own opener: LFM2.5 Thinking in its text, and
+        // Inkling 2 as a thinking message its reply parser prints as one.
+        ModelFamily::Lfm2Chat | ModelFamily::Inkling2Chat
+    ) && variant.chat_capabilities().is_some_and(|caps| {
+        caps.supports_thinking && enable_thinking.unwrap_or(caps.default_thinking_enabled)
+    })
 }
 
 /// Split a complete output into `(reasoning, content)`.

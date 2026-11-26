@@ -219,6 +219,9 @@ fn certified_topology(
         // retained decoder-token transaction.
         (Lfm2Chat, Chat) => RetainedPagedRing,
         (Lfm3Chat, Chat) => RetainedPagedRing,
+        // Inkling 2 commits one paged layer per layer application and the
+        // ring of its short convolutions' inputs in one transaction.
+        (Inkling2Chat, Chat) => RetainedPagedRing,
 
         // Qwen TTS retains talker pages plus tensor continuation state and
         // leases a separate predictor page domain per invocation.

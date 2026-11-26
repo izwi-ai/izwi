@@ -114,6 +114,7 @@ const LFM25_AUDIO_VARIANTS: &[ModelVariant] = &[ModelVariant::Lfm25Audio15BGguf]
 const LFM3_AUDIO_VARIANTS: &[ModelVariant] =
     &[ModelVariant::Lfm3Audio2BGguf, ModelVariant::Lfm3Audio2BQ8Gguf];
 const GEMMA3_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Gemma34BIt];
+const INKLING2_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Inkling2Mini];
 const QWEN3_FORCED_ALIGNER_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3ForcedAligner06B];
 const VOXTRAL_VARIANTS: &[ModelVariant] = &[ModelVariant::VoxtralMini4BRealtime2602];
 const TOKENIZER_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3TtsTokenizer12Hz];
@@ -274,6 +275,11 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::Lfm3Audio,
         module_path: "crate::models::architectures::lfm3_audio",
         variants: LFM3_AUDIO_VARIANTS,
+    },
+    FamilyRegistration {
+        family: ModelFamily::Inkling2Chat,
+        module_path: "crate::models::architectures::inkling2::chat",
+        variants: INKLING2_CHAT_VARIANTS,
     },
     FamilyRegistration {
         family: ModelFamily::Gemma3Chat,

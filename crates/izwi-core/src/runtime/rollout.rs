@@ -97,6 +97,7 @@ pub(crate) fn validate_managed_state_plan_eligibility(
                 | ModelFamily::Qwen35MoeChat
                 | ModelFamily::Qwen38Chat
                 | ModelFamily::Gemma3Chat
+                | ModelFamily::Inkling2Chat
                 | ModelFamily::Lfm2Chat
                 | ModelFamily::Lfm3Chat,
             CapabilityKind::Chat

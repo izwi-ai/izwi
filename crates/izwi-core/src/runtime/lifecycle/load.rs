@@ -46,6 +46,8 @@ mod asr_memory;
 mod checkpoint;
 #[path = "fish_drama3_memory.rs"]
 mod fish_drama3_memory;
+#[path = "inkling2_memory.rs"]
+mod inkling2_memory;
 mod invocation;
 #[path = "qwen36moe_memory.rs"]
 mod qwen36moe_memory;
@@ -479,7 +481,11 @@ fn managed_chat_capacity_policy(
         ModelFamily::Qwen38Chat | ModelFamily::Qwen35MoeChat => CudaResidentPool::RetainedRows,
         // Without a fit LFM2.5 grew a 128K-token arena on demand, with a
         // replacement-copy peak and no CUDA context reserve (A1).
-        ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat => CudaResidentPool::OneContext,
+        // One context: every held token costs keys and values in all 48
+        // layer applications.
+        ModelFamily::Lfm2Chat | ModelFamily::Lfm3Chat | ModelFamily::Inkling2Chat => {
+            CudaResidentPool::OneContext
+        }
         _ => CudaResidentPool::Disabled,
     };
     ManagedChatCapacityPolicy {
