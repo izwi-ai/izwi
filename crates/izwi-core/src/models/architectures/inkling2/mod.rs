@@ -38,6 +38,8 @@ pub mod trunk;
 #[cfg(test)]
 mod chat_tests;
 #[cfg(test)]
+pub(crate) mod synthetic;
+#[cfg(test)]
 mod tests;
 
 pub use chat::{

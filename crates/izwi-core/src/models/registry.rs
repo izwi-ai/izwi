@@ -8783,6 +8783,7 @@ impl ModelRegistry {
                         NativeChatModel::Qwen38(model) => Some(model.runtime_diagnostics()),
                         NativeChatModel::Qwen36Moe(model) => Some(model.runtime_diagnostics()),
                         NativeChatModel::Lfm2(model) => Some(model.runtime_diagnostics()),
+                        NativeChatModel::Inkling2(model) => Some(model.runtime_diagnostics()),
                         _ => None,
                     },
                 ));

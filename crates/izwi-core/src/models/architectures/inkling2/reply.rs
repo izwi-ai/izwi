@@ -234,6 +234,11 @@ pub(crate) mod tests {
     /// [`test_tokenizer`] with only the first `bytes` byte tokens (128:
     /// ASCII), for models with a small vocabulary.
     pub(crate) fn test_tokenizer_sized(bytes: u32) -> Tokenizer {
+        Tokenizer::from_hf_json_bytes(&test_tokenizer_json(bytes)).unwrap()
+    }
+
+    /// The `tokenizer.json` of [`test_tokenizer_sized`].
+    pub(crate) fn test_tokenizer_json(bytes: u32) -> Vec<u8> {
         let specials = [
             MESSAGE_USER,
             MESSAGE_MODEL,
@@ -281,7 +286,7 @@ pub(crate) mod tests {
                       "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false,
                       "ignore_merges": false, "vocab": vocab, "merges": []}
         });
-        Tokenizer::from_hf_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap()
+        serde_json::to_vec(&json).unwrap()
     }
 
     /// The character the ByteLevel pre-tokenizer maps a byte to (GPT-2's
