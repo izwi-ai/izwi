@@ -164,6 +164,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_GRANITE_TOKEN_DIAGNOSTICS` | flag | `false` | first use | Alias of IZWI_GRANITE_TOKEN_DEBUG, consulted only when that variable is unset. |
 | `IZWI_HOST` | text | `127.0.0.1` | startup | Sets the HTTP server bind address. |
 | `IZWI_INFERENCE_BROKER` | choice | `off` | startup | Sets the rollout inference broker mode: shadow or audit = shadow; enabled or a true boolean = on; anything else = off. |
+| `IZWI_INKLING2_DECODE_GRAPHS` | flag | true (CUDA only) | model load | Kill switch: legacy/off runs the pure stages of an Inkling 2 decode step eagerly instead of replaying them as CUDA graphs (two per layer application; the attention core is always eager). Also: `legacy` means false. |
 | `IZWI_INKLING2_MOE_BACKEND` | choice | `auto` | model load | Selects where Inkling 2's packed experts run: auto (on the device on CUDA once the load-time check against the host path passes, on the host elsewhere), host, or device. |
 | `IZWI_KEEP_NEMO_ARCHIVES` | flag | `false` | model load | Keeps the Parakeet and Nemotron ASR .nemo archives after a load from their extracted checkpoints; by default they are deleted (2.4-2.5 GB each). |
 | `IZWI_KOKORO_CPU_PREDECODER` | flag | `true` | first use | Runs the Kokoro CPU pre-decoder stages in parallel; off/serial runs them sequentially. Also: `serial` means false, `sequential` means false. |

@@ -118,11 +118,21 @@ The served path is the composed trunk on every backend:
   when they differ by more than 1e-3 relative. `IZWI_INKLING2_MOE_BACKEND`
   (`auto`, `host`, `device`) overrides the choice; the loaded-model
   diagnostics report the backend, the reason and the check's error;
+- on CUDA, with the experts on the device, a decode step replays its pure
+  stages as CUDA graphs (`kernels::cuda::stretch_graphs`): two per layer
+  application (before and after the attention core) and the final read, 97
+  for the published model. Each graph is warmed, captured, checked bit for
+  bit against the eager stage twice, then replayed; any failure turns the
+  graphs off for the process. The attention core of every layer application
+  stays eager, because it builds per-step index and mask tensors on the host
+  and its shapes grow with the context. `IZWI_INKLING2_DECODE_GRAPHS=off`
+  (or `IZWI_CUDA_DECODE_GRAPHS=off`) runs the stages eagerly; the diagnostics
+  report warm-ups, captures, verifications and replays. Prefill is eager;
 - rows of a batch run one after another.
 
-Not implemented yet: fused attention and convolution kernels, CUDA graphs
-(the composed attention has per-step shapes and host-built masks, so a
-whole-step graph needs the fused attention first), device experts on Metal, dense tensors in the checkpoint's BF16, image input (the vision
+Not implemented yet: a fused paged attention kernel with the position bias
+and sink (which a whole-step graph needs: until then 48 attention cores per
+token run eagerly), fused convolution kernels, device experts on Metal, dense tensors in the checkpoint's BF16, image input (the vision
 tower is not loaded), prefix sharing, releasing windowed pages, the MTP
 head, and grammar-constrained tool calls and JSON output.
 

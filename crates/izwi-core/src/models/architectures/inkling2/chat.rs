@@ -27,6 +27,7 @@ use crate::backends::state::{
 };
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
+use crate::kernels::cuda::stretch_graphs::StretchGraphs;
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -42,6 +43,31 @@ pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 32_768;
 /// Selects where the experts run: `auto` (on the device on CUDA, on the host
 /// elsewhere), `host`, or `device`.
 pub const EXPERT_BACKEND_ENV: &str = "IZWI_INKLING2_MOE_BACKEND";
+/// Kill switch for the decode step's CUDA graphs.
+pub const DECODE_GRAPHS_ENV: &str = "IZWI_INKLING2_DECODE_GRAPHS";
+/// Device memory the decode graphs hold once captured: stable copies of one
+/// token's stage inputs and outputs for every layer application, and the
+/// expert kernels' scratch.
+const DECODE_GRAPH_DEVICE_BYTES: u64 = 64 << 20;
+
+/// Bytes a load on `backend` should set aside for the decode graphs.
+pub fn decode_graph_device_bytes(backend: BackendKind) -> u64 {
+    let on = backend == BackendKind::Cuda
+        && crate::env::flag_or(DECODE_GRAPHS_ENV, true)
+        && !crate::kernels::cuda::stretch_graphs::decode_graphs_switched_off()
+        && ExpertBackendRequest::from_env().wants_device(backend);
+    if on {
+        DECODE_GRAPH_DEVICE_BYTES
+    } else {
+        0
+    }
+}
+
+/// The decode step runs one row at a time.
+fn one_row(rows: usize) -> bool {
+    rows == 1
+}
+
 /// Largest relative error the device experts may show against the host path
 /// at load before the model falls back to the host.
 const DEVICE_EXPERT_TOLERANCE: f32 = 1e-3;
@@ -320,6 +346,8 @@ pub struct Inkling2ChatModel {
     trunk: Inkling2Trunk,
     max_context_tokens: usize,
     experts: ExpertPlacement,
+    /// CUDA graphs of a decode step's pure stages, or why there are none.
+    graphs: std::result::Result<StretchGraphs, String>,
 }
 
 impl InferenceStateContractProvider for Inkling2ChatModel {
@@ -434,6 +462,19 @@ impl Inkling2ChatModel {
         if !experts.on_device && expert_backend.wants_device(BackendKind::from(device.kind)) {
             tracing::warn!("Inkling 2 experts stay on the host: {}", experts.reason);
         }
+        // The stages are pure only with the experts on the device: the host
+        // expert path reads activations back.
+        let graphs = if experts.on_device {
+            StretchGraphs::resolve(
+                "Inkling 2",
+                DECODE_GRAPHS_ENV,
+                &device.device,
+                trunk.decode_stretches(),
+            )
+            .map(|graphs| graphs.with_widths(one_row))
+        } else {
+            Err("the experts run on the host".to_string())
+        };
         let max_context_tokens = config.max_context_tokens.min(DEFAULT_MAX_CONTEXT_TOKENS);
         info!(
             "Loaded Inkling 2 chat model on {:?} from {} ({} layer applications, {:.1} GiB of packed experts, {} context tokens)",
@@ -452,6 +493,7 @@ impl Inkling2ChatModel {
             trunk,
             max_context_tokens,
             experts,
+            graphs,
         })
     }
 
@@ -507,6 +549,10 @@ impl Inkling2ChatModel {
             "layer_applications": self.config.application_count(),
             "expert_resident_bytes": self.trunk.expert_resident_bytes(),
             "max_context_tokens": self.max_context_tokens,
+            "decode_graphs": match &self.graphs {
+                Ok(graphs) => graphs.diagnostics(),
+                Err(reason) => serde_json::json!({ "off": reason }),
+            },
         })
     }
 
@@ -582,8 +628,14 @@ impl Inkling2ChatModel {
                 cache: &*cache,
                 prepared: &mut prepared,
             };
-            self.trunk
-                .forward_span(&embeddings, start, &mut working, &mut context, None)
+            self.trunk.forward_span(
+                &embeddings,
+                start,
+                &mut working,
+                &mut context,
+                self.graphs.as_ref().ok(),
+                None,
+            )
         };
         let hidden = match hidden {
             Ok(hidden) => hidden,

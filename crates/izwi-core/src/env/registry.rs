@@ -1086,6 +1086,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sets the rollout inference broker mode: shadow or audit = shadow; enabled or a true boolean = on; anything else = off.",
     ),
     CoreEnvVar::new(
+        "IZWI_INKLING2_DECODE_GRAPHS",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off runs the pure stages of an Inkling 2 decode step eagerly instead of replaying them as CUDA graphs (two per layer application; the attention core is always eager).",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
         "IZWI_INKLING2_MOE_BACKEND",
         Choice,
         "auto",

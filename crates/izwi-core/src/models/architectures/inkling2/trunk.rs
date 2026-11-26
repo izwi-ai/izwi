@@ -40,11 +40,25 @@ use super::config::{
 };
 use super::experts::Inkling2Moe;
 use crate::error::{Error, Result};
+use crate::kernels::cuda::stretch_graphs::{StepRun, StretchGraphs};
 
 /// Epsilon of the gain-free RMS norms that take none from the config (the
 /// depth-residual and message reads).
 const DEPTH_NORM_EPS: f64 = 1e-6;
 const L2_CLIP_EPS: f32 = 1e-6;
+
+/// A pure stage: through the step's graphs when it has them, else as is.
+fn stage(
+    run: &mut Option<StepRun<'_>>,
+    index: usize,
+    inputs: &[Tensor],
+    body: &dyn Fn(&[Tensor]) -> Result<Vec<Tensor>>,
+) -> Result<Vec<Tensor>> {
+    match run {
+        Some(run) => run.run(index, inputs, body),
+        None => body(inputs),
+    }
+}
 
 fn trunk_error(message: impl std::fmt::Display) -> Error {
     Error::InferenceError(format!("Inkling 2 trunk: {message}"))
@@ -120,7 +134,8 @@ fn extend(history: &Tensor, x: &Tensor) -> Result<(Tensor, Tensor)> {
 }
 
 /// The reference's `ShortConvolution`: `(conv(x) + x) / sqrt(kernel + 1)`.
-fn short_conv(x: &Tensor, conv: &ConvTaps, history: &mut Tensor) -> Result<Tensor> {
+/// Returns the output and the history the next span starts from.
+fn short_conv(x: &Tensor, conv: &ConvTaps, history: &Tensor) -> Result<(Tensor, Tensor)> {
     let seq = x.dim(0)?;
     let (extended, next) = extend(history, x)?;
     let mut out = x.clone();
@@ -130,8 +145,7 @@ fn short_conv(x: &Tensor, conv: &ConvTaps, history: &mut Tensor) -> Result<Tenso
                 .narrow(0, tap, seq)?
                 .broadcast_mul(&conv.taps.narrow(0, tap, 1)?)?)?;
     }
-    *history = next;
-    Ok((out * ((conv.kernel + 1) as f64).powf(-0.5))?)
+    Ok(((out * ((conv.kernel + 1) as f64).powf(-0.5))?, next))
 }
 
 /// Key or value convolution of a full-attention layer: static taps plus
@@ -166,8 +180,9 @@ impl DynamicConv {
         })
     }
 
-    /// `(sum_lag x[t - lag] * w[t, lag] + x) / sqrt(2 * kernel + 1)`.
-    fn forward(&self, x: &Tensor, input: &Tensor, history: &mut Tensor) -> Result<Tensor> {
+    /// `(sum_lag x[t - lag] * w[t, lag] + x) / sqrt(2 * kernel + 1)`, and
+    /// the history the next span starts from.
+    fn forward(&self, x: &Tensor, input: &Tensor, history: &Tensor) -> Result<(Tensor, Tensor)> {
         let (seq, channels) = x.dims2()?;
         let head_dim = channels / self.heads;
         let (extended, next) = extend(history, x)?;
@@ -183,8 +198,7 @@ impl DynamicConv {
             let weights = per_head.broadcast_add(&self.static_taps.narrow(0, lag, 1)?)?;
             out = (out + (extended.narrow(0, self.kernel - 1 - lag, seq)? * weights)?)?;
         }
-        *history = next;
-        Ok((out * ((2 * self.kernel + 1) as f64).powf(-0.5))?)
+        Ok(((out * ((2 * self.kernel + 1) as f64).powf(-0.5))?, next))
     }
 }
 
@@ -740,45 +754,96 @@ impl Inkling2Trunk {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn attention(
-        &self,
-        index: usize,
-        layer: &Layer,
-        [query_input, key_input, value_input]: [&Tensor; 3],
-        first: usize,
-        history: &mut Inkling2ConvHistory,
-        context: &mut dyn Inkling2Context,
-    ) -> Result<Tensor> {
+    /// The pure stage before a layer application's attention core: the
+    /// depth-residual read, the message gates, the input norms, the query,
+    /// key and value projections with their convolutions and norms, the
+    /// position-bias profiles, the sink logits and the output gate.
+    ///
+    /// Inputs: hidden, key history, value history, log scale (`[seq, 1, 1]`,
+    /// read by full layers), then the messages (`[seq, 4, hidden]`) on loop
+    /// passes after the first, then the block states.
+    ///
+    /// Outputs: queries `[heads, seq, head_dim]`, bias profiles
+    /// `[heads, seq, rel_extent]`, sinks `[heads, seq, 1]`, keys and values
+    /// `[seq, kv_heads, head_dim]`, the output gate `[seq, query_width]`,
+    /// then the next key and value histories.
+    fn pre_attention(&self, index: usize, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
+        let application = self.applications[index];
+        let layer = &self.layers[application.layer];
         let c = &self.config;
+        let eps = c.rms_norm_eps;
         let g = layer.heads;
-        let seq = query_input.dim(0)?;
-        let full = layer.kind == Inkling2LayerKind::Full;
-        let log_scale = if full {
-            Some(self.log_scale(first, seq)?)
-        } else {
-            None
+        let [hidden, key_history, value_history, log_scale, rest @ ..] = inputs else {
+            return Err(trunk_error("a layer stage is missing inputs"));
         };
+        let (messages, block_states) = match application.pass {
+            0 => (None, rest),
+            _ => match rest.split_first() {
+                Some((messages, states)) => (Some(messages), states),
+                None => return Err(trunk_error("a loop pass is missing its messages")),
+            },
+        };
+        let seq = hidden.dim(0)?;
+        let message = |slot: usize| -> Result<Option<Tensor>> {
+            messages
+                .map(|messages| Ok(messages.narrow(1, slot, 1)?.squeeze(1)?))
+                .transpose()
+        };
+
+        // Inputs of the query, key and value projections.
+        let read = match &layer.attention_query {
+            None => vec![hidden.clone()],
+            Some(query) => {
+                let read = depth_read(query, block_states, hidden)?;
+                (0..query.dim(0)?)
+                    .map(|row| Ok(read.narrow(1, row, 1)?.squeeze(1)?))
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        let pick = |slot: usize| read[slot.min(read.len() - 1)].clone();
+        let (mut query_input, mut key_input, mut value_input) = (pick(0), pick(1), pick(2));
+        if let (Some(q), Some(k), Some(v)) = (message(0)?, message(1)?, message(2)?) {
+            let gates = layer
+                .controllers
+                .as_ref()
+                .ok_or_else(|| trunk_error("a message reached a layer outside the loop"))?;
+            query_input = gates.query.forward(&query_input, &q, eps)?;
+            key_input = gates.key.forward(&key_input, &k, eps)?;
+            value_input = gates.value.forward(&value_input, &v, eps)?;
+        }
+        let (query_input, key_input, value_input) = match &layer.input_norm {
+            InputNorm::Shared(weight) => (
+                rms_norm(&query_input, weight, eps)?,
+                rms_norm(&key_input, weight, eps)?,
+                rms_norm(&value_input, weight, eps)?,
+            ),
+            InputNorm::Split { query, key, value } => (
+                rms_norm(&query_input, query, eps)?,
+                rms_norm(&key_input, key, eps)?,
+                rms_norm(&value_input, value, eps)?,
+            ),
+        };
+        let full = layer.kind == Inkling2LayerKind::Full;
 
         let mut queries = query_input
             .matmul(&layer.query_proj)?
             .reshape((seq, g.heads, g.head_dim))?
             .broadcast_mul(&layer.query_scale)?;
         queries = l2_clip(&queries, c.qk_l2_clip_threshold)?;
-        if let Some(scale) = &log_scale {
-            queries = queries.broadcast_mul(scale)?;
+        if full {
+            queries = queries.broadcast_mul(log_scale)?;
         }
 
         let keys = key_input.matmul(&layer.key_proj)?;
         let values = value_input.matmul(&layer.value_proj)?;
-        let (keys, values) = match &layer.kv_conv {
+        let ((keys, key_next), (values, value_next)) = match &layer.kv_conv {
             KvConv::Static { key, value } => (
-                short_conv(&keys, key, &mut history.key)?,
-                short_conv(&values, value, &mut history.value)?,
+                short_conv(&keys, key, key_history)?,
+                short_conv(&values, value, value_history)?,
             ),
             KvConv::Dynamic { key, value } => (
-                key.forward(&keys, key_input, &mut history.key)?,
-                value.forward(&values, value_input, &mut history.value)?,
+                key.forward(&keys, &key_input, key_history)?,
+                value.forward(&values, &value_input, value_history)?,
             ),
         };
         let keys = l2_clip(
@@ -790,7 +855,53 @@ impl Inkling2Trunk {
             c.rms_norm_eps,
         )?;
 
-        let (keys, values, oldest) = context.append(index, &keys, &values, g.window, first)?;
+        let mut relative = query_input
+            .matmul(&layer.rel_proj)?
+            .reshape((seq, g.heads, c.d_rel))?
+            .broadcast_mul(&layer.rel_scale)?;
+        relative = l2_clip(&relative, c.rel_l2_clip_threshold)?;
+        if full {
+            relative = relative.broadcast_mul(log_scale)?;
+        }
+        let profiles = relative
+            .broadcast_matmul(&layer.rel_bank)?
+            .transpose(0, 1)?
+            .contiguous()?;
+        // One extra logit per query whose value is zero.
+        let sinks = query_input
+            .matmul(&layer.sink_proj)?
+            .t()?
+            .unsqueeze(2)?
+            .contiguous()?;
+        let gate = sigmoid(&query_input.matmul(&layer.output_gate)?)?;
+        Ok(vec![
+            queries.transpose(0, 1)?.contiguous()?,
+            profiles,
+            sinks,
+            keys.contiguous()?,
+            values.contiguous()?,
+            gate,
+            key_next,
+            value_next,
+        ])
+    }
+
+    /// The attention core: appends the span's keys and values to `context`
+    /// and attends over what it returns. It builds per-step index and mask
+    /// tensors on the host, so it always runs eagerly.
+    fn attend(
+        &self,
+        index: usize,
+        staged: &[Tensor],
+        first: usize,
+        context: &mut dyn Inkling2Context,
+    ) -> Result<Tensor> {
+        let g = self.layers[self.applications[index].layer].heads;
+        let [queries, profiles, sinks, keys, values, ..] = staged else {
+            return Err(trunk_error("the attention core is missing inputs"));
+        };
+        let seq = queries.dim(1)?;
+        let (keys, values, oldest) = context.append(index, keys, values, g.window, first)?;
         let held_now = keys.dim(0)?;
         if values.dim(0)? != held_now || oldest + held_now != first + seq {
             return Err(trunk_error(
@@ -821,20 +932,6 @@ impl Inkling2Trunk {
             .contiguous()?;
         let inside = Tensor::from_vec(inside, shape, &self.device)?;
         let hidden_mask = Tensor::from_vec(hidden_mask, shape, &self.device)?;
-
-        let mut relative = query_input
-            .matmul(&layer.rel_proj)?
-            .reshape((seq, g.heads, c.d_rel))?
-            .broadcast_mul(&layer.rel_scale)?;
-        relative = l2_clip(&relative, c.rel_l2_clip_threshold)?;
-        if let Some(scale) = &log_scale {
-            relative = relative.broadcast_mul(scale)?;
-        }
-        // [heads, seq, rel_extent]
-        let profiles = relative
-            .broadcast_matmul(&layer.rel_bank)?
-            .transpose(0, 1)?
-            .contiguous()?;
         let bias = profiles.gather(&columns, 2)?.broadcast_mul(&inside)?;
 
         let groups = g.heads / g.kv_heads;
@@ -847,34 +944,76 @@ impl Inkling2Trunk {
         };
         let key_heads = per_head(&keys)?;
         let value_heads = per_head(&values)?;
-        let queries = queries.transpose(0, 1)?.contiguous()?;
         let scores = (queries.matmul(&key_heads.transpose(1, 2)?.contiguous()?)?
             * (g.head_dim as f64).powf(-0.5))?;
         let scores = (scores + bias)?.broadcast_add(&hidden_mask)?;
-        // One extra logit per query whose value is zero.
-        let sinks = query_input
-            .matmul(&layer.sink_proj)?
-            .t()?
-            .unsqueeze(2)?
-            .contiguous()?;
         let probabilities =
-            softmax(&Tensor::cat(&[&scores, &sinks], 2)?, 2)?.narrow(2, 0, held_now)?;
-        let attended = probabilities
+            softmax(&Tensor::cat(&[&scores, sinks], 2)?, 2)?.narrow(2, 0, held_now)?;
+        Ok(probabilities
             .contiguous()?
             .matmul(&value_heads)?
             .transpose(0, 1)?
-            .reshape((seq, g.query_width()))?;
-
-        let gate = sigmoid(&query_input.matmul(&layer.output_gate)?)?;
-        Ok((attended * gate)?.matmul(&layer.output_proj)?)
+            .reshape((seq, g.query_width()))?)
     }
 
-    fn moe(&self, layer: &Layer, input: &Tensor) -> Result<Tensor> {
-        layer.moe.forward_tensor(input)
+    /// The pure stage after the attention core: the gated output projection
+    /// and its convolution, the residual, the depth-residual read for the
+    /// MLP, the experts and their convolution.
+    ///
+    /// Inputs: attended, output gate, hidden, attention history, MLP history,
+    /// then the messages on loop passes after the first, then the block
+    /// states. Outputs: the layer output, the next attention and MLP
+    /// histories, and the attention output after its convolution.
+    ///
+    /// Pure only when the experts run on the device: the host expert path
+    /// reads activations back.
+    fn post_attention(&self, index: usize, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
+        let application = self.applications[index];
+        let layer = &self.layers[application.layer];
+        let eps = self.config.rms_norm_eps;
+        let [attended, gate, hidden, attention_history, mlp_history, rest @ ..] = inputs else {
+            return Err(trunk_error("a layer stage is missing inputs"));
+        };
+        let (messages, block_states) = match application.pass {
+            0 => (None, rest),
+            _ => match rest.split_first() {
+                Some((messages, states)) => (Some(messages), states),
+                None => return Err(trunk_error("a loop pass is missing its messages")),
+            },
+        };
+        let projected = (attended * gate)?.matmul(&layer.output_proj)?;
+        let (attended, attention_next) =
+            short_conv(&projected, &layer.attention_conv, attention_history)?;
+
+        // A block's first layer starts a fresh residual and adds its own
+        // input to the states the MLP read sees.
+        let mut states = block_states.to_vec();
+        let residual = if layer.boundary {
+            states.push(hidden.clone());
+            attended.clone()
+        } else {
+            (hidden + &attended)?
+        };
+        let mut mlp_input = depth_read(&layer.mlp_query, &states, &residual)?.squeeze(1)?;
+        if let Some(messages) = messages {
+            let gates = layer
+                .controllers
+                .as_ref()
+                .ok_or_else(|| trunk_error("a message reached a layer outside the loop"))?;
+            let mlp_message = messages.narrow(1, 3, 1)?.squeeze(1)?;
+            mlp_input = gates.mlp.forward(&mlp_input, &mlp_message, eps)?;
+        }
+        let mlp = layer
+            .moe
+            .forward_tensor(&rms_norm(&mlp_input, &layer.mlp_norm, eps)?)?;
+        let (mlp, mlp_next) = short_conv(&mlp, &layer.mlp_conv, mlp_history)?;
+        Ok(vec![(residual + mlp)?, attention_next, mlp_next, attended])
     }
 
     /// One layer application over a span. `messages` is `[seq, 4, hidden]`
-    /// (query, key, value, mlp) on loop passes after the first.
+    /// (query, key, value, mlp) on loop passes after the first. With `run`,
+    /// the two pure stages go through its graphs (stretches `2 * index` and
+    /// `2 * index + 1`).
     #[allow(clippy::too_many_arguments)]
     fn apply(
         &self,
@@ -885,90 +1024,61 @@ impl Inkling2Trunk {
         first: usize,
         history: &mut Inkling2ConvHistory,
         context: &mut dyn Inkling2Context,
+        run: &mut Option<StepRun<'_>>,
         trace: &mut Option<&mut Inkling2Trace>,
     ) -> Result<Tensor> {
-        let layer = &self.layers[self.applications[index].layer];
-        let eps = self.config.rms_norm_eps;
-        let message = |slot: usize| -> Result<Option<Tensor>> {
-            messages
-                .map(|messages| Ok(messages.narrow(1, slot, 1)?.squeeze(1)?))
-                .transpose()
+        let seq = hidden.dim(0)?;
+        let shared = messages.into_iter().chain(block_states).cloned();
+        let mut inputs = vec![
+            hidden.clone(),
+            history.key.clone(),
+            history.value.clone(),
+            self.log_scale(first, seq)?,
+        ];
+        inputs.extend(shared.clone());
+        let staged = stage(run, 2 * index, &inputs, &|inputs| {
+            self.pre_attention(index, inputs)
+        })?;
+        let [.., gate, key_next, value_next] = staged.as_slice() else {
+            return Err(trunk_error("a layer stage returned too little"));
         };
-        let controllers = || {
-            layer
-                .controllers
-                .as_ref()
-                .ok_or_else(|| trunk_error("a message reached a layer outside the loop"))
-        };
+        let attended = self.attend(index, &staged, first, context)?;
 
-        // Inputs of the query, key and value projections.
-        let inputs = match &layer.attention_query {
-            None => vec![hidden.clone()],
-            Some(query) => {
-                let read = depth_read(query, block_states, hidden)?;
-                (0..query.dim(0)?)
-                    .map(|row| Ok(read.narrow(1, row, 1)?.squeeze(1)?))
-                    .collect::<Result<Vec<_>>>()?
-            }
+        let mut inputs = vec![
+            attended,
+            gate.clone(),
+            hidden.clone(),
+            history.attention.clone(),
+            history.mlp.clone(),
+        ];
+        inputs.extend(shared);
+        let outputs = stage(run, 2 * index + 1, &inputs, &|inputs| {
+            self.post_attention(index, inputs)
+        })?;
+        let [out, attention_next, mlp_next, attended] = outputs.as_slice() else {
+            return Err(trunk_error("a layer stage returned too little"));
         };
-        let pick = |slot: usize| inputs[slot.min(inputs.len() - 1)].clone();
-        let (mut query_input, mut key_input, mut value_input) = (pick(0), pick(1), pick(2));
-        if let (Some(q), Some(k), Some(v)) = (message(0)?, message(1)?, message(2)?) {
-            let gates = controllers()?;
-            query_input = gates.query.forward(&query_input, &q, eps)?;
-            key_input = gates.key.forward(&key_input, &k, eps)?;
-            value_input = gates.value.forward(&value_input, &v, eps)?;
-        }
-        let (query_input, key_input, value_input) = match &layer.input_norm {
-            InputNorm::Shared(weight) => (
-                rms_norm(&query_input, weight, eps)?,
-                rms_norm(&key_input, weight, eps)?,
-                rms_norm(&value_input, weight, eps)?,
-            ),
-            InputNorm::Split { query, key, value } => (
-                rms_norm(&query_input, query, eps)?,
-                rms_norm(&key_input, key, eps)?,
-                rms_norm(&value_input, value, eps)?,
-            ),
+        *history = Inkling2ConvHistory {
+            key: key_next.clone(),
+            value: value_next.clone(),
+            attention: attention_next.clone(),
+            mlp: mlp_next.clone(),
         };
-
-        let attended = self.attention(
-            index,
-            layer,
-            [&query_input, &key_input, &value_input],
-            first,
-            history,
-            context,
-        )?;
-        let attended = short_conv(&attended, &layer.attention_conv, &mut history.attention)?;
         if let Some(trace) = trace.as_deref_mut() {
             trace
                 .entries
                 .push((format!("app.{index}.attn"), attended.clone()));
-        }
-
-        // A block's first layer starts a fresh residual and adds its own
-        // input to the states the MLP read sees.
-        let mut states = block_states.to_vec();
-        let residual = if layer.boundary {
-            states.push(hidden.clone());
-            attended
-        } else {
-            (hidden + attended)?
-        };
-        let mut mlp_input = depth_read(&layer.mlp_query, &states, &residual)?.squeeze(1)?;
-        if let Some(mlp_message) = message(3)? {
-            mlp_input = controllers()?.mlp.forward(&mlp_input, &mlp_message, eps)?;
-        }
-        let mlp = self.moe(layer, &rms_norm(&mlp_input, &layer.mlp_norm, eps)?)?;
-        let mlp = short_conv(&mlp, &layer.mlp_conv, &mut history.mlp)?;
-        let out = (residual + mlp)?;
-        if let Some(trace) = trace.as_deref_mut() {
             trace
                 .entries
                 .push((format!("app.{index}.out"), out.clone()));
         }
-        Ok(out)
+        Ok(out.clone())
+    }
+
+    /// Stretches of a decode step's graphs: two per layer application and
+    /// the final read.
+    pub fn decode_stretches(&self) -> usize {
+        2 * self.applications.len() + 1
     }
 
     /// Runs `embeddings` (`[seq, hidden]`, the next `seq` tokens of the
@@ -985,6 +1095,7 @@ impl Inkling2Trunk {
             state.position,
             &mut state.conv,
             &mut state.context,
+            None,
             trace,
         )?;
         state.position += seq;
@@ -996,12 +1107,17 @@ impl Inkling2Trunk {
     /// `first` is the sequence position of the span's first token. On an
     /// error `conv` may be part-way through the span; callers that need to
     /// retry run on a clone.
+    ///
+    /// With `graphs`, a one-token span whose experts run on the device
+    /// replays its pure stages as CUDA graphs; the attention core of every
+    /// layer application stays eager.
     pub fn forward_span(
         &self,
         embeddings: &Tensor,
         first: usize,
         conv: &mut Inkling2ConvState,
         context: &mut dyn Inkling2Context,
+        graphs: Option<&StretchGraphs>,
         mut trace: Option<&mut Inkling2Trace>,
     ) -> Result<Tensor> {
         let c = &self.config;
@@ -1020,6 +1136,11 @@ impl Inkling2Trunk {
         let mut hidden = embeddings.clone();
         let mut block_states: Vec<Tensor> = Vec::new();
         let mut index = 0usize;
+        // The host expert path reads activations back, which a graph cannot.
+        let mut run = match graphs {
+            Some(graphs) if seq == 1 && self.experts_on_device() => graphs.begin(1),
+            _ => None,
+        };
 
         macro_rules! run {
             ($layer:expr, $messages:expr) => {{
@@ -1031,6 +1152,7 @@ impl Inkling2Trunk {
                     first,
                     &mut conv.histories[index],
                     &mut *context,
+                    &mut run,
                     &mut trace,
                 )?;
                 if self.layers[$layer].boundary {
@@ -1069,8 +1191,19 @@ impl Inkling2Trunk {
         }
         debug_assert_eq!(index, self.applications.len());
 
-        let read = depth_read(&self.output_query, &block_states, &hidden)?.squeeze(1)?;
-        let out = rms_norm(&read, &self.final_norm, c.rms_norm_eps)?;
+        let mut inputs = vec![hidden];
+        inputs.extend(block_states);
+        let outputs = stage(&mut run, 2 * index, &inputs, &|inputs| {
+            let [hidden, block_states @ ..] = inputs else {
+                return Err(trunk_error("the final read is missing inputs"));
+            };
+            let read = depth_read(&self.output_query, block_states, hidden)?.squeeze(1)?;
+            Ok(vec![rms_norm(&read, &self.final_norm, c.rms_norm_eps)?])
+        })?;
+        let out = outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| trunk_error("the final read returned nothing"))?;
         if let Some(trace) = trace {
             trace
                 .entries
