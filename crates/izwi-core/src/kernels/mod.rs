@@ -35,6 +35,7 @@ pub(crate) mod metal_paged_gqa;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_qwen36moe;
 pub mod moe_gelu;
+pub mod moe_packed;
 pub mod moe_relu2;
 pub mod numeric_check;
 pub mod penalized_topk;

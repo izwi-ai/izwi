@@ -3648,6 +3648,12 @@ pub(crate) fn cuda_ptx_moe_gelu() -> &'static str {
     cuda_ptx::MOE_GELU
 }
 
+/// The PTX of `kernels/cuda/moe_packed.cu` (`kernels::moe_packed`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_moe_packed() -> &'static str {
+    cuda_ptx::MOE_PACKED
+}
+
 /// The PTX of `kernels/cuda/moe_relu2.cu` (`kernels::moe_relu2`).
 #[cfg(feature = "cuda")]
 pub(crate) fn cuda_ptx_moe_relu2() -> &'static str {
