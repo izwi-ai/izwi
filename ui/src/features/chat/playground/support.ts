@@ -385,6 +385,10 @@ export function defaultThinkingEnabledForModel(variant: string | null): boolean 
   if (isLfm25ThinkingModel(variant) || isLfm3Model(variant)) {
     return true;
   }
+  // Inkling 2 thinks at its template's default effort unless told not to.
+  if (normalized.startsWith("inkling-2-")) {
+    return true;
+  }
   return normalized.startsWith("qwen3-");
 }
 

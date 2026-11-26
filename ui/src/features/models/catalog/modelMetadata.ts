@@ -105,6 +105,12 @@ export function getModelProviderLabel(variant: string): string {
   if (variant.startsWith("Ming-") || variant.startsWith("inclusionAI/")) {
     return "inclusionAI";
   }
+  if (
+    variant.startsWith("Inkling-") ||
+    variant.startsWith("thinkingmachines/")
+  ) {
+    return "Thinking Machines";
+  }
   return "Other";
 }
 
@@ -427,6 +433,22 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     category: "chat",
     capabilities: ["Text Chat", "Thinking", "MoE", "FP8"],
     size: "34.89 GiB",
+  },
+  "Inkling-2-Mini": {
+    shortName: "Inkling 2 Mini",
+    fullName: "Inkling 2 Mini (NVFP4 MoE)",
+    description:
+      "Looped sparse-expert chat model from Thinking Machines (128 experts, 8 routed) whose 4-bit and 8-bit expert weights stay packed in memory",
+    category: "chat",
+    capabilities: [
+      "Text Chat",
+      "Thinking",
+      "Reasoning Effort",
+      "Tool Calling",
+      "MoE",
+      "NVFP4",
+    ],
+    size: "18.21 GiB",
   },
   "LFM2.5-1.2B-Instruct-GGUF": {
     shortName: "LFM2.5 1.2B Instruct",
