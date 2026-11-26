@@ -12,7 +12,9 @@
 //! * `quant`: the two expert formats and products straight from packed bytes;
 //! * `experts`: routing and the expert feed-forward on the host;
 //! * `trunk`: the text trunk composed from plain tensor operations, the
-//!   reference every faster path is checked against.
+//!   reference every faster path is checked against;
+//! * `prompt`: the chat prompt, matching the published template;
+//! * `reply`: the model's reply messages as the text the server reads.
 //!
 //! Nothing here imports another family: the family may use `kernels`,
 //! `models::shared`, `kv`, `backends` and `engine`, and builds its own state
@@ -21,7 +23,9 @@
 pub mod checkpoint;
 pub mod config;
 pub mod experts;
+pub mod prompt;
 pub mod quant;
+pub mod reply;
 pub mod trunk;
 
 #[cfg(test)]
