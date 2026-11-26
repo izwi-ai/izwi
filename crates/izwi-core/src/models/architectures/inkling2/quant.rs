@@ -172,7 +172,7 @@ impl PackedExperts {
         amax: &[f32],
         outer_scale_denominator: f32,
     ) -> Result<Self> {
-        if columns % NVFP4_BLOCK != 0 {
+        if !columns.is_multiple_of(NVFP4_BLOCK) {
             return Err(quant_error(format!(
                 "{columns} columns are not a multiple of {NVFP4_BLOCK}"
             )));
@@ -211,7 +211,7 @@ impl PackedExperts {
         values: PackedBytes,
         scales: PackedBytes,
     ) -> Result<Self> {
-        if columns % MXFP8_BLOCK != 0 {
+        if !columns.is_multiple_of(MXFP8_BLOCK) {
             return Err(quant_error(format!(
                 "{columns} columns are not a multiple of {MXFP8_BLOCK}"
             )));
@@ -320,12 +320,12 @@ impl PackedExperts {
                 let mut total = 0.0f32;
                 for ((scale, codes), x) in scales
                     .iter()
-                    .zip(codes.chunks_exact(8))
-                    .zip(x.chunks_exact(NVFP4_BLOCK))
+                    .zip(codes.as_chunks::<8>().0)
+                    .zip(x.as_chunks::<NVFP4_BLOCK>().0)
                 {
                     let mut values = [0.0f32; NVFP4_BLOCK];
-                    for (pair, byte) in values.chunks_exact_mut(2).zip(codes) {
-                        pair.copy_from_slice(&pairs[*byte as usize]);
+                    for (pair, byte) in values.as_chunks_mut::<2>().0.iter_mut().zip(codes) {
+                        *pair = pairs[*byte as usize];
                     }
                     let mut dot = 0.0f32;
                     for (value, x) in values.iter().zip(x) {
@@ -340,8 +340,8 @@ impl PackedExperts {
                 let mut total = 0.0f32;
                 for ((scale, codes), x) in scales
                     .iter()
-                    .zip(codes.chunks_exact(MXFP8_BLOCK))
-                    .zip(x.chunks_exact(MXFP8_BLOCK))
+                    .zip(codes.as_chunks::<MXFP8_BLOCK>().0)
+                    .zip(x.as_chunks::<MXFP8_BLOCK>().0)
                 {
                     let mut dot = 0.0f32;
                     for (byte, x) in codes.iter().zip(x) {
@@ -408,8 +408,10 @@ mod tests {
 
     fn f32s(bytes: &[u8]) -> Vec<f32> {
         bytes
-            .chunks_exact(4)
-            .map(|quad| f32::from_le_bytes(quad.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|quad| f32::from_le_bytes(*quad))
             .collect()
     }
 

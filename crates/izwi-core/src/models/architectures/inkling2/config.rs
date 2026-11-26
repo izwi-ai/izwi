@@ -366,7 +366,7 @@ impl Inkling2Config {
                 || heads.kv_heads == 0
                 || heads.head_dim == 0
                 || heads.rel_extent == 0
-                || heads.heads % heads.kv_heads != 0
+                || !heads.heads.is_multiple_of(heads.kv_heads)
             {
                 return Err(config_error(format!("bad {name} attention geometry")));
             }
@@ -376,8 +376,8 @@ impl Inkling2Config {
         if self.loop_start == 0
             || self.loop_start >= self.loop_end
             || self.loop_end > self.layers
-            || self.loop_start % self.block_layers != 0
-            || self.loop_end % self.block_layers != 0
+            || !self.loop_start.is_multiple_of(self.block_layers)
+            || !self.loop_end.is_multiple_of(self.block_layers)
         {
             return Err(config_error(format!(
                 "loop {}..{} does not fit {} layers in blocks of {}",
@@ -407,7 +407,7 @@ impl Inkling2Config {
 
     /// Whether `layer` opens a depth-residual block.
     pub fn is_block_boundary(&self, layer: usize) -> bool {
-        layer % self.block_layers == 0
+        layer.is_multiple_of(self.block_layers)
     }
 
     /// Layer applications of one token, in execution order.

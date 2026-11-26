@@ -26,16 +26,20 @@ pub(crate) fn golden() -> Golden {
         file.tensor(name)
             .unwrap()
             .data()
-            .chunks_exact(4)
-            .map(|quad| f32::from_le_bytes(quad.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|quad| f32::from_le_bytes(*quad))
             .collect::<Vec<_>>()
     };
     let i64s = |name: &str| {
         file.tensor(name)
             .unwrap()
             .data()
-            .chunks_exact(8)
-            .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| i64::from_le_bytes(*bytes))
             .collect::<Vec<_>>()
     };
     Golden {
@@ -168,7 +172,7 @@ fn incremental_decode_matches_one_span() {
         let kinds = trunk.config().applications();
         for (held, application) in state.held_keys().iter().zip(&kinds) {
             match trunk.config().heads(application.layer).window {
-                Some(_) => assert!(*held <= window + span - 1, "held {held}"),
+                Some(_) => assert!(*held < window + span, "held {held}"),
                 None => assert_eq!(*held, at),
             }
         }

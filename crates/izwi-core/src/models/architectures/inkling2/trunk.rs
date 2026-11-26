@@ -1071,7 +1071,7 @@ impl Inkling2Trunk {
 
         let read = depth_read(&self.output_query, &block_states, &hidden)?.squeeze(1)?;
         let out = rms_norm(&read, &self.final_norm, c.rms_norm_eps)?;
-        if let Some(trace) = trace.as_deref_mut() {
+        if let Some(trace) = trace {
             trace
                 .entries
                 .push(("final_hidden".to_string(), out.clone()));

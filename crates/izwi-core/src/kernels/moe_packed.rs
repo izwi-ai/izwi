@@ -742,7 +742,11 @@ pub(crate) mod tests {
                         let value = match format {
                             PackedFormat::Nvfp4 => {
                                 let byte = codes[col / 2];
-                                let code = if col % 2 == 0 { byte & 15 } else { byte >> 4 };
+                                let code = if col.is_multiple_of(2) {
+                                    byte & 15
+                                } else {
+                                    byte >> 4
+                                };
                                 f64::from(e2m1(code)) * f64::from(e4m3(scales[col / 16]))
                             }
                             PackedFormat::Mxfp8 => {

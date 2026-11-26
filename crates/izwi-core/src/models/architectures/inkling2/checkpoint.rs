@@ -580,12 +580,16 @@ impl Inkling2Checkpoint {
         let bytes = self.bytes(located);
         match located.dtype {
             Dtype::BF16 => Ok(bytes
-                .chunks_exact(2)
-                .map(|pair| bf16::from_le_bytes([pair[0], pair[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| bf16::from_le_bytes(*pair).to_f32())
                 .collect()),
             Dtype::F32 => Ok(bytes
-                .chunks_exact(4)
-                .map(|quad| f32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|quad| f32::from_le_bytes(*quad))
                 .collect()),
             other => Err(load_error(format!("`{name}` has dtype {other:?}"))),
         }
