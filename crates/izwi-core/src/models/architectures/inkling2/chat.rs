@@ -39,6 +39,56 @@ use crate::tokenizer::Tokenizer;
 /// published 1M-token limit is not served.
 pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 32_768;
 
+/// Selects where the experts run: `auto` (on the device on CUDA, on the host
+/// elsewhere), `host`, or `device`.
+pub const EXPERT_BACKEND_ENV: &str = "IZWI_INKLING2_MOE_BACKEND";
+/// Largest relative error the device experts may show against the host path
+/// at load before the model falls back to the host.
+const DEVICE_EXPERT_TOLERANCE: f32 = 1e-3;
+
+/// Where the experts were asked to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertBackendRequest {
+    Auto,
+    Host,
+    Device,
+}
+
+impl ExpertBackendRequest {
+    pub fn from_env() -> Self {
+        Self::parse(crate::env::value(EXPERT_BACKEND_ENV).as_deref())
+    }
+
+    pub(crate) fn parse(value: Option<&str>) -> Self {
+        match value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("host") => Self::Host,
+            Some("device") => Self::Device,
+            _ => Self::Auto,
+        }
+    }
+
+    /// Whether this request puts the experts on a device of `backend`.
+    pub fn wants_device(self, backend: BackendKind) -> bool {
+        match self {
+            Self::Host => false,
+            Self::Device => true,
+            Self::Auto => backend == BackendKind::Cuda,
+        }
+    }
+}
+
+/// Where the experts run and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpertPlacement {
+    pub on_device: bool,
+    pub reason: String,
+    /// Worst relative error of the load-time check, when it ran.
+    pub check_error: Option<f32>,
+}
+
 fn chat_error(message: impl std::fmt::Display) -> Error {
     Error::InferenceError(format!("Inkling 2 chat: {message}"))
 }
@@ -269,6 +319,7 @@ pub struct Inkling2ChatModel {
     reply_tokens: Inkling2ReplyTokens,
     trunk: Inkling2Trunk,
     max_context_tokens: usize,
+    experts: ExpertPlacement,
 }
 
 impl InferenceStateContractProvider for Inkling2ChatModel {
@@ -302,7 +353,59 @@ impl Inkling2ChatModel {
         let config = Inkling2Config::load(model_dir)?;
         let tokenizer = Tokenizer::from_path_requiring_tokenizer_json(model_dir)?;
         let checkpoint = Inkling2Checkpoint::open(model_dir, &config)?;
-        Self::from_parts(variant, device, config, tokenizer, &checkpoint)
+        Self::from_parts(
+            variant,
+            device,
+            config,
+            tokenizer,
+            &checkpoint,
+            ExpertBackendRequest::from_env(),
+        )
+    }
+
+    /// Puts the experts on the device when asked to, and keeps them there
+    /// only if they agree with the host path.
+    fn place_experts(
+        trunk: &mut Inkling2Trunk,
+        request: ExpertBackendRequest,
+        backend: BackendKind,
+    ) -> ExpertPlacement {
+        let host = |reason: String, check_error| ExpertPlacement {
+            on_device: false,
+            reason,
+            check_error,
+        };
+        if !request.wants_device(backend) {
+            return host(
+                match request {
+                    ExpertBackendRequest::Host => format!("{EXPERT_BACKEND_ENV}=host"),
+                    _ => "the device kernels are CUDA only".to_string(),
+                },
+                None,
+            );
+        }
+        if let Err(error) = trunk.experts_to_device() {
+            trunk.experts_to_host();
+            return host(format!("upload failed: {error}"), None);
+        }
+        match trunk.check_device_experts() {
+            Ok(error) if error <= DEVICE_EXPERT_TOLERANCE => ExpertPlacement {
+                on_device: true,
+                reason: "checked against the host path at load".to_string(),
+                check_error: Some(error),
+            },
+            Ok(error) => {
+                trunk.experts_to_host();
+                host(
+                    format!("the device experts differ from the host path by {error:e}"),
+                    Some(error),
+                )
+            }
+            Err(error) => {
+                trunk.experts_to_host();
+                host(format!("the device check failed: {error}"), None)
+            }
+        }
     }
 
     pub(crate) fn from_parts(
@@ -311,6 +414,7 @@ impl Inkling2ChatModel {
         config: Inkling2Config,
         tokenizer: Tokenizer,
         checkpoint: &Inkling2Checkpoint,
+        expert_backend: ExpertBackendRequest,
     ) -> Result<Self> {
         let reply_tokens = Inkling2ReplyTokens::load(&tokenizer)?;
         if reply_tokens.end_sampling != config.eos_token_id {
@@ -324,7 +428,12 @@ impl Inkling2ChatModel {
                 "Inkling 2: the tokenizer vocabulary exceeds the unembedding".into(),
             ));
         }
-        let trunk = Inkling2Trunk::load(checkpoint, &config, &device.device)?;
+        let mut trunk = Inkling2Trunk::load(checkpoint, &config, &device.device)?;
+        let experts =
+            Self::place_experts(&mut trunk, expert_backend, BackendKind::from(device.kind));
+        if !experts.on_device && expert_backend.wants_device(BackendKind::from(device.kind)) {
+            tracing::warn!("Inkling 2 experts stay on the host: {}", experts.reason);
+        }
         let max_context_tokens = config.max_context_tokens.min(DEFAULT_MAX_CONTEXT_TOKENS);
         info!(
             "Loaded Inkling 2 chat model on {:?} from {} ({} layer applications, {:.1} GiB of packed experts, {} context tokens)",
@@ -342,7 +451,13 @@ impl Inkling2ChatModel {
             reply_tokens,
             trunk,
             max_context_tokens,
+            experts,
         })
+    }
+
+    /// Where the experts run.
+    pub fn expert_placement(&self) -> &ExpertPlacement {
+        &self.experts
     }
 
     pub fn variant(&self) -> ModelVariant {
@@ -383,7 +498,12 @@ impl Inkling2ChatModel {
         serde_json::json!({
             "family": "inkling2_chat",
             "trunk": "composed",
-            "experts": "packed, host",
+            "experts": {
+                "backend": if self.experts.on_device { "device" } else { "host" },
+                "reason": self.experts.reason,
+                "check_error": self.experts.check_error,
+                "device_bytes": self.trunk.expert_device_bytes(),
+            },
             "layer_applications": self.config.application_count(),
             "expert_resident_bytes": self.trunk.expert_resident_bytes(),
             "max_context_tokens": self.max_context_tokens,

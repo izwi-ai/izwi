@@ -9,13 +9,61 @@
 //! depend on what else is in the batch.
 //!
 //! This is the reference expert path on every device and the serving path on
-//! the CPU.
+//! the CPU and Metal.
+//!
+//! On CUDA the layer can run on the device instead ([`Inkling2Moe::upload`]):
+//! the packed bytes are uploaded as they are and `kernels::moe_packed` routes
+//! and multiplies there, so a step never reads activations back for the
+//! experts. The model checks that path against this one at load.
 
+use candle_core::{DType, Device, Tensor};
 use rayon::prelude::*;
 
 use super::config::Inkling2Config;
-use super::quant::PackedExperts;
+use super::quant::{ExpertFormat, PackedExperts};
 use crate::error::{Error, Result};
+use crate::kernels::moe_packed::{self, PackedFormat, PackedWeights};
+
+/// A layer's routers and packed experts on a device.
+#[derive(Debug, Clone)]
+struct DeviceExperts {
+    /// `[hidden, experts]`.
+    router: Tensor,
+    bias: Tensor,
+    gate_up: PackedWeights,
+    down: PackedWeights,
+}
+
+fn upload_projection(experts: &PackedExperts, device: &Device) -> Result<PackedWeights> {
+    let format = match experts.format() {
+        ExpertFormat::Nvfp4 => PackedFormat::Nvfp4,
+        ExpertFormat::Mxfp8 => PackedFormat::Mxfp8,
+    };
+    let (count, rows, columns) = (experts.experts(), experts.rows(), experts.columns());
+    let factors = match experts.format() {
+        ExpertFormat::Nvfp4 => experts.factors().to_vec(),
+        ExpertFormat::Mxfp8 => vec![1.0f32; count],
+    };
+    let weights = PackedWeights {
+        format,
+        // The stored bytes go up as they are: no host conversion.
+        codes: Tensor::from_raw_buffer(
+            experts.codes().as_slice(),
+            DType::U8,
+            &[count, rows, format.code_bytes(columns)],
+            device,
+        )?,
+        scales: Tensor::from_raw_buffer(
+            experts.scales().as_slice(),
+            DType::U8,
+            &[count, rows, columns / format.block()],
+            device,
+        )?,
+        factors: Tensor::from_vec(factors, count, device)?,
+    };
+    weights.validate()?;
+    Ok(weights)
+}
 
 /// The experts a token uses and their weights, ascending by expert.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +86,8 @@ pub struct Inkling2Moe {
     router_bias: Vec<f32>,
     gate_up: PackedExperts,
     down: PackedExperts,
+    /// The layer on a device, when it runs there.
+    device: Option<DeviceExperts>,
 }
 
 impl Inkling2Moe {
@@ -70,7 +120,80 @@ impl Inkling2Moe {
             router_bias,
             gate_up,
             down,
+            device: None,
         })
+    }
+
+    /// Whether `kernels::moe_packed` takes this layer's geometry.
+    pub fn device_supported(&self) -> bool {
+        moe_packed::supported(self.hidden, self.width, self.router_bias.len(), self.top_k)
+    }
+
+    /// Puts the routers and the packed experts on `device`; the layer then
+    /// runs there ([`Self::forward_tensor`]).
+    pub fn upload(&mut self, device: &Device) -> Result<()> {
+        if !self.device_supported() {
+            return Err(Error::ModelLoadError(
+                "Inkling 2 experts: the device kernels do not take this geometry".to_string(),
+            ));
+        }
+        let experts = self.router_bias.len();
+        self.device = Some(DeviceExperts {
+            router: Tensor::from_vec(self.router_weight.clone(), (experts, self.hidden), device)?
+                .t()?
+                .contiguous()?,
+            bias: Tensor::from_vec(self.router_bias.clone(), experts, device)?,
+            gate_up: upload_projection(&self.gate_up, device)?,
+            down: upload_projection(&self.down, device)?,
+        });
+        Ok(())
+    }
+
+    /// Back to the host path; frees the device copy.
+    pub fn drop_device(&mut self) {
+        self.device = None;
+    }
+
+    pub fn on_device(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Bytes the device copy holds.
+    pub fn device_resident_bytes(&self) -> u64 {
+        self.device.as_ref().map_or(0, |device| {
+            (device.gate_up.resident_bytes()
+                + device.down.resident_bytes()
+                + (device.router.elem_count() + device.bias.elem_count()) * 4) as u64
+        })
+    }
+
+    /// The layer over `x` (`[rows, hidden]`, F32): on the device when
+    /// uploaded, else on the host with one read and one upload.
+    pub fn forward_tensor(&self, x: &Tensor) -> Result<Tensor> {
+        let (rows, hidden) = x.dims2()?;
+        match &self.device {
+            Some(device) => {
+                let logits = x.matmul(&device.router)?;
+                let routing =
+                    moe_packed::route(&logits, &device.bias, self.top_k, self.route_scale)?;
+                Ok(moe_packed::experts(
+                    x,
+                    &routing,
+                    &device.gate_up,
+                    &device.down,
+                    self.gate_cap,
+                    self.up_cap,
+                )?)
+            }
+            None => {
+                let host = x.flatten_all()?.to_vec1::<f32>()?;
+                Ok(Tensor::from_vec(
+                    self.forward(&host),
+                    (rows, hidden),
+                    x.device(),
+                )?)
+            }
+        }
     }
 
     pub fn gate_up(&self) -> &PackedExperts {

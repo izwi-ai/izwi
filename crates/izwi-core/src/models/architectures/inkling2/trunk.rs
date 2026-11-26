@@ -599,6 +599,79 @@ impl Inkling2Trunk {
         &self.device
     }
 
+    /// Runs every layer's experts on the trunk's device
+    /// ([`Inkling2Moe::upload`]). On an error some layers may already be
+    /// uploaded; [`Self::experts_to_host`] undoes that.
+    pub fn experts_to_device(&mut self) -> Result<()> {
+        let device = self.device.clone();
+        for layer in &mut self.layers {
+            layer.moe.upload(&device)?;
+        }
+        Ok(())
+    }
+
+    /// Runs every layer's experts on the host again.
+    pub fn experts_to_host(&mut self) {
+        for layer in &mut self.layers {
+            layer.moe.drop_device();
+        }
+    }
+
+    pub fn experts_on_device(&self) -> bool {
+        self.layers.iter().all(|layer| layer.moe.on_device())
+    }
+
+    /// Bytes of the experts' device copies.
+    pub fn expert_device_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|layer| layer.moe.device_resident_bytes())
+            .sum()
+    }
+
+    /// Compares the device experts with the host path on unstructured
+    /// input, one layer of each stored format, and returns the worst error
+    /// relative to the largest output. The host path reads the checkpoint's
+    /// own bytes, so an upload that changed them shows here.
+    pub fn check_device_experts(&self) -> Result<f32> {
+        let mut seen = Vec::new();
+        let mut worst = 0f32;
+        for layer in &self.layers {
+            let format = layer.moe.gate_up().format();
+            if seen.contains(&format) {
+                continue;
+            }
+            seen.push(format);
+            let rows = 3usize;
+            let mut state = 0x9E37_79B9u32;
+            let values = (0..rows * self.config.hidden)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+                })
+                .collect::<Vec<_>>();
+            let want = layer.moe.forward(&values);
+            let input = Tensor::from_vec(values, (rows, self.config.hidden), &self.device)?;
+            let got = layer
+                .moe
+                .forward_tensor(&input)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let scale = want.iter().fold(f32::MIN_POSITIVE, |m, v| m.max(v.abs()));
+            for (got, want) in got.iter().zip(&want) {
+                let error = (got - want).abs() / scale;
+                worst = if error.is_finite() {
+                    worst.max(error)
+                } else {
+                    f32::INFINITY
+                };
+            }
+        }
+        Ok(worst)
+    }
+
     /// Bytes the packed experts keep resident.
     pub fn expert_resident_bytes(&self) -> u64 {
         self.layers
@@ -797,13 +870,7 @@ impl Inkling2Trunk {
     }
 
     fn moe(&self, layer: &Layer, input: &Tensor) -> Result<Tensor> {
-        let (seq, hidden) = input.dims2()?;
-        let host = input.flatten_all()?.to_vec1::<f32>()?;
-        Ok(Tensor::from_vec(
-            layer.moe.forward(&host),
-            (seq, hidden),
-            &self.device,
-        )?)
+        layer.moe.forward_tensor(input)
     }
 
     /// One layer application over a span. `messages` is `[seq, 4, hidden]`

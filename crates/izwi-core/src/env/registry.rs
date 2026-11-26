@@ -1086,6 +1086,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sets the rollout inference broker mode: shadow or audit = shadow; enabled or a true boolean = on; anything else = off.",
     ),
     CoreEnvVar::new(
+        "IZWI_INKLING2_MOE_BACKEND",
+        Choice,
+        "auto",
+        Load,
+        "Selects where Inkling 2's packed experts run: auto (on the device on CUDA once the load-time check against the host path passes, on the host elsewhere), host, or device.",
+    ),
+    CoreEnvVar::new(
         "IZWI_KEEP_NEMO_ARCHIVES",
         Flag,
         "false",

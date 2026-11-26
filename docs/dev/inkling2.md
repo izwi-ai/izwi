@@ -84,9 +84,9 @@ Each has a test, and breaking each fails the parity test:
 
 | Part | CPU | Metal | CUDA |
 | --- | --- | --- | --- |
-| Experts, as stored (14.6 GiB) | mapped file | mapped file | mapped file (host) |
+| Experts, as stored (14.6 GiB) | mapped file | mapped file | device, uploaded as stored (the mapped file if they run on the host) |
 | Dense text tensors, F32 (6.0 GiB) | host | device | device |
-| Routers, F32 | host | host | host |
+| Routers, F32 | host | host | host, and a device copy with the experts |
 | Keys and values | F32 | F16 | BF16 |
 
 F16 keys and values on Metal move the tiny random fixture's logits by about
@@ -108,12 +108,21 @@ The served path is the composed trunk on every backend:
 - attention is composed from tensor operations over the context gathered
   from the paged cache (`KvArena::gather_context`), because the paged
   attention kernels take no additive bias or sink;
-- the experts run on the host from the mapped file, also on Metal and CUDA,
-  which costs one device-to-host read and one upload per layer application;
+- on the CPU and Metal the experts run on the host from the mapped file
+  (on Metal that costs one device-to-host read and one upload per layer
+  application);
+- on CUDA the experts run on the device (`kernels::moe_packed`): the packed
+  bytes are uploaded as stored, routing and the expert products stay on the
+  GPU, and the expert ids never reach the host. The load compares that path
+  with the host path on one layer of each format and falls back to the host
+  when they differ by more than 1e-3 relative. `IZWI_INKLING2_MOE_BACKEND`
+  (`auto`, `host`, `device`) overrides the choice; the loaded-model
+  diagnostics report the backend, the reason and the check's error;
 - rows of a batch run one after another.
 
-Not implemented yet: fused attention, convolution and expert kernels, CUDA
-graphs, dense tensors in the checkpoint's BF16, image input (the vision
+Not implemented yet: fused attention and convolution kernels, CUDA graphs
+(the composed attention has per-step shapes and host-built masks, so a
+whole-step graph needs the fused attention first), device experts on Metal, dense tensors in the checkpoint's BF16, image input (the vision
 tower is not loaded), prefix sharing, releasing windowed pages, the MTP
 head, and grammar-constrained tool calls and JSON output.
 
@@ -143,7 +152,10 @@ head, and grammar-constrained tool calls and JSON output.
 | Trunk on the Metal device; serving on a Metal cache with F32 keys (logit error 1.4e-4, greedy tokens equal) and with F16 keys as served (logit error 0.10 on the random fixture) | Metal tests, M-series Mac | passes |
 | The reference fixture against Transformers itself | `generate_inkling2_golden.py --check-transformers` | not run: needs a Transformers release with `inkling2_loop` |
 | Real checkpoint on any backend | a machine with 24 GB+ | not run |
-| CUDA build and run | | not run |
+| Device experts inside the served model, on the kernels' CPU reference: load check, logits, greedy tokens equal to the host path | CPU test | passes |
+| The CUDA expert kernels' source, run on the host one thread at a time against an independent evaluation | `scripts/cuda-host-emulation/moe_packed.cpp` | passes |
+| CUDA build type check with a stand-in `nvcc` | this Mac | passes |
+| Anything on a GPU | | not run |
 
 The reference fixture (`tests/fixtures/inkling2_golden`) is a tiny random
 model in the published layout whose activations come from a plain-PyTorch

@@ -3,7 +3,7 @@
 
 use candle_core::{DType, Device};
 
-use super::chat::{ChatDecodeState, Inkling2ChatModel};
+use super::chat::{ChatDecodeState, ExpertBackendRequest, Inkling2ChatModel};
 use super::checkpoint::Inkling2Checkpoint;
 use super::config::tests::{fixture, tiny};
 use super::prompt::END_SAMPLING;
@@ -21,6 +21,10 @@ fn tiny_model() -> Inkling2ChatModel {
 }
 
 fn tiny_model_on(profile: DeviceProfile) -> Inkling2ChatModel {
+    tiny_model_with(profile, ExpertBackendRequest::Auto)
+}
+
+fn tiny_model_with(profile: DeviceProfile, experts: ExpertBackendRequest) -> Inkling2ChatModel {
     let mut config = tiny();
     // ASCII byte tokens, then the special tokens.
     let tokenizer = test_tokenizer_sized(128);
@@ -32,6 +36,7 @@ fn tiny_model_on(profile: DeviceProfile) -> Inkling2ChatModel {
         config,
         tokenizer,
         &checkpoint,
+        experts,
     )
     .unwrap()
 }
@@ -321,4 +326,54 @@ fn metal_prefill_and_decode_track_the_reference() {
             assert_eq!(got, reference_greedy(prompt, 8));
         }
     }
+}
+
+/// The device expert path (the kernels' CPU reference here) inside the
+/// served model: it passes the load-time check, and the model then tracks
+/// the reference logits and picks the host path's tokens.
+#[test]
+fn device_experts_serve_the_same_reply() {
+    let golden = golden();
+    let host = tiny_model().without_turn_end_for_test();
+    assert!(!host.expert_placement().on_device);
+    let device = tiny_model_with(DeviceProfile::cpu(), ExpertBackendRequest::Device)
+        .without_turn_end_for_test();
+    let placement = device.expert_placement();
+    assert!(placement.on_device, "{}", placement.reason);
+    assert!(placement.check_error.unwrap() <= 1e-4);
+    assert_eq!(device.runtime_diagnostics()["experts"]["backend"], "device");
+
+    let vocab = device.config().unpadded_vocab;
+    let config = ChatGenerationConfig::default();
+    let prompt = &golden.tokens[..golden.prompt_tokens];
+    let mut state = device
+        .start_decode_managed(prompt, 12, &config, caches(&device, 1).remove(0))
+        .unwrap();
+    let row = prompt.len() - 1;
+    let error = max_error(
+        &values(state_logits(&state)),
+        &golden.logits[row * vocab..(row + 1) * vocab],
+    );
+    assert!(error <= 2e-3, "logit error {error}");
+    let got = generate(&device, &mut state, 12);
+    let mut state = host
+        .start_decode_managed(prompt, 12, &config, caches(&host, 1).remove(0))
+        .unwrap();
+    assert_eq!(got, generate(&host, &mut state, 12));
+}
+
+#[test]
+fn the_expert_backend_request_parses() {
+    use crate::backends::BackendKind;
+    let parse = ExpertBackendRequest::parse;
+    assert_eq!(parse(None), ExpertBackendRequest::Auto);
+    assert_eq!(parse(Some("auto")), ExpertBackendRequest::Auto);
+    assert_eq!(parse(Some(" Host ")), ExpertBackendRequest::Host);
+    assert_eq!(parse(Some("DEVICE")), ExpertBackendRequest::Device);
+    assert_eq!(parse(Some("something else")), ExpertBackendRequest::Auto);
+    assert!(ExpertBackendRequest::Auto.wants_device(BackendKind::Cuda));
+    assert!(!ExpertBackendRequest::Auto.wants_device(BackendKind::Metal));
+    assert!(!ExpertBackendRequest::Auto.wants_device(BackendKind::Cpu));
+    assert!(!ExpertBackendRequest::Host.wants_device(BackendKind::Cuda));
+    assert!(ExpertBackendRequest::Device.wants_device(BackendKind::Cpu));
 }

@@ -70,35 +70,51 @@ impl Inkling2Footprint {
         Ok(Self::of(&config, &checkpoint))
     }
 
-    /// Bytes on the host that stay for the model's lifetime: the mapped
-    /// experts and the routers.
-    pub fn host_resident_bytes(&self) -> u64 {
-        self.expert_bytes + self.router_bytes
+    /// Bytes on the host that stay for the model's lifetime: the routers,
+    /// and the mapped experts unless they run on the device.
+    pub fn host_resident_bytes(&self, experts_on_device: bool) -> u64 {
+        self.router_bytes
+            + if experts_on_device {
+                0
+            } else {
+                self.expert_bytes
+            }
     }
 
     /// Bytes in the load domain (host memory on the CPU, unified memory on
-    /// Metal, device memory on CUDA) after the load.
-    pub fn resident_bytes(&self, backend: BackendKind) -> u64 {
+    /// Metal, device memory on CUDA) after the load. `experts_on_device`:
+    /// the packed experts and a copy of the routers are uploaded.
+    pub fn resident_bytes(&self, backend: BackendKind, experts_on_device: bool) -> u64 {
+        let device_experts = if experts_on_device {
+            self.expert_bytes + self.router_bytes
+        } else {
+            0
+        };
         match backend {
-            BackendKind::Cpu | BackendKind::Metal => self.dense_bytes + self.host_resident_bytes(),
-            BackendKind::Cuda => self.dense_bytes,
+            // One memory: the mapped experts count whether or not a device
+            // copy exists beside them.
+            BackendKind::Cpu | BackendKind::Metal => {
+                self.dense_bytes + self.expert_bytes + self.router_bytes + device_experts
+            }
+            BackendKind::Cuda => self.dense_bytes + device_experts,
         }
     }
 
     /// The load's high point in the load domain: a dense tensor passes
     /// through a host F32 buffer and, for a projection, a transposed copy.
-    pub fn load_peak_bytes(&self, backend: BackendKind) -> u64 {
+    pub fn load_peak_bytes(&self, backend: BackendKind, experts_on_device: bool) -> u64 {
         let transient = match backend {
             BackendKind::Cpu | BackendKind::Metal => 2 * self.largest_dense_bytes,
             // The host buffer is not device memory.
             BackendKind::Cuda => self.largest_dense_bytes,
         };
-        self.resident_bytes(backend) + transient
+        self.resident_bytes(backend, experts_on_device) + transient
     }
 
-    /// CUDA: host bytes at the load's high point.
-    pub fn cuda_host_load_peak_bytes(&self) -> u64 {
-        self.host_resident_bytes() + self.largest_dense_bytes
+    /// CUDA: host bytes at the load's high point. Uploaded experts are read
+    /// through the mapping, which the host can drop again.
+    pub fn cuda_host_load_peak_bytes(&self, experts_on_device: bool) -> u64 {
+        self.host_resident_bytes(experts_on_device) + self.largest_dense_bytes
     }
 }
 
@@ -144,13 +160,19 @@ mod tests {
             (config.vocab * config.hidden * 4) as u64
         );
         assert!(footprint.dense_bytes > footprint.largest_dense_bytes);
+        // On the device, CUDA holds the experts and the host only the routers.
+        assert_eq!(
+            footprint.resident_bytes(BackendKind::Cuda, true),
+            footprint.dense_bytes + footprint.expert_bytes + footprint.router_bytes
+        );
+        assert_eq!(footprint.host_resident_bytes(true), footprint.router_bytes);
         assert!(
-            footprint.load_peak_bytes(BackendKind::Cpu)
-                > footprint.resident_bytes(BackendKind::Cpu)
+            footprint.load_peak_bytes(BackendKind::Cpu, false)
+                > footprint.resident_bytes(BackendKind::Cpu, false)
         );
         assert!(
-            footprint.resident_bytes(BackendKind::Cuda)
-                < footprint.resident_bytes(BackendKind::Metal)
+            footprint.resident_bytes(BackendKind::Cuda, false)
+                < footprint.resident_bytes(BackendKind::Metal, false)
         );
     }
 
