@@ -160,7 +160,7 @@ head, and grammar-constrained tool calls and JSON output.
 | Load, chat alone and concurrently, unload through the runtime | CPU test, synthetic checkpoint | passes |
 | Prompt against the published template | CPU test | passes |
 | Trunk on the Metal device; serving on a Metal cache with F32 keys (logit error 1.4e-4, greedy tokens equal) and with F16 keys as served (logit error 0.10 on the random fixture) | Metal tests, M-series Mac | passes |
-| The reference fixture against Transformers itself | `generate_inkling2_golden.py --check-transformers` | not run: needs a Transformers release with `inkling2_loop` |
+| The reference fixture against Transformers itself, every layer application and the logits | `generate_inkling2_golden.py --check-transformers`, Transformers 5.24.1 | passes: F64 logits within 1e-12 |
 | Real checkpoint on any backend | a machine with 24 GB+ | not run |
 | Device experts inside the served model, on the kernels' CPU reference: load check, logits, greedy tokens equal to the host path | CPU test | passes |
 | The CUDA expert kernels' source, run on the host one thread at a time against an independent evaluation | `scripts/cuda-host-emulation/moe_packed.cpp` | passes |
@@ -169,5 +169,11 @@ head, and grammar-constrained tool calls and JSON output.
 
 The reference fixture (`tests/fixtures/inkling2_golden`) is a tiny random
 model in the published layout whose activations come from a plain-PyTorch
-transcription of the Transformers forward pass. Until that transcription is
-checked against Transformers, parity is with the transcription.
+transcription of the Transformers forward pass. The transcription was checked
+against Transformers 5.24.1 on that checkpoint: run in F64 the two agree to
+1e-12 on the logits and 6e-11 on every layer application. In F32 they differ
+by 2e-3 on the logits, which is rounding that the tiny random model amplifies
+(Transformers' own F32 run is 1e-3 from its F64 one). Transformers takes the
+full-attention layers from `layer_types`, so the fixture's config carries it
+next to `local_layer_ids`; without it every sixth layer is a full one, as
+published.

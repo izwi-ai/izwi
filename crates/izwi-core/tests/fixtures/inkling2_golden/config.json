@@ -32,6 +32,16 @@
       4,
       6
     ],
+    "layer_types": [
+      "hybrid_sliding",
+      "hybrid_sliding",
+      "hybrid",
+      "hybrid_sliding",
+      "hybrid_sliding",
+      "hybrid",
+      "hybrid_sliding",
+      "hybrid"
+    ],
     "sconv_kernel_size": 4,
     "unpadded_vocab_size": 150,
     "final_logit_softcapping": 30.0,

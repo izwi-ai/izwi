@@ -13,8 +13,8 @@ The forward pass below is a plain-PyTorch transcription of transformers'
 stores (dequantized experts, BF16-rounded dense tensors). It needs torch only,
 because the transformers release that carries `inkling2_loop` is not installed
 on the machine this was written on. `--check-transformers` loads the written
-checkpoint with transformers itself and compares the logits, for whoever has
-that release.
+checkpoint with transformers itself and compares every layer application and
+the logits; it passed against transformers 5.24.1 (F64 logits within 1e-12).
 
 The tiny geometry covers every layer class: sliding and full attention, inside
 and outside the loop, both expert formats, a window shorter than the sequence,
@@ -66,6 +66,12 @@ TEXT_CONFIG = {
     "qk_l2_clip_threshold": 2.0,
     "rel_l2_clip_threshold": 1.0,
     "local_layer_ids": [0, 1, 3, 4, 6],
+    # transformers does not read `local_layer_ids`: it takes `layer_types`, and
+    # without one makes every sixth layer a full one, which is the published
+    # layout but not this one.
+    "layer_types": [
+        "hybrid_sliding" if layer in (0, 1, 3, 4, 6) else "hybrid" for layer in range(8)
+    ],
     "sconv_kernel_size": 4,
     "unpadded_vocab_size": 150,
     "final_logit_softcapping": 30.0,
@@ -551,15 +557,62 @@ def write_safetensors(path: Path, tensors: dict[str, tuple[str, torch.Tensor]]) 
     path.write_bytes(struct.pack("<Q", len(head)) + head + b"".join(blobs))
 
 
-def check_with_transformers(out: Path, tokens: torch.Tensor, logits: torch.Tensor) -> None:
+def check_with_transformers(out: Path, tokens: torch.Tensor, logits: torch.Tensor, reference: dict) -> None:
+    """Compare the transcription with transformers on the written checkpoint.
+
+    In F32 the two differ by rounding alone, and the tiny random model
+    amplifies it (activations near 500, sixteen layer applications): about
+    2e-3 on the logits. So the deciding comparison runs both in F64, where a
+    transcription error cannot hide: transformers' explicit F32 steps are
+    widened for the duration of the run, and its grouped matrix product, which
+    refuses F64, is replaced by the same product group by group.
+    """
+    import transformers.integrations.moe as moe
     from transformers import Inkling2LoopForCausalLM  # needs the release that carries inkling2_loop
 
     model = Inkling2LoopForCausalLM.from_pretrained(out, dtype=torch.float32).eval()
     with torch.no_grad():
         theirs = model(input_ids=tokens[None]).logits[0]
-    error = (theirs - logits).abs().max().item()
-    print(f"transformers max |logit difference|: {error:.3e}")
-    if error > 2e-3:
+    single = (theirs - logits).abs().max().item()
+    print(f"transformers F32 max |logit difference|: {single:.3e}")
+
+    def grouped_mm(input, weight, offs):
+        rows, start = [], 0
+        for group, end in enumerate(offs.tolist()):
+            rows.append(input[start:end].to(weight.dtype) @ weight[group])
+            start = end
+        return torch.cat(rows, 0)
+
+    states = []
+    hooks = [
+        layer.register_forward_hook(lambda _module, _inputs, output: states.append(output))
+        for layer in model.model.layers
+    ]
+    saved = (torch.float32, torch.Tensor.float, moe._grouped_mm)
+    torch.float32, torch.Tensor.float, moe._grouped_mm = torch.float64, torch.Tensor.double, grouped_mm
+    try:
+        with torch.no_grad():
+            wide = model.double()(input_ids=tokens[None]).logits[0]
+            ours = Reference(
+                TEXT_CONFIG,
+                {name: value.double() if value.is_floating_point() else value for name, value in reference.items()},
+            )
+            ours_logits = ours.forward(tokens)
+    finally:
+        torch.float32, torch.Tensor.float, moe._grouped_mm = saved
+        for hook in hooks:
+            hook.remove()
+    if wide.dtype != torch.float64 or ours_logits.dtype != torch.float64:
+        raise SystemExit("the F64 comparison did not run in F64")
+    double = (wide - ours_logits).abs().max().item()
+    layers = max(
+        (state[0] - ours.trace[f"app.{index}.out"].reshape(state[0].shape)).abs().max().item()
+        for index, state in enumerate(states)
+    )
+    print(f"transformers F64 max |logit difference|: {double:.3e}, worst layer application: {layers:.3e}")
+    print(f"F32 against the F64 result: transformers {(theirs - wide).abs().max().item():.3e}, "
+          f"transcription {(logits - wide).abs().max().item():.3e}")
+    if double > 1e-9 or layers > 1e-8 or single > 1e-2:
         raise SystemExit("the transcription disagrees with transformers")
 
 
@@ -600,7 +653,7 @@ def main() -> None:
     print("wrote", out, "tensors:", len(stored), "trace:", len(model.trace))
 
     if "--check-transformers" in sys.argv:
-        check_with_transformers(out, tokens, logits)
+        check_with_transformers(out, tokens, logits, reference)
 
 
 if __name__ == "__main__":
