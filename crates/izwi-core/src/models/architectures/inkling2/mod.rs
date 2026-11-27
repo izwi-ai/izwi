@@ -38,8 +38,8 @@ pub mod vision;
 
 #[cfg(test)]
 mod chat_tests;
-#[cfg(test)]
-pub(crate) mod synthetic;
+#[cfg(any(test, feature = "test-support"))]
+pub mod synthetic;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

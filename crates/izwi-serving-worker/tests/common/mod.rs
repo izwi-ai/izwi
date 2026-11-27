@@ -1232,6 +1232,38 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
     model_dir
 }
 
+/// The tiny Inkling 2 checkpoint (izwi-core's synthetic writer: the
+/// reference fixture's weights in the published layout, both expert formats,
+/// a byte-level tokenizer) as a model directory a worker accepts: the
+/// checkpoint plus the artifact manifest of the pinned revision.
+#[allow(dead_code)]
+pub fn write_tiny_inkling2_fixture(models_dir: &Path) -> PathBuf {
+    let variant = ModelVariant::Inkling2Mini;
+    let model_dir = models_dir.join(variant.dir_name());
+    izwi_core::runtime_models::architectures::inkling2::synthetic::write_checkpoint(&model_dir);
+
+    let manifest = ArtifactManifest {
+        schema_version: 1,
+        variant,
+        repo_id: variant.repo_id().into(),
+        revision: variant
+            .artifact_revision()
+            .expect("Inkling 2 Mini artifact revision is catalog-pinned")
+            .into(),
+        files: vec![
+            "config.json".into(),
+            "model.safetensors".into(),
+            "tokenizer.json".into(),
+        ],
+    };
+    std::fs::write(
+        model_dir.join("izwi-artifact.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    model_dir
+}
+
 /// The gateway's view of one worker: a registry holding only the worker
 /// `client` reaches, approved as it describes itself, behind a dispatcher for
 /// `config`. The status TTL covers a whole test, so nothing needs to poll.

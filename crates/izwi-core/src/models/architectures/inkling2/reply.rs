@@ -264,18 +264,15 @@ fn forced_call_rest(native: &str, owed: Owed) -> String {
     format!("{rest}\n{TOOL_CALL_CLOSE}")
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// The byte-level tokenizer the family's tests and its synthetic checkpoint
+/// share. Built for this crate's tests and, through the `test-support`
+/// feature, for another crate's; a release build has none of it.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod test_tokenizer {
     use super::*;
 
-    /// A byte-level test tokenizer: ids 0..=255 are bytes, then the special
-    /// tokens.
-    pub(crate) fn test_tokenizer() -> Tokenizer {
-        test_tokenizer_sized(256)
-    }
-
-    /// [`test_tokenizer`] with only the first `bytes` byte tokens (128:
-    /// ASCII), for models with a small vocabulary.
+    /// A byte-level tokenizer: ids `0..bytes` are bytes (128: ASCII, for
+    /// models with a small vocabulary), then the special tokens.
     pub(crate) fn test_tokenizer_sized(bytes: u32) -> Tokenizer {
         Tokenizer::from_hf_json_bytes(&test_tokenizer_json(bytes)).unwrap()
     }
@@ -351,6 +348,19 @@ pub(crate) mod tests {
             char::from_u32(256 + shifted).unwrap()
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A byte-level test tokenizer: ids 0..=255 are bytes, then the special
+    /// tokens.
+    pub(crate) fn test_tokenizer() -> Tokenizer {
+        test_tokenizer_sized(256)
+    }
+
+    pub(crate) use super::test_tokenizer::test_tokenizer_sized;
 
     fn ids(tokenizer: &Tokenizer, pieces: &[&str]) -> Vec<u32> {
         let mut out = Vec::new();

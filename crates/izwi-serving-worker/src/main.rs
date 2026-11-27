@@ -884,9 +884,10 @@ impl WorkerProcessConfig {
                     && variant != ModelVariant::Qwen3827BFp8
                     && variant != ModelVariant::Qwen3Moe30bA3bGguf
                     && variant != ModelVariant::Qwen36Moe35BA3BFp8
+                    && variant != ModelVariant::Inkling2Mini
                 {
                     bail!(
-                        "serving worker supports only LFM2.5-1.2B-Instruct-GGUF, LFM2.5-1.2B-Thinking-GGUF, LFM3-1.7B-GGUF, LFM3-1.7B-Q8_0-GGUF, Qwen3.8-27B-FP8, Qwen3-30B-A3B-GGUF, and Qwen3.6-35B-A3B-FP8 for chat"
+                        "serving worker supports only LFM2.5-1.2B-Instruct-GGUF, LFM2.5-1.2B-Thinking-GGUF, LFM3-1.7B-GGUF, LFM3-1.7B-Q8_0-GGUF, Qwen3.8-27B-FP8, Qwen3-30B-A3B-GGUF, Qwen3.6-35B-A3B-FP8, and Inkling-2-Mini for chat"
                     );
                 }
                 variant
@@ -1448,6 +1449,8 @@ fn execution_profile(
             ModelVariant::Qwen3Moe30bA3bGguf => ("gguf-q4_k_m", "native-qwen3-moe"),
             ModelVariant::Qwen3827BFp8 => ("fp8-block", "native-qwen38"),
             ModelVariant::Qwen36Moe35BA3BFp8 => ("fp8-block", "native-qwen35-moe"),
+            // Its experts stay packed as published: NVFP4 and MXFP8.
+            ModelVariant::Inkling2Mini => ("nvfp4-mxfp8", "native-inkling2"),
             other => bail!("no serving execution profile for chat model {other}"),
         },
         TaskKind::SpeechToText => match variant {
@@ -2234,6 +2237,24 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
             ]))
             .is_err());
         }
+    }
+
+    /// Inkling 2 Mini serves chat with its own execution profile.
+    #[test]
+    fn inkling2_takes_the_chat_lane_with_its_own_profile() {
+        let process = WorkerProcessConfig::from_env(&env_config::snapshot([
+            (WORKER_TASK_ENV, "chat"),
+            ("IZWI_WORKER_MODEL", "Inkling-2-Mini"),
+            ("IZWI_WORKER_ARTIFACT_REVISION", "test-rev"),
+            ("IZWI_WORKER_CREDENTIAL_ID", "test-cred"),
+            ("IZWI_WORKER_BEARER_TOKEN", "test-token-12345678"),
+        ]))
+        .unwrap();
+        assert_eq!(process.variant, ModelVariant::Inkling2Mini);
+        assert_eq!(
+            execution_profile(process.task, process.variant).unwrap(),
+            ("nvfp4-mxfp8", "native-inkling2")
+        );
     }
 
     #[test]

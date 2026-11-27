@@ -553,14 +553,16 @@ fn inkling2_file_bytes(file: &str) -> Option<u64> {
 }
 
 /// Marks a test's synthetic Inkling 2 checkpoint (a tiny model in the
-/// published layout, one unindexed weight file).
-#[cfg(test)]
+/// published layout, one unindexed weight file). Built for this crate's
+/// tests and, through the `test-support` feature, for another crate's; a
+/// release build has neither the marker nor the bypass it selects.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const INKLING2_SYNTHETIC_MARKER: &str = ".izwi-synthetic-checkpoint";
 
 /// Every file present and the weight file at its exact pinned size, so an
 /// interrupted 19.5 GB download never reads as complete.
 fn inkling2_bundle_is_complete(model_dir: &Path) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if model_dir.join(INKLING2_SYNTHETIC_MARKER).is_file() {
         return ["config.json", "tokenizer.json", "model.safetensors"]
             .iter()

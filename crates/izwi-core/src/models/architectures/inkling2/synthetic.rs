@@ -1,21 +1,26 @@
 //! A tiny Inkling 2 checkpoint on disk for runtime tests: the reference
 //! fixture's weights (`tests/fixtures/inkling2_golden`, in the published
 //! layout with both expert formats) with a byte-level tokenizer.
+//!
+//! Built for this crate's tests and, through the `test-support` feature,
+//! for another crate's (the serving worker's process test). A release build
+//! has none of it.
 
 use std::path::Path;
 
-use super::config::tests::fixture;
 use super::prompt::{END_SAMPLING, IMAGE_SLOT};
-use super::reply::tests::{test_tokenizer_json, test_tokenizer_sized};
+use super::reply::test_tokenizer::{test_tokenizer_json, test_tokenizer_sized};
 use crate::artifacts::downloader::INKLING2_SYNTHETIC_MARKER;
 
 /// ASCII byte tokens; the special tokens follow them.
 pub(crate) const BYTE_TOKENS: u32 = 128;
 
 /// Writes the checkpoint into `dir` (a model directory).
-pub(crate) fn write_checkpoint(dir: &Path) {
+pub fn write_checkpoint(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
-    let golden = fixture("inkling2_golden");
+    // This crate's own fixture directory, also when another crate's test
+    // calls in.
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/inkling2_golden");
     std::fs::copy(
         golden.join("model.safetensors"),
         dir.join("model.safetensors"),
