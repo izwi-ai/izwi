@@ -19,7 +19,8 @@ use crate::Result;
 use super::{
     arena_page_bytes, page_transfer, validate_attention_softcap, DeviceFence, KvArena,
     KvArenaConfig, KvArenaOperationStats, KvAttentionProvider, KvBackendRuntime, KvDeviceFence,
-    KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
+    KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvBiasedDecodeArgs,
+    PagedKvDecodeArgs, PagedKvPrefillArgs,
 };
 
 #[derive(Debug)]
@@ -434,6 +435,62 @@ impl KvArena for CpuKvArena {
                 row.context_len,
             )?,
         ))
+    }
+
+    fn paged_decode_biased(
+        &self,
+        binding: KvLayerBinding,
+        args: PagedKvBiasedDecodeArgs<'_>,
+    ) -> Result<Tensor> {
+        probe_device_op("kv.paged_decode_biased");
+        let layer = self.layer(binding)?;
+        let tables = self.lower_decode_tables(args.batch)?;
+        // The kernels' packed form: contexts, first-page offsets, then one
+        // padded row of physical pages per sequence.
+        let sequences = tables.rows.len();
+        let max_blocks = tables
+            .rows
+            .iter()
+            .map(|row| row.page_len)
+            .max()
+            .unwrap_or(0);
+        let mut metadata = vec![0_u32; sequences * (2 + max_blocks)];
+        for (index, row) in tables.rows.iter().enumerate() {
+            metadata[index] = row.context_len as u32;
+            metadata[sequences + index] = row.first_page_offset as u32;
+            let pages = &tables.pages[row.page_start..row.page_start + row.page_len];
+            for (slot, page) in metadata[2 * sequences + index * max_blocks..]
+                .iter_mut()
+                .zip(pages)
+            {
+                *slot = *page as u32;
+            }
+        }
+        let _guard = self
+            .mutation_lock
+            .read()
+            .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
+        let output = crate::kernels::paged_bias_sink::attend(
+            &crate::kernels::paged_bias_sink::PagedBiasSink {
+                queries: args.queries,
+                profiles: args.profiles,
+                sinks: args.sinks,
+                keys: &layer.keys,
+                values: &layer.values,
+                metadata: &metadata,
+                device_metadata: None,
+                max_blocks,
+                queries_per_table: args.queries_per_sequence as usize,
+                scale: args.softmax_scale,
+                window: args.window_tokens,
+            },
+        )?;
+        self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.cpu_reference_attention_dispatches
+            .fetch_add(1, Ordering::Relaxed);
+        self.last_attention_provider
+            .store(KvAttentionProvider::CpuReference.code(), Ordering::Relaxed);
+        Ok(output)
     }
 
     fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {

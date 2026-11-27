@@ -254,6 +254,35 @@ pub struct PagedKvDecodeArgs<'a> {
     pub softcap: Option<f32>,
 }
 
+/// Paged decode with an additive position bias and a sink logit
+/// ([`crate::kernels::paged_bias_sink`]).
+///
+/// A query scores the key at backward distance `d` (0 is its own key) as
+/// `q.k * softmax_scale + (d < extent ? profile[d] : 0)`; one sink logit per
+/// (query, head) joins the softmax and carries no value. The operands are
+/// F32 whatever the arena stores, and so is the output.
+///
+/// `batch` holds one block table per sequence and each table serves
+/// `queries_per_sequence` consecutive rows: the last row sees the table's
+/// whole context, the row before it one token less, and so on. With one
+/// query per sequence this is a batch of decode rows; with one sequence it
+/// is a prefill span whose keys and values are already written.
+pub struct PagedKvBiasedDecodeArgs<'a> {
+    /// `[rows, query_heads, key_head_dim]` F32, `rows = sequences *
+    /// queries_per_sequence`, each sequence's queries oldest first.
+    pub queries: &'a Tensor,
+    /// `[rows, query_heads, extent]` F32, indexed by backward distance.
+    pub profiles: &'a Tensor,
+    /// `[rows, query_heads]` F32, unscaled.
+    pub sinks: &'a Tensor,
+    pub batch: &'a KvDecodeBatchMetadata,
+    pub queries_per_sequence: u32,
+    pub softmax_scale: f32,
+    /// Optional causal window in tokens, the query's own included. The
+    /// tables may hold more than a row's window; older keys are skipped.
+    pub window_tokens: Option<u32>,
+}
+
 /// One ragged row in a multi-query paged prefill/extend operation.
 ///
 /// `context_len` is the visible context after the final query token has been
@@ -782,10 +811,11 @@ pub trait KvArena: Send + Sync {
     /// tensors, `[context_len, kv_heads, head_dim]` each, oldest token first,
     /// in the arena's storage dtype.
     ///
-    /// For attention forms the paged kernels do not implement (an additive
-    /// per-query bias, a sink logit): the model composes its own attention
-    /// over the gathered context. The gather is ordered after every write
-    /// submitted through this arena before it.
+    /// For attention forms the paged kernels do not implement: the model
+    /// composes its own attention over the gathered context
+    /// ([`Self::paged_decode_biased`] covers an additive per-query bias with
+    /// a sink logit). The gather is ordered after every write submitted
+    /// through this arena before it.
     fn gather_context(
         &self,
         _layer: KvLayerBinding,
@@ -793,6 +823,20 @@ pub trait KvArena: Send + Sync {
     ) -> Result<(Tensor, Tensor)> {
         Err(Error::InferenceError(format!(
             "{:?} KV arenas do not gather a context",
+            self.backend_kind()
+        )))
+    }
+    /// Paged decode with an additive position bias and a sink logit, F32
+    /// `[rows, query_heads, value_head_dim]`. Every row is computed from its
+    /// own context alone, so its bits do not depend on the batch. The read
+    /// is ordered after every write submitted through this arena before it.
+    fn paged_decode_biased(
+        &self,
+        _layer: KvLayerBinding,
+        _args: PagedKvBiasedDecodeArgs<'_>,
+    ) -> Result<Tensor> {
+        Err(Error::InferenceError(format!(
+            "{:?} KV arenas do not decode with a bias and a sink",
             self.backend_kind()
         )))
     }

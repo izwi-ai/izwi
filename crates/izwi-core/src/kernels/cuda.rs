@@ -3654,6 +3654,12 @@ pub(crate) fn cuda_ptx_moe_packed() -> &'static str {
     cuda_ptx::MOE_PACKED
 }
 
+/// The PTX of `kernels/cuda/paged_bias_sink.cu` (`kernels::paged_bias_sink`).
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_ptx_paged_bias_sink() -> &'static str {
+    cuda_ptx::PAGED_BIAS_SINK
+}
+
 /// The PTX of `kernels/cuda/moe_relu2.cu` (`kernels::moe_relu2`).
 #[cfg(feature = "cuda")]
 pub(crate) fn cuda_ptx_moe_relu2() -> &'static str {

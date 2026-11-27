@@ -8,7 +8,8 @@ use candle_core::Tensor;
 
 use crate::backends::kv::{
     submit_ordered_after_write, KvArena, KvSlotMap, KvWriteArgs, KvWriteBatchCompletion,
-    KvWriteCompletionCollector, PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
+    KvWriteCompletionCollector, PagedKvBiasedDecodeArgs, PagedKvDecodeArgs, PagedKvPrefillArgs,
+    PagedKvPrefillRow,
 };
 use crate::error::{Error, Result};
 use crate::kv::{
@@ -999,6 +1000,119 @@ impl PhysicalPagedKvCache {
             submit_ordered_after_write(completion, || self.arena.gather_context(binding, &table))?;
         prepared.completions.collect(completion)?;
         Ok((keys, values, oldest))
+    }
+
+    /// Write one layer's projected K/V into its prepared slots and attend
+    /// over the same pages with an additive position bias and a sink logit
+    /// ([`KvArena::paged_decode_biased`]): the fused form of
+    /// [`Self::write_and_gather`] followed by the model's own softmax.
+    ///
+    /// `keys` and `values` are `[tokens, kv_heads, head_dim]` in the arena's
+    /// storage dtype, exactly as `write_and_gather` takes them. `queries`
+    /// `[tokens, heads, head_dim]`, `profiles` `[tokens, heads, extent]`
+    /// (indexed by backward distance, zero past `extent`) and `sinks`
+    /// `[tokens, heads]` are F32, one row per written token in order. Returns
+    /// F32 `[tokens, heads, value_head_dim]`: token `i` sits at position
+    /// `start + i` and sees the keys up to its own, back to `window_tokens`
+    /// when there is a window.
+    ///
+    /// The block table is the one `write_and_gather` reads: it starts where
+    /// the first written token's window does (or at the cache's window start)
+    /// and never names a page the cache released.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_and_attend_biased(
+        &self,
+        layer_idx: usize,
+        prepared: &mut PreparedPhysicalPagedStep,
+        keys: &Tensor,
+        values: &Tensor,
+        queries: &Tensor,
+        profiles: &Tensor,
+        sinks: &Tensor,
+        softmax_scale: f32,
+        window_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        let token_count = keys.dim(0)?;
+        if token_count == 0
+            || values.dim(0)? != token_count
+            || queries.dim(0)? != token_count
+            || profiles.dim(0)? != token_count
+            || sinks.dim(0)? != token_count
+        {
+            return Err(Error::InvalidInput(
+                "physical paged biased attention requires matching non-empty token dimensions"
+                    .into(),
+            ));
+        }
+        if prepared.arena != self.arena.id()
+            || prepared.logical_generation != self.logical_generation
+            || prepared.start_pos != self.context_len
+            || prepared.token_count != token_count
+            || prepared.slots.len() != token_count
+        {
+            return Err(Error::InvalidInput(
+                "physical paged biased attention received a stale or incompatible prepared step"
+                    .into(),
+            ));
+        }
+        let end_pos = prepared.start_pos + token_count;
+        let (table, window) = match window_tokens {
+            Some(0) => {
+                return Err(Error::InvalidInput(
+                    "physical paged sliding window cannot be zero".into(),
+                ))
+            }
+            Some(window) => (
+                self.sequence_table_from(
+                    (prepared.start_pos + 1)
+                        .saturating_sub(window)
+                        .max(self.window_start),
+                    end_pos,
+                )?,
+                Some(u32::try_from(window).map_err(|_| {
+                    Error::InvalidInput("physical paged window exceeds u32".into())
+                })?),
+            ),
+            None => (self.sequence_table_from(self.window_start, end_pos)?, None),
+        };
+        let queries_per_sequence = u32::try_from(token_count)
+            .map_err(|_| Error::InvalidInput("physical paged query length exceeds u32".into()))?;
+        let batch = KvDecodeBatchMetadata {
+            sequences: vec![table],
+        };
+        let binding = self.layer_binding(layer_idx)?;
+        let completion = self.arena.write_slots(
+            binding,
+            KvWriteArgs {
+                keys,
+                values,
+                slots: prepared.slots.as_ref(),
+            },
+        )?;
+        if completion.arena() != self.arena.id()
+            || completion.layer() != binding
+            || completion.slots() != token_count
+        {
+            return Err(Error::InferenceError(
+                "physical paged write returned a mismatched backend completion".into(),
+            ));
+        }
+        let (output, completion) = submit_ordered_after_write(completion, || {
+            self.arena.paged_decode_biased(
+                binding,
+                PagedKvBiasedDecodeArgs {
+                    queries,
+                    profiles,
+                    sinks,
+                    batch: &batch,
+                    queries_per_sequence,
+                    softmax_scale,
+                    window_tokens: window,
+                },
+            )
+        })?;
+        prepared.completions.collect(completion)?;
+        Ok(output)
     }
 
     /// Decode one token whose rotated key and value a fused kernel writes
@@ -2138,6 +2252,331 @@ mod tests {
             return;
         };
         gathered_context_is_what_was_written(&device);
+    }
+
+    /// The eager attention a model composes over a gathered context: scores
+    /// plus a gathered bias plus a visibility mask, one softmax over the
+    /// scores and the sink, the weighted values. `queries`, `profiles` and
+    /// `sinks` are `[seq, heads, ..]`; `keys` and `values` are
+    /// [`PhysicalPagedKvCache::write_and_gather`]'s, whose first row sits at
+    /// position `oldest`. Returns `[seq, heads, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn eager_bias_sink_attention(
+        queries: &Tensor,
+        profiles: &Tensor,
+        sinks: &Tensor,
+        keys: &Tensor,
+        values: &Tensor,
+        oldest: usize,
+        first: usize,
+        window: Option<usize>,
+        kv_heads: usize,
+    ) -> Tensor {
+        let (seq, heads, head_dim) = queries.dims3().unwrap();
+        let extent = profiles.dim(2).unwrap();
+        let device = queries.device();
+        let keys = keys.to_dtype(DType::F32).unwrap();
+        let values = values.to_dtype(DType::F32).unwrap();
+        let held_now = keys.dim(0).unwrap();
+        assert_eq!(oldest + held_now, first + seq);
+        // Head-major, as the model holds them.
+        let queries = queries.transpose(0, 1).unwrap().contiguous().unwrap();
+        let profiles = profiles.transpose(0, 1).unwrap().contiguous().unwrap();
+        let sinks = sinks.transpose(0, 1).unwrap().unsqueeze(2).unwrap();
+
+        let mut columns = Vec::with_capacity(seq * held_now);
+        let mut inside = Vec::with_capacity(seq * held_now);
+        let mut hidden_mask = Vec::with_capacity(seq * held_now);
+        for query in 0..seq {
+            let query_position = (first + query) as i64;
+            for key in 0..held_now {
+                let distance = query_position - (oldest + key) as i64;
+                let visible = distance >= 0 && window.is_none_or(|window| distance < window as i64);
+                let biased = distance >= 0 && distance < extent as i64;
+                columns.push(distance.clamp(0, extent as i64 - 1) as u32);
+                inside.push(if biased { 1.0f32 } else { 0.0 });
+                hidden_mask.push(if visible { 0.0f32 } else { f32::NEG_INFINITY });
+            }
+        }
+        let shape = (1, seq, held_now);
+        let columns = Tensor::from_vec(columns, shape, device)
+            .unwrap()
+            .broadcast_as((heads, seq, held_now))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let inside = Tensor::from_vec(inside, shape, device).unwrap();
+        let hidden_mask = Tensor::from_vec(hidden_mask, shape, device).unwrap();
+        let bias = profiles
+            .gather(&columns, 2)
+            .unwrap()
+            .broadcast_mul(&inside)
+            .unwrap();
+
+        let groups = heads / kv_heads;
+        let per_head = |kv: &Tensor| {
+            kv.transpose(0, 1)
+                .unwrap()
+                .unsqueeze(1)
+                .unwrap()
+                .broadcast_as((kv_heads, groups, held_now, head_dim))
+                .unwrap()
+                .reshape((heads, held_now, head_dim))
+                .unwrap()
+        };
+        let key_heads = per_head(&keys);
+        let value_heads = per_head(&values);
+        let scores = (queries
+            .matmul(&key_heads.transpose(1, 2).unwrap().contiguous().unwrap())
+            .unwrap()
+            * (head_dim as f64).powf(-0.5))
+        .unwrap();
+        let scores = (scores + bias)
+            .unwrap()
+            .broadcast_add(&hidden_mask)
+            .unwrap();
+        let probabilities =
+            candle_nn::ops::softmax(&Tensor::cat(&[&scores, &sinks], 2).unwrap(), 2)
+                .unwrap()
+                .narrow(2, 0, held_now)
+                .unwrap();
+        probabilities
+            .contiguous()
+            .unwrap()
+            .matmul(&value_heads)
+            .unwrap()
+            .transpose(0, 1)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+    }
+
+    /// `max |fused - eager| / max |eager|`.
+    fn bias_sink_ratio(fused: &Tensor, eager: &Tensor) -> f32 {
+        use crate::kernels::numeric_check::host_f32;
+        let (fused, eager) = (host_f32(fused).unwrap(), host_f32(eager).unwrap());
+        assert_eq!(fused.len(), eager.len());
+        let peak = eager.iter().fold(1e-6f32, |peak, v| peak.max(v.abs()));
+        let worst = crate::kernels::numeric_check::max_abs_diff(&fused, &eager);
+        assert!(worst.is_finite());
+        worst / peak
+    }
+
+    /// One cache composes the attention eagerly over
+    /// [`PhysicalPagedKvCache::write_and_gather`]; its twin runs
+    /// [`PhysicalPagedKvCache::write_and_attend_biased`] over the same keys
+    /// and values. Spans cross pages; layer 0 has no window and a bias
+    /// shorter than its context, layer 1 a window. Returns the worst
+    /// fused-to-eager difference relative to the eager peak.
+    fn paged_bias_sink_versus_eager(device: &candle_core::Device, dtype: DType) -> f32 {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let (heads, kv_heads, dim, capacity) = (6usize, 2usize, 32usize, 96usize);
+        let (window, extents) = (20usize, [12usize, 20]);
+        let mut caches =
+            test_physical_caches_with_dtype_on(device, dtype, 2, kv_heads, dim, capacity, 2);
+        let mut fused_cache = caches.pop().unwrap();
+        let mut eager_cache = caches.pop().unwrap();
+        let mut worst = 0f32;
+        let mut position = 0usize;
+        for (index, span) in [3usize, 1, 18, 1, 4, 1, 25, 1, 7].into_iter().enumerate() {
+            let seed = 1_000 * (index as u64 + 1);
+            let mut eager_step = eager_cache.prepare_append(position, span).unwrap();
+            let mut fused_step = fused_cache.prepare_append(position, span).unwrap();
+            for (layer, extent) in extents.into_iter().enumerate() {
+                let seed = seed + 100 * layer as u64;
+                let stored = |seed| {
+                    xorshift_tensor(&[span, kv_heads, dim], seed, 1.0, device)
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap()
+                };
+                let (keys, values) = (stored(seed + 1), stored(seed + 2));
+                let queries = xorshift_tensor(&[span, heads, dim], seed + 3, 6.0, device).unwrap();
+                let profiles =
+                    xorshift_tensor(&[span, heads, extent], seed + 4, 2.0, device).unwrap();
+                let sinks = xorshift_tensor(&[span, heads], seed + 5, 3.0, device).unwrap();
+                let layer_window = (layer == 1).then_some(window);
+                let (context_keys, context_values, oldest) = eager_cache
+                    .write_and_gather(layer, &mut eager_step, &keys, &values, layer_window)
+                    .unwrap();
+                let eager = eager_bias_sink_attention(
+                    &queries,
+                    &profiles,
+                    &sinks,
+                    &context_keys,
+                    &context_values,
+                    oldest,
+                    position,
+                    layer_window,
+                    kv_heads,
+                );
+                let fused = fused_cache
+                    .write_and_attend_biased(
+                        layer,
+                        &mut fused_step,
+                        &keys,
+                        &values,
+                        &queries,
+                        &profiles,
+                        &sinks,
+                        (dim as f32).powf(-0.5),
+                        layer_window,
+                    )
+                    .unwrap();
+                assert_eq!(fused.dims(), [span, heads, dim]);
+                assert_eq!(fused.dtype(), DType::F32);
+                worst = worst.max(bias_sink_ratio(&fused, &eager));
+            }
+            eager_cache.commit_prepared(eager_step).unwrap();
+            fused_cache.commit_prepared(fused_step).unwrap();
+            position += span;
+        }
+        assert_eq!(fused_cache.context_len(), position);
+        worst
+    }
+
+    #[test]
+    fn paged_bias_sink_matches_eager_on_cpu() {
+        let worst = paged_bias_sink_versus_eager(&Device::Cpu, DType::F32);
+        eprintln!("paged bias/sink versus eager on the CPU: {worst:e} of the peak");
+        assert!(worst <= 1e-5, "{worst:e}");
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn paged_bias_sink_matches_eager_on_metal() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("paged_bias_sink_matches_eager_on_metal")
+        else {
+            return;
+        };
+        for dtype in [DType::F32, DType::F16] {
+            let worst = paged_bias_sink_versus_eager(&device, dtype);
+            eprintln!(
+                "paged bias/sink versus eager on Metal, {dtype:?} K/V: {worst:e} of the peak"
+            );
+            assert!(worst <= 1e-5, "{dtype:?}: {worst:e}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn paged_bias_sink_matches_eager_on_cuda() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        for dtype in [DType::F32, DType::BF16] {
+            let worst = paged_bias_sink_versus_eager(&device, dtype);
+            eprintln!("paged bias/sink versus eager on CUDA, {dtype:?} K/V: {worst:e} of the peak");
+            assert!(worst <= 1e-5, "{dtype:?}: {worst:e}");
+        }
+    }
+
+    /// A windowed cache that rotates its pages: the fused attention follows
+    /// the cache's window start as the gather does and never reads a page
+    /// the cache gave up.
+    #[test]
+    fn paged_bias_sink_follows_a_rotating_window() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let device = Device::Cpu;
+        let (heads, kv_heads, dim) = (4usize, 2usize, 8usize);
+        // Three 16-token pages hold a 20-token window and a spare page.
+        let (window, capacity) = (20usize, 48usize);
+        let mut caches = test_physical_caches_on(&device, 1, kv_heads, dim, capacity, 2);
+        let mut fused_cache = caches.pop().unwrap();
+        let mut eager_cache = caches.pop().unwrap();
+        let mut position = 0usize;
+        let mut step_index = 0u64;
+        while position < 130 {
+            let span = [1usize, 3, 1, 6, 2][step_index as usize % 5];
+            for cache in [&mut eager_cache, &mut fused_cache] {
+                cache
+                    .advance_sliding_window_for_append(position, span, window)
+                    .unwrap();
+            }
+            let seed = 50 * (step_index + 1);
+            let keys = xorshift_tensor(&[span, kv_heads, dim], seed, 1.0, &device).unwrap();
+            let values = xorshift_tensor(&[span, kv_heads, dim], seed + 1, 1.0, &device).unwrap();
+            let queries = xorshift_tensor(&[span, heads, dim], seed + 2, 4.0, &device).unwrap();
+            let profiles = xorshift_tensor(&[span, heads, window], seed + 3, 2.0, &device).unwrap();
+            let sinks = xorshift_tensor(&[span, heads], seed + 4, 3.0, &device).unwrap();
+            let mut eager_step = eager_cache.prepare_append(position, span).unwrap();
+            let mut fused_step = fused_cache.prepare_append(position, span).unwrap();
+            let (context_keys, context_values, oldest) = eager_cache
+                .write_and_gather(0, &mut eager_step, &keys, &values, Some(window))
+                .unwrap();
+            let eager = eager_bias_sink_attention(
+                &queries,
+                &profiles,
+                &sinks,
+                &context_keys,
+                &context_values,
+                oldest,
+                position,
+                Some(window),
+                kv_heads,
+            );
+            let fused = fused_cache
+                .write_and_attend_biased(
+                    0,
+                    &mut fused_step,
+                    &keys,
+                    &values,
+                    &queries,
+                    &profiles,
+                    &sinks,
+                    (dim as f32).powf(-0.5),
+                    Some(window),
+                )
+                .unwrap();
+            let ratio = bias_sink_ratio(&fused, &eager);
+            assert!(ratio <= 1e-5, "position {position}: {ratio:e}");
+            eager_cache.commit_prepared(eager_step).unwrap();
+            fused_cache.commit_prepared(fused_step).unwrap();
+            position += span;
+            step_index += 1;
+        }
+        assert!(fused_cache.window_start() >= 80, "the cache rotated");
+        assert_eq!(fused_cache.window_start(), eager_cache.window_start());
+    }
+
+    /// The fused call refuses what `write_and_gather` refuses and leaves the
+    /// step usable.
+    #[test]
+    fn paged_bias_sink_refuses_mismatched_spans() {
+        let device = Device::Cpu;
+        let mut caches = test_physical_caches_on(&device, 1, 1, 4, 32, 1);
+        let cache = caches.remove(0);
+        let mut step = cache.prepare_append(0, 2).unwrap();
+        let kv = Tensor::zeros((2, 1, 4), DType::F32, &device).unwrap();
+        let queries = Tensor::zeros((2, 2, 4), DType::F32, &device).unwrap();
+        let profiles = Tensor::zeros((2, 2, 3), DType::F32, &device).unwrap();
+        let sinks = Tensor::zeros((2, 2), DType::F32, &device).unwrap();
+        let one = Tensor::zeros((1, 2, 4), DType::F32, &device).unwrap();
+        assert!(cache
+            .write_and_attend_biased(0, &mut step, &kv, &kv, &one, &profiles, &sinks, 0.5, None)
+            .is_err());
+        assert!(cache
+            .write_and_attend_biased(
+                0,
+                &mut step,
+                &kv,
+                &kv,
+                &queries,
+                &profiles,
+                &sinks,
+                0.5,
+                Some(0)
+            )
+            .is_err());
+        let out = cache
+            .write_and_attend_biased(
+                0, &mut step, &kv, &kv, &queries, &profiles, &sinks, 0.5, None,
+            )
+            .unwrap();
+        assert_eq!(out.dims(), [2, 2, 4]);
     }
 
     #[test]

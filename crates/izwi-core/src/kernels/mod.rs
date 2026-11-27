@@ -38,6 +38,7 @@ pub mod moe_gelu;
 pub mod moe_packed;
 pub mod moe_relu2;
 pub mod numeric_check;
+pub mod paged_bias_sink;
 pub mod penalized_topk;
 pub mod qk_norm_rope;
 pub mod relpos_attention;
