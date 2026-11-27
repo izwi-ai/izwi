@@ -779,6 +779,77 @@ fn the_windowed_cache_can_release_pages_no_query_reaches() {
     assert!(state.begin_managed_quantum(other, None).is_err());
 }
 
+/// The fused attention kernel inside the served model gives the composed
+/// form's logits and tokens: on one cache with prefill cut into spans, and on
+/// the split layout after the windowed cache has released pages.
+#[test]
+fn fused_attention_serves_what_composed_attention_does() {
+    use super::state::Inkling2Caches;
+    let golden = golden();
+    let composed = tiny_model().without_turn_end_for_test();
+    // The composed form is the CPU's default.
+    assert!(composed.fused_attention().is_err());
+    let fused = tiny_model()
+        .without_turn_end_for_test()
+        .with_fused_attention_for_test();
+    let prompt = &golden.tokens[..40];
+    let config = ChatGenerationConfig::default();
+    let steps = 12;
+    let mut reference = composed
+        .start_decode_managed(prompt, steps, &config, caches(&composed, 1).remove(0))
+        .unwrap();
+    let want_logits = values(state_logits(&reference));
+    let want = generate(&composed, &mut reference, steps);
+
+    // Prefill in spans that end inside and beyond the window.
+    let mut state = fused
+        .begin_resumable_prefill_managed(prompt, steps, &config, caches(&fused, 1).remove(0))
+        .unwrap();
+    let mut at = 0;
+    for end in [3, 4, 21, prompt.len()] {
+        fused
+            .continue_resumable_prefill(&mut state, prompt, at, end)
+            .unwrap();
+        at = end;
+    }
+    let error = max_error(&values(state_logits(&state)), &want_logits);
+    assert!(error <= 2e-4, "fused prefill logits differ by {error}");
+    assert_eq!(generate(&fused, &mut state, steps), want);
+
+    // The split layout, then a windowed view without its early pages.
+    let (full, windowed) = split_caches(&fused);
+    let mut state = fused
+        .start_decode_managed(
+            prompt,
+            steps,
+            &config,
+            Inkling2Caches::new(full, Some(windowed)).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(generate(&fused, &mut state, 2), want[..2]);
+    let main = state.cache_view_for_test();
+    let held = state.windowed_cache_for_test().unwrap();
+    let window = fused.config().sliding.window.unwrap();
+    let page = held.arena().config().page_tokens as usize;
+    let context = held.context_len();
+    let window_start = context + 1 - window;
+    let view = PhysicalPagedKvCache::new_windowed(
+        held.arena().clone(),
+        held.arena()
+            .config()
+            .layers
+            .iter()
+            .map(|layer| layer.binding)
+            .collect(),
+        held.blocks[window_start / page..].to_vec(),
+        window_start,
+        context,
+    )
+    .unwrap();
+    state.begin_managed_quantum(main, Some(view)).unwrap();
+    assert_eq!(generate(&fused, &mut state, steps), want);
+}
+
 /// Rows of a batch do not affect each other.
 #[test]
 fn batch_rows_decode_as_they_do_alone() {
@@ -842,6 +913,14 @@ fn metal_prefill_and_decode_track_the_reference() {
     }
     let golden = golden();
     let model = tiny_model_on(profile).without_turn_end_for_test();
+    // Attention runs in the fused kernel on Metal once it passes its check.
+    if crate::env::value(super::chat::FUSED_ATTENTION_ENV).is_none() {
+        assert!(
+            model.fused_attention().is_ok(),
+            "{:?}",
+            model.fused_attention()
+        );
+    }
     let vocab = model.config().unpadded_vocab;
     let config = ChatGenerationConfig::default();
     let prompt = &golden.tokens[..golden.prompt_tokens];

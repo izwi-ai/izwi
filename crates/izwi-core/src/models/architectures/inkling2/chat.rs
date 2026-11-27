@@ -49,6 +49,12 @@ pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 32_768;
 /// Selects where the experts run: `auto` (on the device on CUDA, on the host
 /// elsewhere), `host`, or `device`.
 pub const EXPERT_BACKEND_ENV: &str = "IZWI_INKLING2_MOE_BACKEND";
+/// Selects the attention core of decode steps and short spans
+/// (`state::FUSED_ATTENTION_MAX_SPAN`): `auto` (the fused paged kernel on
+/// Metal and CUDA once it passes its load-time check, the composed form on
+/// the CPU), `on` (the fused kernel wherever it passes) or `off` (always
+/// composed).
+pub const FUSED_ATTENTION_ENV: &str = "IZWI_INKLING2_FUSED_ATTENTION";
 /// Kill switch for the decode step's CUDA graphs.
 pub const DECODE_GRAPHS_ENV: &str = "IZWI_INKLING2_DECODE_GRAPHS";
 /// Device memory the decode graphs hold once captured: stable copies of one
@@ -480,6 +486,9 @@ pub struct Inkling2ChatModel {
     experts: ExpertPlacement,
     /// CUDA graphs of a decode step's pure stages, or why there are none.
     graphs: std::result::Result<StretchGraphs, String>,
+    /// The fused attention kernel's load-time check (its worst error
+    /// relative to the host reference), or why attention is composed.
+    fused_attention: std::result::Result<f64, String>,
     /// The vision tower, when the checkpoint has one.
     vision: Option<Inkling2Vision>,
     /// Whether prompts share committed prefixes (set at load from the
@@ -527,6 +536,71 @@ impl Inkling2ChatModel {
             &checkpoint,
             ExpertBackendRequest::from_env(),
         )
+    }
+
+    /// Whether attention runs in the arena's fused kernel
+    /// (`kernels::paged_bias_sink`): where it is asked for, the head width
+    /// fits, and the kernel agrees with its host reference on this device.
+    fn resolve_fused_attention(
+        config: &Inkling2Config,
+        device: &candle_core::Device,
+        backend: BackendKind,
+    ) -> std::result::Result<f64, String> {
+        use crate::kernels::paged_bias_sink;
+        let request =
+            crate::env::value(FUSED_ATTENTION_ENV).map(|value| value.trim().to_ascii_lowercase());
+        match request.as_deref() {
+            Some("off" | "0" | "false") => {
+                return Err(format!("{FUSED_ATTENTION_ENV}=off"));
+            }
+            Some("on" | "1" | "true") => {}
+            _ if backend == BackendKind::Cpu => {
+                return Err(format!(
+                    "the composed form is the default on the CPU; {FUSED_ATTENTION_ENV}=on selects the fused kernel"
+                ));
+            }
+            _ => {}
+        }
+        for heads in [config.full, config.sliding] {
+            if paged_bias_sink::lanes(heads.head_dim).is_none() {
+                return Err(format!(
+                    "the fused kernel does not take a head width of {}",
+                    heads.head_dim
+                ));
+            }
+        }
+        let storage = match backend {
+            BackendKind::Cpu => candle_core::DType::F32,
+            BackendKind::Metal => candle_core::DType::F16,
+            BackendKind::Cuda => candle_core::DType::BF16,
+        };
+        match paged_bias_sink::self_check(device, storage) {
+            Ok(check) => match check.failure {
+                None => Ok(check.worst_ratio),
+                Some(failure) => Err(format!("the fused kernel failed its check: {failure}")),
+            },
+            Err(error) => Err(format!("the fused kernel's check did not run: {error}")),
+        }
+    }
+
+    /// Whether attention runs in the fused kernel.
+    pub fn fused_attention(&self) -> &std::result::Result<f64, String> {
+        &self.fused_attention
+    }
+
+    /// Runs attention in the fused kernel whatever the load chose.
+    #[cfg(test)]
+    pub(crate) fn with_fused_attention_for_test(mut self) -> Self {
+        self.fused_attention = Ok(0.0);
+        self
+    }
+
+    /// Composes attention in the trunk whatever the load chose, for a test
+    /// that compares the two forms.
+    #[cfg(test)]
+    pub(crate) fn with_composed_attention_for_test(mut self) -> Self {
+        self.fused_attention = Err("composed for a test".to_string());
+        self
     }
 
     /// Puts the experts on the device when asked to, and keeps them there
@@ -615,6 +689,11 @@ impl Inkling2ChatModel {
         } else {
             Err("the experts run on the host".to_string())
         };
+        let fused_attention =
+            Self::resolve_fused_attention(&config, &device.device, BackendKind::from(device.kind));
+        if let Err(reason) = &fused_attention {
+            tracing::debug!("Inkling 2 attention is composed: {reason}");
+        }
         let vision = config
             .vision
             .is_some()
@@ -640,6 +719,7 @@ impl Inkling2ChatModel {
             max_context_tokens,
             experts,
             graphs,
+            fused_attention,
             vision,
             prefix_caching: false,
         })
@@ -721,6 +801,10 @@ impl Inkling2ChatModel {
             "layer_applications": self.config.application_count(),
             "expert_resident_bytes": self.trunk.expert_resident_bytes(),
             "prefix_sharing": self.prefix_caching,
+            "attention": match &self.fused_attention {
+                Ok(error) => serde_json::json!({ "core": "fused", "check_error": error }),
+                Err(reason) => serde_json::json!({ "core": "composed", "reason": reason }),
+            },
             "dense": {
                 "projection_dtype": format!("{:?}", self.trunk.projection_dtype()),
                 "widened_projections": self.trunk.widened_projections(),
@@ -970,7 +1054,8 @@ impl Inkling2ChatModel {
         let mut working = conv.conv()?.clone();
         let mut prepared = cache.prepare_append(start, tokens.len())?;
         let hidden = {
-            let mut context = cache.context(&self.config, &mut prepared);
+            let mut context =
+                cache.context(&self.config, &mut prepared, self.fused_attention.is_ok());
             self.trunk.forward_span(
                 &embeddings,
                 start,

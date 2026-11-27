@@ -2542,6 +2542,205 @@ mod tests {
         assert_eq!(fused_cache.window_start(), eager_cache.window_start());
     }
 
+    /// Times one layer application both ways at the published geometry (24
+    /// heads over 8 KV heads, 128 dims, a 1,024-entry bias): the span's keys
+    /// and values are written, then either the context is gathered and the
+    /// attention composed eagerly (as [`eager_bias_sink_attention`] does,
+    /// host-built index and mask vectors included) or
+    /// [`KvArena::paged_decode_biased`] reads the pages. Each case is
+    /// `(context, span, window)`; `calls` layer applications are timed read
+    /// back one by one and queued before a single readback.
+    fn time_bias_sink_paths(
+        device: &candle_core::Device,
+        dtype: DType,
+        cases: &[(usize, usize, Option<usize>)],
+        calls: usize,
+    ) {
+        use crate::backends::kv::PagedKvBiasedDecodeArgs;
+        use crate::kernels::numeric_check::{host_f32, xorshift_tensor};
+
+        let (heads, kv_heads, dim, extent) = (24usize, 8usize, 128usize, 1_024usize);
+        for &(context, span, window) in cases {
+            let mut cache =
+                test_physical_caches_with_dtype_on(device, dtype, 1, kv_heads, dim, context, 1)
+                    .remove(0);
+            let binding = cache.layer_binding(0).unwrap();
+            let stored = |tokens: usize, seed: u64| {
+                xorshift_tensor(&[tokens, kv_heads, dim], seed, 1.0, device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+            };
+            let start = context - span;
+            if start > 0 {
+                let mut fill = cache.prepare_append(0, start).unwrap();
+                let completion = cache
+                    .arena
+                    .write_slots(
+                        binding,
+                        KvWriteArgs {
+                            keys: &stored(start, 1),
+                            values: &stored(start, 2),
+                            slots: fill.slots.as_ref(),
+                        },
+                    )
+                    .unwrap();
+                fill.completions.collect(completion).unwrap();
+                cache.commit_prepared(fill).unwrap();
+            }
+            let step = cache.prepare_append(start, span).unwrap();
+            let table = cache
+                .sequence_table_from(
+                    window.map_or(0, |window| (start + 1).saturating_sub(window)),
+                    context,
+                )
+                .unwrap();
+            let oldest = context - table.context_len as usize;
+            let batch = KvDecodeBatchMetadata {
+                sequences: vec![table.clone()],
+            };
+            let (keys, values) = (stored(span, 3), stored(span, 4));
+            let queries = xorshift_tensor(&[span, heads, dim], 5, 6.0, device).unwrap();
+            let profiles = xorshift_tensor(&[span, heads, extent], 6, 2.0, device).unwrap();
+            let sinks = xorshift_tensor(&[span, heads], 7, 3.0, device).unwrap();
+            let mut completions = Vec::new();
+            let mut write = || {
+                completions.push(
+                    cache
+                        .arena
+                        .write_slots(
+                            binding,
+                            KvWriteArgs {
+                                keys: &keys,
+                                values: &values,
+                                slots: step.slots.as_ref(),
+                            },
+                        )
+                        .unwrap(),
+                );
+            };
+            let mut timings = Vec::new();
+            for fused in [false, true] {
+                let mut apply = || {
+                    write();
+                    if fused {
+                        cache
+                            .arena
+                            .paged_decode_biased(
+                                binding,
+                                PagedKvBiasedDecodeArgs {
+                                    queries: &queries,
+                                    profiles: &profiles,
+                                    sinks: &sinks,
+                                    batch: &batch,
+                                    queries_per_sequence: span as u32,
+                                    softmax_scale: (dim as f32).powf(-0.5),
+                                    window_tokens: window.map(|window| window as u32),
+                                },
+                            )
+                            .unwrap()
+                    } else {
+                        let (context_keys, context_values) =
+                            cache.arena.gather_context(binding, &table).unwrap();
+                        eager_bias_sink_attention(
+                            &queries,
+                            &profiles,
+                            &sinks,
+                            &context_keys,
+                            &context_values,
+                            oldest,
+                            start,
+                            window,
+                            kv_heads,
+                        )
+                    }
+                };
+                host_f32(&apply()).unwrap();
+                let started = std::time::Instant::now();
+                for _ in 0..calls {
+                    host_f32(&apply()).unwrap();
+                }
+                let synced = started.elapsed().as_secs_f64() * 1e3 / calls as f64;
+                let started = std::time::Instant::now();
+                let outputs = (0..calls).map(|_| apply()).collect::<Vec<_>>();
+                host_f32(outputs.last().unwrap()).unwrap();
+                let queued = started.elapsed().as_secs_f64() * 1e3 / calls as f64;
+                timings.push((synced, queued));
+            }
+            for completion in completions {
+                completion.wait().unwrap();
+            }
+            eprintln!(
+                "bias/sink timing {:?} {dtype:?} K/V: context {context}, {span} queries, window \
+                 {window:?}: eager {:.3} ms read back each call, {:.3} ms with {calls} queued; \
+                 fused {:.3} ms and {:.3} ms",
+                device.location(),
+                timings[0].0,
+                timings[0].1,
+                timings[1].0,
+                timings[1].1,
+            );
+        }
+    }
+
+    /// `(context, span, window)` for one query and for prefill spans, on a
+    /// full layer and on a layer with a 1,024-token window.
+    fn bias_sink_timing_cases(
+        contexts: &[usize],
+        spans: &[usize],
+    ) -> Vec<(usize, usize, Option<usize>)> {
+        let mut cases = Vec::new();
+        for &span in spans {
+            for &context in contexts {
+                for window in [Some(1_024), None] {
+                    cases.push((context, span, window));
+                }
+            }
+        }
+        cases
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn paged_bias_sink_timing_fused_versus_eager_on_metal() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "paged_bias_sink_timing_fused_versus_eager_on_metal",
+        ) else {
+            return;
+        };
+        let mut cases = bias_sink_timing_cases(&[1_024, 8_192], &[1, 8, 16, 64, 256]);
+        // The longest full-layer span runs on its own, with fewer calls.
+        cases.retain(|case| *case != (8_192, 256, None));
+        time_bias_sink_paths(&device, DType::F16, &cases, 48);
+    }
+
+    /// A 256-query span over an 8,192-token context on a full layer. The
+    /// eager composition holds several `[24, 256, 8192]` planes per call, so
+    /// 48 queued calls did not finish in ten minutes on a 17 GB-free
+    /// machine; four calls do.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn paged_bias_sink_timing_longest_span_on_metal() {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "paged_bias_sink_timing_longest_span_on_metal",
+        ) else {
+            return;
+        };
+        time_bias_sink_paths(&device, DType::F16, &[(8_192, 256, None)], 4);
+    }
+
+    /// Only meaningful in an optimized build: in a dev build neither Candle
+    /// nor the host reference is optimized.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn paged_bias_sink_timing_fused_versus_eager_on_cpu() {
+        let mut cases = bias_sink_timing_cases(&[1_024, 8_192], &[1]);
+        cases.extend(bias_sink_timing_cases(&[1_024], &[64]));
+        time_bias_sink_paths(&Device::Cpu, DType::F32, &cases, 4);
+    }
+
     /// The fused call refuses what `write_and_gather` refuses and leaves the
     /// step usable.
     #[test]

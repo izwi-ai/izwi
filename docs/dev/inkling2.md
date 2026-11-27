@@ -138,9 +138,37 @@ The served path is the composed trunk on every backend:
   report warm-ups, captures, verifications and replays. Prefill is eager;
 - rows of a batch run one after another.
 
-Not implemented yet: a fused paged attention kernel with the position bias
-and sink (which a whole-step graph needs: until then 48 attention cores per
-token run eagerly), fused convolution kernels, and the MTP head.
+Not implemented yet: whole-step CUDA graphs (the attention core now runs in
+a fused kernel, but a step still uploads per-step positions and builds its
+key/value slot maps on the host), fused convolution kernels, and serving the
+drafter (`drafter.rs` computes it; the decode loop does not use it yet).
+
+## Attention core
+
+`kernels::paged_bias_sink` attends over the paged arena with the position
+bias and the sink in one kernel (host reference, Metal, CUDA), so a decode
+step neither gathers the context into dense tensors nor uploads host-built
+masks. The model uses it for decode steps and spans of up to 16 tokens on
+Metal and CUDA, after a load-time check against the host reference
+(`IZWI_INKLING2_FUSED_ATTENTION`: `auto`, `on`, `off`; the diagnostics
+report which core runs and why). Wider prefill spans are composed from
+gathered keys and values as before, and the CPU composes by default.
+
+Measured on an M1 Pro at the published geometry (24 heads over 8, F16 keys,
+one layer application, milliseconds per call with 48 calls queued):
+
+| Context, queries | Composed | Fused |
+| --- | --- | --- |
+| 1,024, 1 (window) | 11.1 | 0.48 |
+| 8,192, 1 (full) | 89.5 | 2.9 |
+| 1,024, 16 | 13.7 | 4.2 |
+| 8,192, 16 (full) | 113.9 | 46.5 |
+| 1,024, 64 | 22.7 | 20.6 |
+| 1,024, 256 | 64.9 | 86.8 |
+
+The fused kernel and the composed form agree to 8e-7 on Metal, and in the
+served model give the same tokens (`fused_attention_serves_what_composed_attention_does`).
+On CUDA the kernel is type-checked and host-emulated only.
 
 ## Dense weights in 16 bits
 

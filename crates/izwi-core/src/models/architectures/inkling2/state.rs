@@ -232,6 +232,15 @@ pub(crate) fn paged_geometry(config: &Inkling2Config) -> Vec<(u32, usize, usize,
         .collect()
 }
 
+/// The widest span the fused attention kernel serves; a wider prefill span
+/// is composed from gathered keys and values. On an M1 Pro at the published
+/// geometry (24 heads over 8, F16 keys, 48 calls queued) the kernel is 5 to
+/// 25 times faster for one query and 2.5 to 6 times for 8 or 16, but at 64
+/// and 256 queries it is up to a third slower than the composed form, which
+/// does a span's queries in one matrix product (`physical.rs`,
+/// `paged_bias_sink_timing_fused_versus_eager_on_metal`).
+pub(crate) const FUSED_ATTENTION_MAX_SPAN: usize = 16;
+
 /// Whether the model has sliding-window and full-attention applications.
 fn has_both_kinds(config: &Inkling2Config) -> bool {
     let windowed = config
@@ -394,15 +403,19 @@ impl Inkling2Caches {
     }
 
     /// The context a span's layer applications write to and read from.
+    /// With `fused`, attention runs in the arena's fused kernel; otherwise
+    /// the trunk composes it from gathered keys and values.
     pub(crate) fn context<'a>(
         &'a self,
         config: &Inkling2Config,
         prepared: &'a mut Inkling2Prepared,
+        fused: bool,
     ) -> Inkling2PagedContext<'a> {
         Inkling2PagedContext {
             routes: self.routes(config),
             caches: self,
             prepared,
+            fused,
         }
     }
 }
@@ -412,17 +425,17 @@ pub(crate) struct Inkling2PagedContext<'a> {
     caches: &'a Inkling2Caches,
     prepared: &'a mut Inkling2Prepared,
     routes: Vec<Route>,
+    fused: bool,
 }
 
-impl Inkling2Context for Inkling2PagedContext<'_> {
-    fn append(
+impl Inkling2PagedContext<'_> {
+    /// The cache, its layer and its prepared append for `application`,
+    /// checked to continue at `first`.
+    fn target(
         &mut self,
         application: usize,
-        keys: &Tensor,
-        values: &Tensor,
-        window: Option<usize>,
         first: usize,
-    ) -> Result<(Tensor, Tensor, usize)> {
+    ) -> Result<(&PhysicalPagedKvCache, usize, &mut PreparedPhysicalPagedStep)> {
         let route = *self
             .routes
             .get(application)
@@ -443,17 +456,65 @@ impl Inkling2Context for Inkling2PagedContext<'_> {
                 cache.context_len()
             )));
         }
+        Ok((cache, route.ordinal, prepared))
+    }
+}
+
+impl Inkling2Context for Inkling2PagedContext<'_> {
+    fn append(
+        &mut self,
+        application: usize,
+        keys: &Tensor,
+        values: &Tensor,
+        window: Option<usize>,
+        first: usize,
+    ) -> Result<(Tensor, Tensor, usize)> {
+        let (cache, ordinal, prepared) = self.target(application, first)?;
         // The arena stores keys and values in its own dtype (F16 on Metal,
         // BF16 on CUDA); activations are F32.
         let storage = cache.arena().config().dtype;
         let (keys, values) = (keys.to_dtype(storage)?, values.to_dtype(storage)?);
         let (keys, values, oldest) =
-            cache.write_and_gather(route.ordinal, prepared, &keys, &values, window)?;
+            cache.write_and_gather(ordinal, prepared, &keys, &values, window)?;
         Ok((
             keys.to_dtype(DType::F32)?,
             values.to_dtype(DType::F32)?,
             oldest,
         ))
+    }
+
+    fn attend(
+        &mut self,
+        application: usize,
+        keys: &Tensor,
+        values: &Tensor,
+        queries: &Tensor,
+        profiles: &Tensor,
+        sinks: &Tensor,
+        scale: f32,
+        window: Option<usize>,
+        first: usize,
+    ) -> Result<Option<Tensor>> {
+        if !self.fused || queries.dim(1)? > FUSED_ATTENTION_MAX_SPAN {
+            return Ok(None);
+        }
+        let (cache, ordinal, prepared) = self.target(application, first)?;
+        let storage = cache.arena().config().dtype;
+        let (keys, values) = (keys.to_dtype(storage)?, values.to_dtype(storage)?);
+        // The kernel takes one row per token; the trunk holds heads first.
+        let by_token =
+            |tensor: &Tensor| -> Result<Tensor> { Ok(tensor.transpose(0, 1)?.contiguous()?) };
+        Ok(Some(cache.write_and_attend_biased(
+            ordinal,
+            prepared,
+            &keys,
+            &values,
+            &by_token(queries)?,
+            &by_token(profiles)?,
+            &by_token(&sinks.squeeze(2)?)?,
+            scale,
+            window,
+        )?))
     }
 }
 

@@ -362,6 +362,29 @@ pub trait Inkling2Context {
         window: Option<usize>,
         first: usize,
     ) -> Result<(Tensor, Tensor, usize)>;
+
+    /// Appends as [`Self::append`] does and attends in the same call, when
+    /// the context has a fused attention for it: `queries`
+    /// (`[heads, seq, head_dim]`), `profiles` (`[heads, seq, extent]`, the
+    /// position bias by backward distance, zero beyond the extent) and
+    /// `sinks` (`[heads, seq, 1]`) are F32; the result is the attention
+    /// output `[seq, heads, head_dim]`. `None` leaves the keys and values
+    /// unwritten for the caller to append and attend itself.
+    #[allow(clippy::too_many_arguments)]
+    fn attend(
+        &mut self,
+        _application: usize,
+        _keys: &Tensor,
+        _values: &Tensor,
+        _queries: &Tensor,
+        _profiles: &Tensor,
+        _sinks: &Tensor,
+        _scale: f32,
+        _window: Option<usize>,
+        _first: usize,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
 }
 
 /// Keys and values held as plain tensors (the reference state).
@@ -999,8 +1022,10 @@ impl Inkling2Trunk {
     }
 
     /// The attention core: appends the span's keys and values to `context`
-    /// and attends over what it returns. It builds per-step index and mask
-    /// tensors on the host, so it always runs eagerly.
+    /// and attends over them. A context with a fused attention does both in
+    /// one call. Otherwise the context returns the keys and values and the
+    /// attention is composed here, with per-step index and mask tensors
+    /// built on the host; that is the reference form.
     fn attend(
         &self,
         index: usize,
@@ -1013,6 +1038,20 @@ impl Inkling2Trunk {
             return Err(trunk_error("the attention core is missing inputs"));
         };
         let seq = queries.dim(1)?;
+        let scale = (g.head_dim as f64).powf(-0.5);
+        if let Some(attended) = context.attend(
+            index,
+            keys,
+            values,
+            queries,
+            profiles,
+            sinks,
+            scale as f32,
+            g.window,
+            first,
+        )? {
+            return Ok(attended.reshape((seq, g.query_width()))?);
+        }
         let (keys, values, oldest) = context.append(index, keys, values, g.window, first)?;
         let held_now = keys.dim(0)?;
         if values.dim(0)? != held_now || oldest + held_now != first + seq {
@@ -1056,8 +1095,7 @@ impl Inkling2Trunk {
         };
         let key_heads = per_head(&keys)?;
         let value_heads = per_head(&values)?;
-        let scores = (queries.matmul(&key_heads.transpose(1, 2)?.contiguous()?)?
-            * (g.head_dim as f64).powf(-0.5))?;
+        let scores = (queries.matmul(&key_heads.transpose(1, 2)?.contiguous()?)? * scale)?;
         let scores = (scores + bias)?.broadcast_add(&hidden_mask)?;
         let probabilities =
             softmax(&Tensor::cat(&[&scores, sinks], 2)?, 2)?.narrow(2, 0, held_now)?;

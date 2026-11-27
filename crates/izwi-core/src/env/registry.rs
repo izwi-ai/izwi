@@ -1101,6 +1101,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Selects the dtype of Inkling 2's large dense matrices: auto or f32 (F32 everywhere), f16 (Metal: halves them, decode products faster, prefill spans over 16 rows slower), or bf16 (CUDA: the stored bytes, with projection activations rounded to BF16).",
     ),
     CoreEnvVar::new(
+        "IZWI_INKLING2_FUSED_ATTENTION",
+        Choice,
+        "auto",
+        Load,
+        "Selects Inkling 2's attention core for decode steps and spans of up to 16 tokens: auto (the fused paged kernel with position bias and sink on Metal and CUDA once it passes its load-time check, composed from gathered keys and values on the CPU), on (the fused kernel wherever it passes), or off (always composed). Wider prefill spans are always composed.",
+    ),
+    CoreEnvVar::new(
         "IZWI_INKLING2_MOE_BACKEND",
         Choice,
         "auto",
