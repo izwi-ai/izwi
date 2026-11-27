@@ -312,6 +312,16 @@ pub enum ModelVariant {
         alias = "Qwen3.6-35B-A3B"
     )]
     Qwen36Moe35BA3BFp8,
+    /// Inkling 2 Mini: Thinking Machines' text + image chat model, a looped
+    /// sparse-expert decoder (24 layers of weights, 48 layer applications
+    /// per token, 128 experts with 8 routed) published with NVFP4 and MXFP8
+    /// expert weights, which stay packed in memory on every backend.
+    #[serde(
+        rename = "Inkling-2-Mini",
+        alias = "thinkingmachines/Inkling-2-Mini",
+        alias = "inkling-2-mini"
+    )]
+    Inkling2Mini,
     /// Gemma 3 4B instruction-tuned chat model
     #[serde(rename = "Gemma-3-4b-it")]
     Gemma34BIt,
@@ -445,6 +455,10 @@ impl ModelVariant {
     /// contract (HF repo state 2026-04-24).
     pub const QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION: &'static str =
         "95a723d08a9490559dae23d0cff1d9466213d989";
+    /// Revision the Inkling 2 Mini tensor census and fixtures were taken
+    /// from (HF repo state 2026-11-24).
+    pub const INKLING2_MINI_ARTIFACT_REVISION: &'static str =
+        "c9d028302cd0f035fdf8e7e91f089a4ce94d2195";
     /// Official Qwen3-TTS generation limit from upstream generation configs
     /// (`max_new_tokens` in Hugging Face `generation_config.json`).
     pub const QWEN3_TTS_MAX_OUTPUT_FRAMES: usize = 8192;
@@ -631,6 +645,7 @@ impl ModelVariant {
         match self {
             Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
             Self::Qwen36Moe35BA3BFp8 => Some(Self::QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION),
+            Self::Inkling2Mini => Some(Self::INKLING2_MINI_ARTIFACT_REVISION),
             Self::FishAudioS2Pro => Some(Self::FISH_S2_PRO_ARTIFACT_REVISION),
             Self::FishAudioDrama3 => Some(Self::FISH_DRAMA3_ARTIFACT_REVISION),
             Self::Audio8TtsRealisticAir => Some(Self::AUDIO8_ARTIFACT_REVISION),
@@ -722,6 +737,7 @@ impl ModelVariant {
             Self::Qwen359BGguf => "unsloth/Qwen3.5-9B-GGUF",
             Self::Qwen3827BFp8 => "Qwen/Qwen3.8-27B-FP8",
             Self::Qwen36Moe35BA3BFp8 => "Qwen/Qwen3.6-35B-A3B-FP8",
+            Self::Inkling2Mini => "thinkingmachines/Inkling-2-Mini",
             Self::Gemma34BIt => "google/gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen/Qwen3-ForcedAligner-0.6B",
             Self::VoxtralMini4BRealtime2602 => "mistralai/Voxtral-Mini-4B-Realtime-2602",
@@ -788,6 +804,7 @@ impl ModelVariant {
             Self::Qwen359BGguf => "Qwen3.5 9B GGUF",
             Self::Qwen3827BFp8 => "Qwen3.8 27B FP8",
             Self::Qwen36Moe35BA3BFp8 => "Qwen3.6 35B-A3B FP8",
+            Self::Inkling2Mini => "Inkling 2 Mini",
             Self::Gemma34BIt => "Gemma 3 4B Instruct",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner 0.6B",
             Self::VoxtralMini4BRealtime2602 => "Voxtral Mini 4B Realtime",
@@ -855,6 +872,7 @@ impl ModelVariant {
             Self::Qwen359BGguf => "Qwen3.5-9B",
             Self::Qwen3827BFp8 => "Qwen3.8-27B-FP8",
             Self::Qwen36Moe35BA3BFp8 => "Qwen3.6-35B-A3B-FP8",
+            Self::Inkling2Mini => "Inkling-2-Mini",
             Self::Gemma34BIt => "Gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner-0.6B",
             Self::VoxtralMini4BRealtime2602 => "Voxtral-Mini-4B-Realtime-2602",
@@ -932,6 +950,10 @@ impl ModelVariant {
             Self::Qwen359BGguf => 6_598_688_544,        // local GGUF + mmproj + tokenizer assets
             Self::Qwen3827BFp8 => 30_889_968_808, // pinned indexed FP8 bundle + chat/tokenizer metadata
             Self::Qwen36Moe35BA3BFp8 => 37_470_000_000, // ~34.9 GiB indexed FP8 safetensors + chat/tokenizer metadata (HF model-card total; re-pinned at download)
+            // The 19.5 GB weight file, tokenizer.json and the small configs at
+            // the pinned revision (the downloader's file list; the MTP head is
+            // not fetched).
+            Self::Inkling2Mini => 19_552_331_059,
             Self::Gemma34BIt => 8_600_000_000,          // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
             Self::VoxtralMini4BRealtime2602 => 8_874_376_007, // resolved download total, Oct 2026
@@ -1050,6 +1072,11 @@ impl ModelVariant {
             // dequantized); the qwen3_5_moe representation plan replaces it
             // per backend (about 37 GiB on CUDA).
             Self::Qwen36Moe35BA3BFp8 => 140.0,
+            // A coarse hint: 14.6 GiB of packed experts mapped from the file
+            // and 6.0 GiB of F32 dense tensors, the load's transient and room
+            // for one conversation. Load admission prices each backend from
+            // the checkpoint header.
+            Self::Inkling2Mini => 24.0,
             Self::Gemma34BIt => 11.0,
             // The aligner expands to F32 on the CPU (3.42 GiB); Metal (F16
             // text) holds 2.69 GiB and CUDA (BF16 text) 2.30 GiB.
@@ -1356,6 +1383,7 @@ impl ModelVariant {
                 | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::Qwen35MoeChat
                 | crate::catalog::ModelFamily::Qwen38Chat
+                | crate::catalog::ModelFamily::Inkling2Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Lfm2Chat
                 | crate::catalog::ModelFamily::Lfm3Chat
@@ -1419,6 +1447,7 @@ impl ModelVariant {
             | Self::Rumble2Flash
             | Self::Qwen3827BFp8
             | Self::Qwen36Moe35BA3BFp8
+            | Self::Inkling2Mini
             | Self::Maya13B
             | Self::Maya13BGguf
             | Self::Maya2Native25B
@@ -1803,6 +1832,19 @@ impl ModelVariant {
             Self::Qwen3508BGguf | Self::Qwen352BGguf => (false, Vec::new(), false),
             Self::Qwen354BGguf | Self::Qwen359BGguf => (true, Vec::new(), false),
             Self::Qwen36Moe35BA3BFp8 => (true, Vec::new(), false),
+            // The template states a thinking effort in every prompt; the
+            // three served levels map to 0.99, 0.7 and 0.2, and thinking
+            // switched off is effort 0. Unset, the template's own default
+            // (0.9) applies.
+            Self::Inkling2Mini => (
+                true,
+                vec![
+                    ChatReasoningEffort::Xhigh,
+                    ChatReasoningEffort::Medium,
+                    ChatReasoningEffort::Low,
+                ],
+                false,
+            ),
             Self::Lfm2512BThinkingGguf => (true, Vec::new(), false),
             // LFM3 reasons by default; `enable_thinking=false` closes an empty
             // `<think></think>` instead.
@@ -1951,6 +1993,7 @@ impl ModelVariant {
                 | Self::Qwen359BGguf
                 | Self::Qwen3827BFp8
                 | Self::Qwen36Moe35BA3BFp8
+                | Self::Inkling2Mini
                 | Self::Nemotron35Transcribe30BA4BFp8
                 | Self::FishAudioDrama3
         )
@@ -2018,6 +2061,11 @@ impl ModelVariant {
         )
     }
 
+    /// Whether the chat model takes images in a conversation.
+    pub fn accepts_image_input(&self) -> bool {
+        self.is_qwen35_chat_gguf() || self.is_inkling2()
+    }
+
     /// Whether this is the revision-pinned native Qwen3.8 FP8 checkpoint.
     pub fn is_qwen38_fp8(&self) -> bool {
         matches!(self, Self::Qwen3827BFp8)
@@ -2028,6 +2076,11 @@ impl ModelVariant {
     /// Qwen3.5-35B-A3B-FP8 rollout); the name follows the architecture module.
     pub fn is_qwen35_moe_fp8(&self) -> bool {
         matches!(self, Self::Qwen36Moe35BA3BFp8)
+    }
+
+    /// Whether this is an Inkling 2 checkpoint.
+    pub fn is_inkling2(&self) -> bool {
+        matches!(self, Self::Inkling2Mini)
     }
 
     /// Whether this is an LFM2.5 chat GGUF variant.
@@ -2076,6 +2129,7 @@ impl ModelVariant {
             // checkpoint remains an exact-SHA hardware handoff gate.
             | Self::Qwen36Moe35BA3BFp8
             | Self::Qwen3827BFp8
+            | Self::Inkling2Mini
             | Self::Lfm2512BInstructGguf
             | Self::Lfm2512BThinkingGguf
             | Self::Lfm25Audio15BGguf
@@ -2164,6 +2218,7 @@ impl ModelVariant {
             Self::Qwen359BGguf,
             Self::Qwen3827BFp8,
             Self::Qwen36Moe35BA3BFp8,
+            Self::Inkling2Mini,
             Self::Gemma34BIt,
             Self::Qwen3ForcedAligner06B,
             Self::VoxtralMini4BRealtime2602,

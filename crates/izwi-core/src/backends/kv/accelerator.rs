@@ -20,8 +20,8 @@ use super::KvBackendRuntime;
 use super::{
     arena_page_bytes, page_transfer, DeviceFence, GraphKvLayers, KvArena, KvArenaConfig,
     KvArenaGrowthPlan, KvArenaOperationStats, KvAttentionProvider, KvDeviceFence, KvPageCopy,
-    KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
-    PagedKvPrefillRow,
+    KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvBiasedDecodeArgs, PagedKvDecodeArgs,
+    PagedKvPrefillArgs, PagedKvPrefillRow,
 };
 
 /// Operations Candle 0.11 can execute without moving KV data through host memory.
@@ -2741,6 +2741,88 @@ impl KvArena for CandleAcceleratorKvArena {
         self.record_attention_provider(KvAttentionProvider::Portable);
         self.paged_prefill_dispatches
             .fetch_add(1, Ordering::Relaxed);
+        Ok(output)
+    }
+
+    fn gather_context(
+        &self,
+        binding: KvLayerBinding,
+        table: &crate::kv::KvSequenceBlockTable,
+    ) -> Result<(Tensor, Tensor)> {
+        probe_device_op("kv.gather_context");
+        let page_tokens = self.config.page_tokens as usize;
+        let offset = table.first_page_offset as usize;
+        let context = table.context_len as usize;
+        if context == 0
+            || offset >= page_tokens
+            || table.blocks.len() != (offset + context).div_ceil(page_tokens)
+        {
+            return Err(Error::InferenceError(
+                "accelerator context gather received an inconsistent block table".into(),
+            ));
+        }
+        let pages = table
+            .blocks
+            .iter()
+            .map(|block| self.validate_block(*block).map(|page| page as u32))
+            .collect::<Result<Vec<_>>>()?;
+        let _guard = self.mutation_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+        })?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
+        let layer = self.layer_from(&layers, binding)?;
+        Ok((
+            super::gather_pages(&layer.keys, &pages, offset, context)?,
+            super::gather_pages(&layer.values, &pages, offset, context)?,
+        ))
+    }
+
+    fn paged_decode_biased(
+        &self,
+        binding: KvLayerBinding,
+        args: PagedKvBiasedDecodeArgs<'_>,
+    ) -> Result<Tensor> {
+        probe_device_op("kv.paged_decode_biased");
+        if !candle_accelerator_kv_support(self.backend).direct_paged_attention {
+            return Err(Error::InferenceError(format!(
+                "direct paged attention is not compiled for {:?}",
+                self.backend
+            )));
+        }
+        let _guard = self.mutation_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+        })?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
+        let layer = self.layer_from(&layers, binding)?;
+        // The decode plan's packed tables are the kernel's metadata as they
+        // are; a span of queries shares its sequence's one table.
+        let plan = self.cached_decode_plan(args.batch)?;
+        let output = crate::kernels::paged_bias_sink::attend(
+            &crate::kernels::paged_bias_sink::PagedBiasSink {
+                queries: args.queries,
+                profiles: args.profiles,
+                sinks: args.sinks,
+                keys: &layer.keys,
+                values: &layer.values,
+                metadata: &plan.host_native_metadata,
+                device_metadata: Some(&plan.native_metadata),
+                max_blocks: plan.max_blocks,
+                queries_per_table: args.queries_per_sequence as usize,
+                scale: args.softmax_scale,
+                window: args.window_tokens,
+            },
+        )?;
+        self.record_attention_provider(match self.backend {
+            BackendKind::Cuda => KvAttentionProvider::CudaNative,
+            _ => KvAttentionProvider::MetalNative,
+        });
+        self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
         Ok(output)
     }
 

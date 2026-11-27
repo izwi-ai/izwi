@@ -364,6 +364,11 @@ impl ModelVariant {
                 Provider::IzwiCudaEligible,
                 "Qwen3.8 DeltaNet blocks require independently verified Izwi CUDA causal-convolution coverage with a Candle fallback; Qwen3.5 evidence is not inherited",
             ),
+            ModelFamily::Inkling2Chat => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::CandleTensor,
+                "Inkling 2's four-tap causal convolutions (keys, values, attention and MLP outputs) are composed from Candle tensor operators over a ring of the last three inputs",
+            ),
             ModelFamily::Qwen3MoeChat | ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
                 CudaOperatorCapability::source_reviewed(
                     Operator::Convolution,
@@ -377,7 +382,10 @@ impl ModelVariant {
             | ModelFamily::ParakeetAsr
             | ModelFamily::NemotronAsr
             | ModelFamily::SortformerDiarization
-            | ModelFamily::Lfm25Audio => Provider::CandleTensor,
+            | ModelFamily::Lfm25Audio
+            // Scores add a per-query position bias and a sink logit, which
+            // FlashAttention does not take.
+            | ModelFamily::Inkling2Chat => Provider::CandleTensor,
             _ => Provider::CandleFlashAttentionEligible,
         };
         let paged_provider = match family {
@@ -386,6 +394,7 @@ impl ModelVariant {
             | ModelFamily::Qwen35Chat
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
+            | ModelFamily::Inkling2Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm3Chat
             | ModelFamily::Gemma3Chat
@@ -508,6 +517,10 @@ impl ModelVariant {
         }
 
         match self.family() {
+            ModelFamily::Inkling2Chat => CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Inkling 2 runs its attention, depth-residual reads and convolutions on Candle CUDA tensor kernels over paged keys and values; the packed NVFP4/MXFP8 experts run on the host from the mapped checkpoint; source review is not runtime validation",
+            ),
             ModelFamily::Tokenizer => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
                 "Qwen3 TTS tokenizer is a neural speech codec whose encoder, RVQ, transformer, and decoder use Candle CUDA tensor kernels when selected",
@@ -627,6 +640,13 @@ impl ModelVariant {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::CandleQuantizedGeneric,
                 "Qwen3.5/3.6 MoE stores 128x128 block-scaled FP8 Safetensors weights; with CUDA performance optimizations on (the default) projections stay resident as raw block FP8 and the fp8 projection kernel applies weight_scale_inv per GEMM (per-tensor Q8_0 fallback for kernel-incompatible geometry); projection_backend = \"q8\" or disabled optimizations expand them to resident BF16 at load",
+            );
+        }
+
+        if self.is_inkling2() {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Inkling 2 stores its experts as NVFP4 (4-bit E2M1 codes, one FP8 scale per 16 values, one factor per expert) and MXFP8 (FP8 values, one power-of-two scale per 32); they stay packed and are multiplied straight from the mapped bytes on the host, never expanded; dense tensors load as stored",
             );
         }
 

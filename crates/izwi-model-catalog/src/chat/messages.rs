@@ -80,6 +80,11 @@ pub struct ChatMediaInput {
     pub source: String,
 }
 
+/// Where a message's text holds each of its images, in order. The text is
+/// Qwen3.5's own image marker; other families split a message on it and
+/// write their own tokens.
+pub const CHAT_IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
 /// Where a message's text holds each of its audio clips, in order: the
 /// token LFM3-Audio's template writes for an audio content part.
 pub const CHAT_AUDIO_PLACEHOLDER: &str = "<|audio|>";

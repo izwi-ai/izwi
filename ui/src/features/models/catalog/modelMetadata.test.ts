@@ -47,6 +47,22 @@ describe("model display metadata", () => {
     expect(detail.capabilities).toContain("Voice Design");
   });
 
+  it("lists Inkling 2 Mini as a Thinking Machines chat model", () => {
+    expect(getModelDisplayName("Inkling-2-Mini", "Inkling 2 Mini")).toBe(
+      "Inkling 2 Mini",
+    );
+    expect(getModelProviderLabel("Inkling-2-Mini")).toBe("Thinking Machines");
+    const detail = resolveModelDetail({
+      variant: "Inkling-2-Mini",
+      display_name: "Inkling 2 Mini",
+      task: "chat",
+    });
+    expect(detail.category).toBe("chat");
+    expect(detail.capabilities).toContain("Reasoning Effort");
+    expect(detail.capabilities).toContain("Tool Calling");
+    expect(detail.size).toBe("18.21 GiB");
+  });
+
   it("lists both LFM3 Audio variants as Liquid AI speech models", () => {
     expect(getModelDisplayName("LFM3-Audio-2B-GGUF", "LFM3 Audio 2B GGUF")).toBe(
       "LFM3 Audio 2B",

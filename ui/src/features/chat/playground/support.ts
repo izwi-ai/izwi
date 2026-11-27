@@ -385,6 +385,10 @@ export function defaultThinkingEnabledForModel(variant: string | null): boolean 
   if (isLfm25ThinkingModel(variant) || isLfm3Model(variant)) {
     return true;
   }
+  // Inkling 2 thinks at its template's default effort unless told not to.
+  if (normalized.startsWith("inkling-2-")) {
+    return true;
+  }
   return normalized.startsWith("qwen3-");
 }
 
@@ -406,7 +410,8 @@ export function supportsImageAttachmentsForModel(
   if (!variant) {
     return false;
   }
-  return variant.trim().toLowerCase().startsWith("qwen3.5-");
+  const name = variant.trim().toLowerCase();
+  return name.startsWith("qwen3.5-") || name.startsWith("inkling-2-");
 }
 
 export function isLfm25ThinkingModel(variant: string | null): boolean {

@@ -34,6 +34,8 @@ pub(crate) mod rollout;
 mod routing;
 mod service;
 #[cfg(test)]
+mod inkling2_tests;
+#[cfg(test)]
 mod sov_transcribe_tests;
 mod speech_to_speech;
 mod telemetry;

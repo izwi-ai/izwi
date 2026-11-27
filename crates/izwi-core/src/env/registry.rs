@@ -1086,6 +1086,49 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sets the rollout inference broker mode: shadow or audit = shadow; enabled or a true boolean = on; anything else = off.",
     ),
     CoreEnvVar::new(
+        "IZWI_INKLING2_DECODE_GRAPHS",
+        Flag,
+        "true (CUDA only)",
+        Load,
+        "Kill switch: legacy/off runs the pure stages of an Inkling 2 decode step eagerly instead of replaying them as CUDA graphs (two per layer application; the attention core is always eager).",
+    )
+    .aliases(&[("legacy", false)]),
+    CoreEnvVar::new(
+        "IZWI_INKLING2_DENSE_DTYPE",
+        Choice,
+        "auto",
+        Load,
+        "Selects the dtype of Inkling 2's large dense matrices: auto or f32 (F32 everywhere), f16 (Metal: halves them, decode products faster, prefill spans over 16 rows slower), or bf16 (CUDA: the stored bytes, with projection activations rounded to BF16).",
+    ),
+    CoreEnvVar::new(
+        "IZWI_INKLING2_DRAFTER",
+        Choice,
+        "off",
+        Load,
+        "Serves Inkling 2's block drafter (mtp.safetensors in the model directory, fetched separately) for speculative decoding: on or off. A round drafts up to seven tokens and keeps those the sampler's own picks agree with, so replies are the same as without it.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_INKLING2_FUSED_ATTENTION",
+        Choice,
+        "auto",
+        Load,
+        "Selects Inkling 2's attention core for decode steps and spans of up to 16 tokens: auto (the fused paged kernel with position bias and sink on Metal and CUDA once it passes its load-time check, composed from gathered keys and values on the CPU), on (the fused kernel wherever it passes), or off (always composed). Wider prefill spans are always composed.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_INKLING2_MOE_BACKEND",
+        Choice,
+        "auto",
+        Load,
+        "Selects where Inkling 2's packed experts run: auto (on the device on CUDA once the load-time check against the host path passes, on the host elsewhere), host, or device (also on Metal, with the same check).",
+    ),
+    CoreEnvVar::new(
+        "IZWI_INKLING2_STEP_GRAPHS",
+        Choice,
+        "off",
+        Load,
+        "Asks for whole-step CUDA graphs of Inkling 2's decode steps (one token per row, up to 64 rows, the experts on the device, the fused attention, no drafter): on or off. Each width's first step is checked against the standard batched decode; a failure turns them off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_KEEP_NEMO_ARCHIVES",
         Flag,
         "false",
@@ -1542,7 +1585,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Path,
         "unset (local file media disabled)",
         Once,
-        "Sets the absolute directory Qwen3.5 vision may read file:// media from; unset disables local media.",
+        "Sets the absolute directory chat image input may read file:// media from; unset disables local media.",
     ),
     CoreEnvVar::new(
         "IZWI_METAL_DTYPE",
@@ -1851,6 +1894,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "false",
         Startup,
         "Never contacts Hugging Face: downloads are refused and download sizes come from the built-in estimates.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_PAGED_BIAS_SINK_EMULATOR_DIR",
+        Path,
+        "unset (test skipped)",
+        TestHarness,
+        "Directory the ignored kernels::paged_bias_sink emulator test writes its cases to (inputs and the host reference's output), for the C++ harness that runs kernels/cuda/paged_bias_sink.cu thread by thread on a machine without a GPU.",
     ),
     CoreEnvVar::new(
         "IZWI_PARAKEET_ASR_DTYPE",

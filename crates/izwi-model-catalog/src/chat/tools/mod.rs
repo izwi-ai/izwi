@@ -15,7 +15,7 @@ mod schema;
 
 pub use choice::{ToolChoice, ToolPlan};
 pub use dialect::ToolDialect;
-pub use grammar::ToolConstraint;
+pub use grammar::{ToolCallSyntax, ToolConstraint, INKLING_CALL_OPENER};
 pub use json::{is_deferred_tool, python_json, tool_function, tool_to_json, write_python_json};
 pub use lfm::{TOOL_CALL_END as LFM_TOOL_CALL_END, TOOL_CALL_START as LFM_TOOL_CALL_START};
 pub use parse::{

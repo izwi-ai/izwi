@@ -29,6 +29,7 @@ impl ModelLifecycleController {
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm3Chat
             | ModelFamily::Gemma3Chat
+            | ModelFamily::Inkling2Chat
             | ModelFamily::Voxtral
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::NemotronAsr

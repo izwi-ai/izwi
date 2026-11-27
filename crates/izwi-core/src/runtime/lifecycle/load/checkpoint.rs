@@ -102,6 +102,11 @@ pub(super) fn checkpoint_resource_plan(
         return fish_drama3_memory::resource_plan(model_path, BackendKind::from(device.kind))
             .map(Some);
     }
+    if variant.family() == crate::catalog::ModelFamily::Inkling2Chat {
+        // Priced from the checkpoint header, before a weight is read.
+        return inkling2_memory::resource_plan(model_path, BackendKind::from(device.kind))
+            .map(Some);
+    }
     // ASR, TTS, LFM2.5 chat and Qwen3.5 / Qwen3 chat (CPU and Metal) price what
     // their loader allocates; the catalog figure stays a display value for
     // them.

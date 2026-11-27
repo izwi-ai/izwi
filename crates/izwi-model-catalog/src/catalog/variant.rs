@@ -56,6 +56,9 @@ pub enum ModelFamily {
     Qwen35Chat,
     Qwen35MoeChat,
     Qwen38Chat,
+    /// Inkling 2: a looped sparse-expert text + image chat decoder with
+    /// packed NVFP4/MXFP8 experts.
+    Inkling2Chat,
     Lfm2Chat,
     Lfm25Audio,
     /// LFM3 text chat: the tri-hybrid trunk on the LFM2 backbone, with its
@@ -107,6 +110,7 @@ impl ModelFamily {
             | Self::Qwen35Chat
             | Self::Qwen35MoeChat
             | Self::Qwen38Chat
+            | Self::Inkling2Chat
             | Self::Lfm2Chat
             | Self::Lfm3Chat
             | Self::Gemma3Chat
@@ -470,6 +474,7 @@ impl ModelVariant {
             Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => ModelFamily::Qwen35Chat,
             Qwen36Moe35BA3BFp8 => ModelFamily::Qwen35MoeChat,
             Qwen3827BFp8 => ModelFamily::Qwen38Chat,
+            Inkling2Mini => ModelFamily::Inkling2Chat,
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
             Lfm317BGguf | Lfm317BQ8Gguf => ModelFamily::Lfm3Chat,
@@ -509,6 +514,7 @@ impl ModelVariant {
             | ModelFamily::Qwen35Chat
             | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
+            | ModelFamily::Inkling2Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm3Chat
             | ModelFamily::Gemma3Chat => ModelTask::Chat,

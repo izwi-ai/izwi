@@ -30,6 +30,10 @@ impl ToolDialect {
     pub fn of(variant: ModelVariant) -> Option<Self> {
         match variant.family() {
             ModelFamily::Qwen3Chat | ModelFamily::Qwen3MoeChat => Some(Self::HermesJson),
+            // Inkling 2 writes calls as its own JSON messages; its reply
+            // parser hands them to the server as Hermes blocks, and its
+            // prompt renderer reads past calls back from that form.
+            ModelFamily::Inkling2Chat => Some(Self::HermesJson),
             ModelFamily::Qwen35Chat | ModelFamily::Qwen35MoeChat | ModelFamily::Qwen38Chat => {
                 Some(Self::QwenXml)
             }

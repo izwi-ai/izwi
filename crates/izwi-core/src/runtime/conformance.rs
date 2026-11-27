@@ -13,9 +13,9 @@ use crate::backends::BackendKind;
 use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 61;
+pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 62;
 #[cfg(test)]
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 90;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 91;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformanceExecutionClass {
@@ -449,7 +449,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            81
+            82
         );
         assert_eq!(
             manifest

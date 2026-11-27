@@ -136,6 +136,11 @@ const QWEN38_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
 // at 1, the optional MTP draft layer at 4.
 const QWEN36_MOE_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
 const QWEN36_MOE_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
+// Inkling 2: every layer application at 1, or (when its contract splits them
+// so the engine can release window pages) the full-attention ones at 1 and
+// the sliding-window ones at 3.
+const INKLING2_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
+const INKLING2_WINDOWED_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(3);
 // Cancellation signals are AtomicBools without a notification edge. Polling
 // at 40 Hz bounds cancelled FIFO residency without turning admission into a
 // hot loop.
@@ -431,6 +436,54 @@ fn qwen38_managed_caches_for_row(
         })
         .transpose()?;
     Ok(Qwen38ManagedCaches { target, mtp })
+}
+
+/// Inkling 2's caches for a row: the main one and, when the contract has a
+/// sliding-window domain, that domain's.
+fn inkling2_managed_caches_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    reservation: &super::ManagedCacheReservation,
+) -> Result<(PhysicalPagedKvCache, Option<PhysicalPagedKvCache>)> {
+    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+        Error::InferenceError("managed Inkling 2 row has no model runtime".to_string())
+    })?;
+    let groups = runtime
+        .plan()
+        .groups
+        .iter()
+        .map(|group| (group.domain, group.id, group.arena))
+        .collect::<Vec<_>>();
+    let main_group =
+        exact_managed_group_for_domain(&groups, reservation, INKLING2_ATTENTION_DOMAIN, true)?
+            .ok_or_else(|| {
+                Error::InferenceError("managed Inkling 2 attention domain did not resolve".into())
+            })?;
+    let windowed_group = exact_managed_group_for_domain(
+        &groups,
+        reservation,
+        INKLING2_WINDOWED_ATTENTION_DOMAIN,
+        false,
+    )?;
+    let main = physical_paged_cache_for_row(
+        request,
+        scheduled,
+        reservation,
+        INKLING2_ATTENTION_DOMAIN,
+        main_group,
+    )?;
+    let windowed = windowed_group
+        .map(|group| {
+            physical_paged_cache_for_row(
+                request,
+                scheduled,
+                reservation,
+                INKLING2_WINDOWED_ATTENTION_DOMAIN,
+                group,
+            )
+        })
+        .transpose()?;
+    Ok((main, windowed))
 }
 
 fn qwen3_managed_cache_for_row(
@@ -3360,6 +3413,18 @@ impl ModelExecutor for NativeExecutor {
                 _ => "f32",
             }
             .into();
+        } else if variant.family() == crate::catalog::ModelFamily::Inkling2Chat {
+            // Inkling 2 activations are F32 on every backend; its paged KV is
+            // stored as `inkling2::state::kv_dtype` picks.
+            profile.compute_dtype = "f32".into();
+            profile.kv_dtype =
+                match crate::models::architectures::inkling2::state::kv_dtype(self.config.backend)
+                {
+                    crate::kv::v2::StateDType::F16 => "f16",
+                    crate::kv::v2::StateDType::Bf16 => "bf16",
+                    _ => "f32",
+                }
+                .into();
         } else {
             profile.compute_dtype = self.config.dtype.clone();
             profile.kv_dtype = self.config.kv_cache_dtype.clone();
@@ -6125,6 +6190,7 @@ mod tests {
         for family in [
             ModelFamily::Qwen3Chat,
             ModelFamily::Gemma3Chat,
+            ModelFamily::Inkling2Chat,
             ModelFamily::NemotronTranscribeAsr,
             ModelFamily::Lfm25Audio,
             ModelFamily::Lfm3Audio,

@@ -59,6 +59,9 @@ describe("chat playground support", () => {
   it("uses variant-aware thinking defaults for supported chat models", () => {
     expect(defaultThinkingEnabledForModel("Qwen3-14B-GGUF")).toBe(true);
     expect(defaultThinkingEnabledForModel("Qwen3.5-0.8B")).toBe(false);
+    expect(defaultThinkingEnabledForModel("Inkling-2-Mini")).toBe(true);
+    // Inkling 2 writes its own opener: its reply never starts inside a block.
+    expect(supportsImplicitOpenThinkTagParsing("Inkling-2-Mini")).toBe(false);
     expect(defaultThinkingEnabledForModel("Qwen3.5-2B")).toBe(false);
     expect(defaultThinkingEnabledForModel("Qwen3.5-4B")).toBe(true);
     expect(defaultThinkingEnabledForModel("Qwen3.5-9B")).toBe(true);
@@ -85,8 +88,9 @@ describe("chat playground support", () => {
     );
   });
 
-  it("recognizes Qwen3.5 as the image-capable chat family", () => {
+  it("recognizes the image-capable chat families", () => {
     expect(supportsImageAttachmentsForModel("Qwen3.5-4B")).toBe(true);
+    expect(supportsImageAttachmentsForModel("Inkling-2-Mini")).toBe(true);
     expect(supportsImageAttachmentsForModel("Qwen3-14B-GGUF")).toBe(false);
   });
 

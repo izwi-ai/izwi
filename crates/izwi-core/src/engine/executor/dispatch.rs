@@ -407,6 +407,21 @@ impl NativeExecutor {
                             caches.mtp,
                             reservation.clocked_state.clone(),
                         )
+                    } else if request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Inkling2Chat
+                    }) {
+                        let (cache, windowed) = super::inkling2_managed_caches_for_row(
+                            request,
+                            scheduled_req,
+                            reservation,
+                        )?;
+                        self.chat_request_with_managed_cache(
+                            request,
+                            scheduled_req,
+                            Some(cache),
+                            windowed,
+                            reservation.clocked_state.clone(),
+                        )
                     } else {
                         let cache = super::qwen3_managed_cache_for_row(
                             request,

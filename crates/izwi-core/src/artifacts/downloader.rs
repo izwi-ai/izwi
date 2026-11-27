@@ -521,6 +521,63 @@ fn sov_transcribe_bundle_is_complete(model_dir: &Path) -> bool {
         })
 }
 
+/// Inkling 2 Mini at its pinned revision. `mtp.safetensors` (the block
+/// drafter, 636 MB) is not fetched: serving it is a request
+/// (`IZWI_INKLING2_DRAFTER`), and the model loads without it.
+const INKLING2_METADATA_FILES: &[&str] = &[
+    "config.json",
+    "generation_config.json",
+    "chat_template.jinja",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "processor_config.json",
+    "model.safetensors.index.json",
+];
+const INKLING2_WEIGHT_FILES: [(&str, u64); 1] =
+    [("model-00001-of-00001.safetensors", 19_526_019_168)];
+
+fn inkling2_files() -> Vec<String> {
+    INKLING2_METADATA_FILES
+        .iter()
+        .copied()
+        .chain(INKLING2_WEIGHT_FILES.iter().map(|(file, _)| *file))
+        .map(str::to_string)
+        .collect()
+}
+
+fn inkling2_file_bytes(file: &str) -> Option<u64> {
+    INKLING2_WEIGHT_FILES
+        .iter()
+        .find(|(name, _)| *name == file)
+        .map(|(_, bytes)| *bytes)
+}
+
+/// Marks a test's synthetic Inkling 2 checkpoint (a tiny model in the
+/// published layout, one unindexed weight file). Built for this crate's
+/// tests and, through the `test-support` feature, for another crate's; a
+/// release build has neither the marker nor the bypass it selects.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const INKLING2_SYNTHETIC_MARKER: &str = ".izwi-synthetic-checkpoint";
+
+/// Every file present and the weight file at its exact pinned size, so an
+/// interrupted 19.5 GB download never reads as complete.
+fn inkling2_bundle_is_complete(model_dir: &Path) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if model_dir.join(INKLING2_SYNTHETIC_MARKER).is_file() {
+        return ["config.json", "tokenizer.json", "model.safetensors"]
+            .iter()
+            .all(|file| model_dir.join(file).is_file());
+    }
+    INKLING2_METADATA_FILES
+        .iter()
+        .all(|file| model_dir.join(file).is_file())
+        && INKLING2_WEIGHT_FILES.iter().all(|(file, bytes)| {
+            std::fs::metadata(model_dir.join(file))
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == *bytes)
+        })
+}
+
 /// Marks a test's synthetic checkpoint (see `nemotron_transcribe::synthetic`).
 #[cfg(test)]
 pub(crate) const NEMOTRON_TRANSCRIBE_SYNTHETIC_MARKER: &str = ".izwi-synthetic-checkpoint";
@@ -2021,6 +2078,7 @@ impl ModelDownloader {
             ModelFamily::RumbleAsr => RUMBLE_FILES.iter().all(|file| path.join(file).exists()),
             ModelFamily::NemotronTranscribeAsr => nemotron_transcribe_bundle_is_complete(&path),
             ModelFamily::SovTranscribeAsr => sov_transcribe_bundle_is_complete(&path),
+            ModelFamily::Inkling2Chat => inkling2_bundle_is_complete(&path),
             ModelFamily::SortformerDiarization => {
                 let nemo_file = match variant {
                     ModelVariant::DiarStreamingSortformer4SpkV21 => {
@@ -2674,6 +2732,7 @@ impl ModelDownloader {
             ModelFamily::RumbleAsr => RUMBLE_FILES.iter().map(|file| (*file).to_string()).collect(),
             ModelFamily::NemotronTranscribeAsr => nemotron_transcribe_files(),
             ModelFamily::SovTranscribeAsr => sov_transcribe_files(),
+            ModelFamily::Inkling2Chat => inkling2_files(),
             ModelFamily::SortformerDiarization => match variant {
                 ModelVariant::Nemotron3Diarization => {
                     vec!["Nemotron-3-Diarization.nemo".to_string()]
@@ -3192,6 +3251,7 @@ impl ModelDownloader {
             || variant.is_qwen35_moe_fp8()
             || variant.family() == ModelFamily::NemotronTranscribeAsr
             || variant.family() == ModelFamily::SovTranscribeAsr
+            || variant.family() == ModelFamily::Inkling2Chat
             || variant.family() == ModelFamily::FishDrama3Tts;
 
         let mut repo_tree_indexes: HashMap<(String, String), HashMap<String, u64>> = HashMap::new();
@@ -3474,6 +3534,11 @@ impl ModelDownloader {
             size
         } else if let Some(size) = (variant.family() == ModelFamily::SovTranscribeAsr)
             .then(|| sov_transcribe_file_bytes(file))
+            .flatten()
+        {
+            size
+        } else if let Some(size) = (variant.family() == ModelFamily::Inkling2Chat)
+            .then(|| inkling2_file_bytes(file))
             .flatten()
         {
             size

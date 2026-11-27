@@ -1,7 +1,9 @@
-use izwi_model_catalog::{ChatMediaInput, ChatMediaKind, ModelVariant, CHAT_AUDIO_PLACEHOLDER};
+use izwi_model_catalog::{
+    ChatMediaInput, ChatMediaKind, ModelVariant, CHAT_AUDIO_PLACEHOLDER, CHAT_IMAGE_PLACEHOLDER,
+};
 use serde_json::Value;
 
-pub const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+pub const IMAGE_PLACEHOLDER: &str = CHAT_IMAGE_PLACEHOLDER;
 pub const VIDEO_PLACEHOLDER: &str = "<|vision_start|><|video_pad|><|vision_end|>";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -187,13 +189,13 @@ pub fn content_part_is_video(part: &Value) -> bool {
         || map.get("input_video").is_some_and(|value| !value.is_null())
 }
 
-/// Whether the chat runtime accepts image inputs for this model. Single
-/// source of truth for image support until the model catalog exposes it.
+/// Whether the chat runtime accepts image inputs for this model.
 pub fn variant_accepts_image_input(variant: ModelVariant) -> bool {
-    variant.is_qwen35_chat_gguf()
+    variant.accepts_image_input()
 }
 
-/// Whether `variant` hears chat media of `kind`: Qwen3.5 images and videos.
+/// Whether `variant` takes chat media of `kind`: images, for the models that
+/// see them (video parts are refused later, by name).
 /// No chat model hears audio clips; older threads may still carry them.
 pub fn variant_accepts_media(variant: ModelVariant, kind: ChatMediaKind) -> bool {
     match kind {
@@ -223,13 +225,13 @@ pub fn validate_media_inputs_for_variant(
         .iter()
         .any(|input| input.kind == ChatMediaKind::Video)
     {
-        return Err("Qwen3.5 video inputs are not implemented yet".to_string());
+        return Err("Chat video inputs are not implemented yet".to_string());
     }
     if variant_accepts_image_input(variant) {
         return Ok(());
     }
     Err(format!(
-        "Multimodal chat input is currently supported only for Qwen3.5 GGUF models, not {}",
+        "Multimodal chat input is currently supported only for Qwen3.5 GGUF and Inkling 2 models, not {}",
         variant.dir_name()
     ))
 }
@@ -399,6 +401,21 @@ mod tests {
 
             assert!(err.contains("currently supported only for Qwen3.5"));
         }
+    }
+
+    #[test]
+    fn images_are_accepted_by_the_families_that_see_them() {
+        let image = [ChatMediaInput {
+            kind: ChatMediaKind::Image,
+            source: "https://example.com/cat.png".to_string(),
+        }];
+        for variant in [ModelVariant::Qwen354BGguf, ModelVariant::Inkling2Mini] {
+            assert!(variant_accepts_image_input(variant));
+            assert!(variant_accepts_media(variant, ChatMediaKind::Image));
+            assert!(!variant_accepts_media(variant, ChatMediaKind::Audio));
+            validate_media_inputs_for_variant(variant, &image).expect("an image");
+        }
+        assert!(!variant_accepts_image_input(ModelVariant::Qwen3827BFp8));
     }
 
     #[test]

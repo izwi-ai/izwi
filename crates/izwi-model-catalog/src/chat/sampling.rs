@@ -83,6 +83,7 @@ pub fn chat_supports_json_object(variant: ModelVariant) -> bool {
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm3Chat
             | ModelFamily::Qwen35MoeChat
+            | ModelFamily::Inkling2Chat
     )
 }
 
@@ -98,7 +99,8 @@ pub fn chat_supports_tools(variant: ModelVariant) -> bool {
 /// definitions (a `strict` tool, or the names and arguments of a forced
 /// call). Qwen3.8 samples through its own speculative path, which has no
 /// grammar hook yet: its forced calls are opened by the prompt alone, and
-/// `strict` tools are refused.
+/// `strict` tools are refused. Inkling 2 writes calls as messages of its
+/// own, which have their own grammar (`ToolCallSyntax::InklingMessage`).
 pub fn chat_supports_tool_constraint(variant: ModelVariant) -> bool {
     chat_supports_tools(variant) && variant.family() != ModelFamily::Qwen38Chat
 }
@@ -142,6 +144,18 @@ pub fn resolve_chat_sampling(
             top_p: 1.0,
             top_k: 50,
             repetition_penalty: 1.1,
+            presence_penalty: 0.0,
+        }
+    } else if variant.family() == ModelFamily::Inkling2Chat {
+        // Inkling 2's `generation_config.json` samples at temperature 1.0
+        // with nothing else. The engine default's repetition penalty would
+        // push down the message tokens every reply repeats
+        // (`<|message_model|>`, `<|end_message|>`).
+        ResolvedChatSampling {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
             presence_penalty: 0.0,
         }
     } else {
@@ -225,6 +239,25 @@ fn lfm25_sampling_temperature(variant: ModelVariant) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inkling2_samples_as_published_and_holds_tool_calls_and_json() {
+        let variant = ModelVariant::Inkling2Mini;
+        let resolved = resolve_chat_sampling(variant, None, ChatSamplingRequest::default());
+        assert_eq!(
+            (
+                resolved.temperature,
+                resolved.top_p,
+                resolved.top_k,
+                resolved.repetition_penalty,
+                resolved.presence_penalty
+            ),
+            (1.0, 1.0, 0, 1.0, 0.0)
+        );
+        assert!(chat_supports_tools(variant));
+        assert!(chat_supports_tool_constraint(variant));
+        assert!(chat_supports_json_object(variant));
+    }
 
     const QWEN_THINKING_VARIANTS: [ModelVariant; 2] =
         [ModelVariant::Qwen3827BFp8, ModelVariant::Qwen36Moe35BA3BFp8];

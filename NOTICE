@@ -76,6 +76,18 @@ License) and includes Rust ports of:
   2.0) give cloned voices their speaker embedding. Copyright (c) Alibaba
   Speech Lab. Apache License, Version 2.0.
 
+The Inkling 2 chat family
+(crates/izwi-core/src/models/architectures/inkling2) runs Thinking Machines
+Lab's Inkling 2 Mini (https://huggingface.co/thinkingmachines/Inkling-2-Mini,
+Apache License, Version 2.0) and includes a Rust port of:
+
+* The inkling2_loop model in Hugging Face Transformers
+  (https://github.com/huggingface/transformers): the looped decoder, its
+  attention with relative-position bias and sinks, the short convolutions,
+  the routed experts and the NVFP4/MXFP8 expert decoding.
+  Copyright 2026 the HuggingFace Team.
+  Apache License, Version 2.0.
+
 The Maya 2 Native text-to-speech family
 (crates/izwi-core/src/models/architectures/maya2) runs Maya Research's
 Maya 2 Native (https://huggingface.co/maya-research/maya2-native, Apache

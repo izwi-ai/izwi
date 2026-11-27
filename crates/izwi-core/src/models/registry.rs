@@ -28,6 +28,9 @@ use crate::models::architectures::chatterbox::ChatterboxTtsModel;
 use crate::models::architectures::fish_drama3::FishDrama3Model;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
 use crate::models::architectures::audio8::Audio8TtsModel;
+use crate::models::architectures::inkling2::{
+    Inkling2ChatDecodeState, Inkling2ChatModel, Inkling2PreparedPrompt,
+};
 use crate::models::architectures::gemma3::chat::{
     ChatDecodeCheckpoint as Gemma3ChatDecodeCheckpoint, ChatDecodeState as Gemma3ChatDecodeState,
     Gemma3ChatModel,
@@ -472,6 +475,19 @@ fn load_gemma_chat_model(
     )?))
 }
 
+fn load_inkling2_chat_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+    _performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
+) -> Result<NativeChatModel> {
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
+    let mut model = Inkling2ChatModel::load(model_dir, variant, device)?;
+    model.set_prefix_caching(prefix_reuse);
+    Ok(NativeChatModel::Inkling2(model))
+}
+
 fn load_sortformer_diarization_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -833,6 +849,11 @@ const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
         name: "qwen35_moe_chat",
         family: ModelFamily::Qwen35MoeChat,
         loader: load_qwen35_moe_chat_model,
+    },
+    ChatLoaderRegistration {
+        name: "inkling2_chat",
+        family: ModelFamily::Inkling2Chat,
+        loader: load_inkling2_chat_model,
     },
     ChatLoaderRegistration {
         name: "gemma_chat",
@@ -5364,6 +5385,7 @@ pub enum NativeChatModel {
     Qwen36Moe(Qwen36MoeChatModel),
     Qwen38(Qwen38ChatModel),
     Gemma3(Gemma3ChatModel),
+    Inkling2(Inkling2ChatModel),
     Lfm2(Lfm2ChatModel),
 }
 
@@ -5378,6 +5400,7 @@ impl NativeChatModel {
             Self::Qwen36Moe(model) => model.max_context_tokens(),
             Self::Qwen38(model) => model.max_context_tokens(),
             Self::Gemma3(model) => model.max_context_tokens(),
+            Self::Inkling2(model) => model.max_context_tokens(),
             Self::Lfm2(model) => model.max_context_tokens(),
         }
     }
@@ -5391,6 +5414,7 @@ impl NativeChatModel {
             Self::Qwen36Moe(model) => model.preferred_prefill_tokens(),
             Self::Qwen38(model) => model.preferred_prefill_tokens(),
             Self::Lfm2(model) => model.preferred_prefill_tokens(),
+            Self::Inkling2(model) => model.preferred_prefill_tokens(),
             Self::Qwen3(_) | Self::Gemma3(_) => 0,
         }
     }
@@ -5444,6 +5468,9 @@ impl NativeChatModel {
                 model.sustained_decode_quantum(),
                 false,
             ),
+            // With its drafter served, Inkling 2 takes the anchor and the
+            // drafted tokens per quantum when decoding alone; otherwise one.
+            Self::Inkling2(model) => (model.preferred_decode_tokens(), false, false),
             Self::Qwen3(_) | Self::Gemma3(_) => (1, false, false),
         }
     }
@@ -5457,6 +5484,7 @@ impl InferenceStateContractProvider for NativeChatModel {
             Self::Qwen36Moe(model) => model.inference_state_contract(),
             Self::Qwen38(model) => model.inference_state_contract(),
             Self::Gemma3(model) => model.inference_state_contract(),
+            Self::Inkling2(model) => model.inference_state_contract(),
             Self::Lfm2(model) => model.inference_state_contract(),
         }
     }
@@ -6237,6 +6265,7 @@ pub enum NativeChatDecodeState {
     Qwen36Moe(Qwen36MoeChatDecodeState),
     Qwen38(Qwen38ChatDecodeState),
     Gemma3(Gemma3ChatDecodeState),
+    Inkling2(Inkling2ChatDecodeState),
     Lfm2(Lfm2ChatDecodeState),
 }
 
@@ -6249,6 +6278,7 @@ impl NativeChatDecodeState {
             Self::Qwen36Moe(state) => std::mem::take(&mut state.pending_logprobs),
             Self::Qwen38(state) => std::mem::take(&mut state.pending_logprobs),
             Self::Gemma3(state) => std::mem::take(&mut state.pending_logprobs),
+            Self::Inkling2(state) => std::mem::take(&mut state.pending_logprobs),
             Self::Lfm2(state) => std::mem::take(&mut state.pending_logprobs),
         }
     }
@@ -6259,6 +6289,7 @@ pub(crate) enum NativeChatDecodeCheckpoint {
     Qwen35(Qwen35SharedStepCheckpoint),
     Qwen36Moe(Qwen36SharedStepCheckpoint),
     Gemma3(Gemma3ChatDecodeCheckpoint),
+    Inkling2(crate::models::architectures::inkling2::chat::ChatDecodeCheckpoint),
     Qwen38(Qwen38SharedStepCheckpoint),
     Lfm2(Lfm2ChatDecodeCheckpoint),
 }
@@ -6269,6 +6300,7 @@ pub(crate) enum NativeChatDecodeCheckpoint {
 pub(crate) enum NativeChatReplayCheckpoint {
     Qwen3(crate::models::architectures::qwen3::chat::ChatReplayCheckpoint),
     Gemma3(crate::models::architectures::gemma3::chat::ChatReplayCheckpoint),
+    Inkling2(crate::models::architectures::inkling2::chat::ChatReplayCheckpoint),
     Lfm2(crate::models::architectures::lfm2::chat::Lfm2ChatReplayCheckpoint),
     Qwen35(crate::models::architectures::qwen35::chat::Qwen35ReplayCheckpoint),
     Qwen38(crate::models::architectures::qwen38::chat::Qwen38ReplayCheckpoint),
@@ -6281,6 +6313,7 @@ impl NativeChatReplayCheckpoint {
         match self {
             Self::Qwen3(checkpoint) => checkpoint.replay_tokens(),
             Self::Gemma3(checkpoint) => checkpoint.replay_tokens(),
+            Self::Inkling2(checkpoint) => checkpoint.replay_tokens(),
             Self::Lfm2(checkpoint) => checkpoint.replay_tokens(),
             Self::Qwen35(checkpoint) => checkpoint.replay_tokens(),
             Self::Qwen38(checkpoint) => checkpoint.replay_tokens(),
@@ -6294,6 +6327,8 @@ pub enum NativeChatPreparedPrompt {
     Qwen35(Qwen35PreparedPrompt),
     Qwen36Moe(Qwen36PreparedPrompt),
     Qwen38(Qwen38PreparedPrompt),
+    /// A prompt with images; a text prompt has no artifact.
+    Inkling2(Inkling2PreparedPrompt),
 }
 
 /// The end of a prompt's first turn (the system turn, with any tools, when
@@ -6315,6 +6350,7 @@ impl NativeChatPreparedPrompt {
             Self::Qwen35(prepared) => prepared.prompt_ids(),
             Self::Qwen36Moe(prepared) => prepared.prompt_ids(),
             Self::Qwen38(prepared) => prepared.prompt_ids(),
+            Self::Inkling2(prepared) => prepared.prompt_ids(),
         }
     }
 
@@ -6323,6 +6359,7 @@ impl NativeChatPreparedPrompt {
             Self::Qwen35(_) => ModelFamily::Qwen35Chat,
             Self::Qwen36Moe(_) => ModelFamily::Qwen35MoeChat,
             Self::Qwen38(_) => ModelFamily::Qwen38Chat,
+            Self::Inkling2(_) => ModelFamily::Inkling2Chat,
         }
     }
 
@@ -6333,6 +6370,8 @@ impl NativeChatPreparedPrompt {
             Self::Qwen35(prepared) => prepared.history_boundary(),
             Self::Qwen36Moe(prepared) => prepared.history_boundary(),
             Self::Qwen38(prepared) => prepared.history_boundary(),
+            // Prompts with images share no prefix.
+            Self::Inkling2(_) => None,
         }
     }
 
@@ -6348,21 +6387,28 @@ impl NativeChatPreparedPrompt {
     pub(crate) fn as_qwen35(&self) -> Option<&Qwen35PreparedPrompt> {
         match self {
             Self::Qwen35(prepared) => Some(prepared),
-            Self::Qwen36Moe(_) | Self::Qwen38(_) => None,
+            Self::Qwen36Moe(_) | Self::Qwen38(_) | Self::Inkling2(_) => None,
+        }
+    }
+
+    pub(crate) fn as_inkling2(&self) -> Option<&Inkling2PreparedPrompt> {
+        match self {
+            Self::Inkling2(prepared) => Some(prepared),
+            Self::Qwen35(_) | Self::Qwen36Moe(_) | Self::Qwen38(_) => None,
         }
     }
 
     pub(crate) fn as_qwen36_moe(&self) -> Option<&Qwen36PreparedPrompt> {
         match self {
             Self::Qwen36Moe(prepared) => Some(prepared),
-            Self::Qwen35(_) | Self::Qwen38(_) => None,
+            Self::Qwen35(_) | Self::Qwen38(_) | Self::Inkling2(_) => None,
         }
     }
 
     pub(crate) fn as_qwen38(&self) -> Option<&Qwen38PreparedPrompt> {
         match self {
             Self::Qwen38(prepared) => Some(prepared),
-            Self::Qwen35(_) | Self::Qwen36Moe(_) => None,
+            Self::Qwen35(_) | Self::Qwen36Moe(_) | Self::Inkling2(_) => None,
         }
     }
 }
@@ -6377,6 +6423,7 @@ impl NativeChatDecodeState {
             Self::Qwen36Moe(state) => Some(state.prefill_progress()),
             Self::Qwen38(state) => Some(state.prefill_progress()),
             Self::Gemma3(state) => Some(state.prefill_progress()),
+            Self::Inkling2(state) => Some(state.prefill_progress()),
             Self::Lfm2(state) => Some(state.prefill_progress()),
         }
     }
@@ -6388,6 +6435,9 @@ impl NativeChatDecodeState {
         Ok(match self {
             Self::Qwen3(state) => NativeChatReplayCheckpoint::Qwen3(state.replay_checkpoint()?),
             Self::Gemma3(state) => NativeChatReplayCheckpoint::Gemma3(state.replay_checkpoint()?),
+            Self::Inkling2(state) => {
+                NativeChatReplayCheckpoint::Inkling2(state.replay_checkpoint()?)
+            }
             Self::Lfm2(state) => NativeChatReplayCheckpoint::Lfm2(state.replay_checkpoint()?),
             Self::Qwen35(state) => NativeChatReplayCheckpoint::Qwen35(state.replay_checkpoint()?),
             Self::Qwen38(state) => NativeChatReplayCheckpoint::Qwen38(state.replay_checkpoint()?),
@@ -6403,6 +6453,7 @@ impl NativeChatDecodeState {
         match self {
             Self::Qwen3(state) => state.replay_tokens(),
             Self::Gemma3(state) => state.replay_tokens(),
+            Self::Inkling2(state) => state.replay_tokens(),
             Self::Lfm2(state) => state.replay_tokens(),
             Self::Qwen35(state) => state.replay_tokens(),
             Self::Qwen38(state) => state.replay_tokens(),
@@ -6462,6 +6513,10 @@ impl NativeChatDecodeState {
                     .begin_managed_quantum(cache)
                     .map(NativeChatDecodeCheckpoint::Lfm2)
             }
+            // Inkling 2's second cache is its sliding-window domain's.
+            Self::Inkling2(state) => state
+                .begin_managed_quantum(cache, mtp_cache)
+                .map(NativeChatDecodeCheckpoint::Inkling2),
         }
     }
 
@@ -6491,6 +6546,10 @@ impl NativeChatDecodeState {
                 Ok(())
             }
             (Self::Lfm2(state), NativeChatDecodeCheckpoint::Lfm2(checkpoint)) => {
+                state.rollback_managed_quantum(checkpoint);
+                Ok(())
+            }
+            (Self::Inkling2(state), NativeChatDecodeCheckpoint::Inkling2(checkpoint)) => {
                 state.rollback_managed_quantum(checkpoint);
                 Ok(())
             }
@@ -6559,6 +6618,7 @@ impl NativeChatDecodeState {
                 }
                 state.install_managed_reservation(cache)
             }
+            Self::Inkling2(state) => state.install_managed_reservation(cache, mtp_cache),
         }
     }
 
@@ -6570,6 +6630,7 @@ impl NativeChatDecodeState {
             Self::Qwen38(state) => state.uses_physical_kv(),
             Self::Gemma3(_) => true,
             Self::Lfm2(_) => true,
+            Self::Inkling2(_) => true,
         }
     }
 
@@ -6583,6 +6644,7 @@ impl NativeChatDecodeState {
             Self::Qwen38(state) => state.take_physical_write_completions(),
             Self::Gemma3(state) => state.take_physical_write_completions(),
             Self::Lfm2(state) => state.take_physical_write_completions(),
+            Self::Inkling2(state) => state.take_physical_write_completions(),
         }
     }
 
@@ -6592,6 +6654,7 @@ impl NativeChatDecodeState {
             Self::Qwen36Moe(state) => state.bind_tensor_sequence(sequence),
             Self::Qwen38(state) => state.bind_tensor_sequence(sequence),
             Self::Lfm2(state) => state.bind_tensor_sequence(sequence),
+            Self::Inkling2(state) => state.bind_tensor_sequence(sequence),
             Self::Qwen3(_) => Err(Error::InvalidInput(
                 "tensor-state reservation was routed to a dense Qwen3 model".into(),
             )),
@@ -6610,6 +6673,7 @@ impl NativeChatDecodeState {
             Self::Qwen36Moe(state) => state.restore_tensor_state(arena),
             Self::Qwen38(state) => state.restore_tensor_state(arena),
             Self::Lfm2(state) => state.restore_tensor_state(arena),
+            Self::Inkling2(state) => state.restore_tensor_state(arena),
             Self::Qwen3(_) => Err(Error::InvalidInput(
                 "tensor-state arena was routed to a dense Qwen3 model".into(),
             )),
@@ -6629,6 +6693,7 @@ impl NativeChatDecodeState {
             Self::Qwen36Moe(state) => state.stage_tensor_state(arena, transaction),
             Self::Qwen38(state) => state.stage_tensor_state(arena, transaction),
             Self::Lfm2(state) => state.stage_tensor_state(arena, transaction),
+            Self::Inkling2(state) => state.stage_tensor_state(arena, transaction),
             Self::Qwen3(_) => Err(Error::InvalidInput(
                 "tensor-state arena was routed to a dense Qwen3 model".into(),
             )),
@@ -6709,6 +6774,13 @@ impl NativeChatModel {
                     Some(NativeChatPreparedPrompt::Qwen38(prepared)),
                 ))
             }
+            Self::Inkling2(model) if !config.request.media_inputs.is_empty() => {
+                let prepared = model.prepare_prompt(messages, config)?;
+                Ok((
+                    prepared.prompt_ids().to_vec(),
+                    Some(NativeChatPreparedPrompt::Inkling2(prepared)),
+                ))
+            }
             _ => Ok((self.prompt_token_ids_with_config(messages, config)?, None)),
         }
     }
@@ -6731,6 +6803,7 @@ impl NativeChatModel {
             Self::Qwen38(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Gemma3(model) => model.prompt_token_ids(messages),
             Self::Lfm2(model) => model.prompt_token_ids_for_request(messages, &config.request),
+            Self::Inkling2(model) => model.prompt_token_ids(messages, config),
         }
     }
 
@@ -6769,6 +6842,9 @@ impl NativeChatModel {
             }
             Self::Lfm2(_) => Err(Error::InvalidInput(
                 "LFM2 chat requires invocation-owned physical state".into(),
+            )),
+            Self::Inkling2(_) => Err(Error::InvalidInput(
+                "Inkling 2 chat requires scheduler-owned physical state".into(),
             )),
         }
     }
@@ -6811,6 +6887,9 @@ impl NativeChatModel {
             Self::Lfm2(_) => Err(Error::InvalidInput(
                 "LFM2 chat requires invocation-owned physical state".into(),
             )),
+            Self::Inkling2(_) => Err(Error::InvalidInput(
+                "Inkling 2 chat requires scheduler-owned physical state".into(),
+            )),
         }
     }
 
@@ -6822,6 +6901,7 @@ impl NativeChatModel {
             Self::Qwen38(model) => model.supports_incremental_decode(),
             Self::Gemma3(model) => model.supports_incremental_decode(),
             Self::Lfm2(model) => model.supports_incremental_decode(),
+            Self::Inkling2(model) => model.supports_incremental_decode(),
         }
     }
 
@@ -6975,6 +7055,7 @@ impl NativeChatModel {
             Self::Gemma3(model) => model.supports_continuous_decode_batch(),
             Self::Qwen38(model) => model.supports_continuous_decode_batch(),
             Self::Lfm2(model) => model.supports_continuous_decode_batch(),
+            Self::Inkling2(model) => model.supports_continuous_decode_batch(),
         }
     }
 
@@ -6984,6 +7065,7 @@ impl NativeChatModel {
     pub(crate) fn managed_history_boundary(&self, prompt_ids: &[u32]) -> Option<usize> {
         match self {
             Self::Lfm2(model) if model.prefix_caching() => model.history_boundary(prompt_ids),
+            Self::Inkling2(model) if model.prefix_caching() => model.history_boundary(prompt_ids),
             _ => None,
         }
     }
@@ -6997,6 +7079,7 @@ impl NativeChatModel {
             Self::Qwen36Moe(model) => model.shares_prefixes(),
             Self::Qwen38(model) => model.shares_prefixes(),
             Self::Lfm2(model) => model.prefix_caching(),
+            Self::Inkling2(model) => model.prefix_caching(),
             _ => false,
         }
     }
@@ -7013,6 +7096,7 @@ impl NativeChatModel {
             | Self::Qwen38(_)
             | Self::Gemma3(_)
             | Self::Lfm2(_)
+            | Self::Inkling2(_)
         )
     }
 
@@ -7021,9 +7105,12 @@ impl NativeChatModel {
     /// validation, so it does not declare one.
     pub fn replay_capability(&self) -> ReplayCapability {
         match self {
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) | Self::Qwen38(_) => {
-                ReplayCapability::TokenReplay
-            }
+            Self::Qwen3(_)
+            | Self::Qwen35(_)
+            | Self::Gemma3(_)
+            | Self::Lfm2(_)
+            | Self::Qwen38(_)
+            | Self::Inkling2(_) => ReplayCapability::TokenReplay,
             Self::Qwen36Moe(_) => ReplayCapability::None,
         }
     }
@@ -7064,6 +7151,12 @@ impl NativeChatModel {
                 Ok(NativeChatDecodeState::Lfm2(
                     model.begin_replay_managed(checkpoint, cache)?,
                 ))
+            }
+            (Self::Inkling2(model), NativeChatReplayCheckpoint::Inkling2(checkpoint)) => {
+                Ok(NativeChatDecodeState::Inkling2(model.begin_replay_managed(
+                    checkpoint,
+                    crate::models::architectures::inkling2::state::Inkling2Caches::new(cache, mtp_cache)?,
+                )?))
             }
             (Self::Qwen35(model), NativeChatReplayCheckpoint::Qwen35(checkpoint))
                 if mtp_cache.is_none() =>
@@ -7117,6 +7210,9 @@ impl NativeChatModel {
             (Self::Gemma3(model), NativeChatDecodeState::Gemma3(state)) => {
                 model.continue_replay(state, prompt_ids, span_start, span_end)
             }
+            (Self::Inkling2(model), NativeChatDecodeState::Inkling2(state)) => {
+                model.continue_replay(state, prompt_ids, span_start, span_end)
+            }
             (Self::Lfm2(model), NativeChatDecodeState::Lfm2(state)) => {
                 model.continue_replay(state, prompt_ids, span_start, span_end)
             }
@@ -7155,6 +7251,7 @@ impl NativeChatModel {
             Self::Gemma3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Qwen38(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Lfm2(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Inkling2(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
         }
     }
 
@@ -7399,6 +7496,32 @@ impl NativeChatModel {
                     target_cache,
                 )?),
             ),
+            Self::Inkling2(model) if prepared.is_none() => Ok(NativeChatDecodeState::Inkling2(
+                model.begin_resumable_prefill_managed(
+                    prompt_ids,
+                    max_new_tokens,
+                    config,
+                    crate::models::architectures::inkling2::state::Inkling2Caches::new(target_cache, mtp_cache)?,
+                )?,
+            )),
+            Self::Inkling2(model) => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_inkling2)
+                    .filter(|prepared| prepared.prompt_ids() == prompt_ids)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Inkling 2 prefill was given another prompt's prepared artifact".into(),
+                        )
+                    })?;
+                Ok(NativeChatDecodeState::Inkling2(
+                    model.begin_prepared_prefill_managed(
+                        prepared,
+                        max_new_tokens,
+                        config,
+                        crate::models::architectures::inkling2::state::Inkling2Caches::new(target_cache, mtp_cache)?,
+                    )?,
+                ))
+            }
             Self::Lfm2(model) if prepared.is_none() && mtp_cache.is_none() => Ok(
                 NativeChatDecodeState::Lfm2(model.begin_resumable_prefill_state_managed(
                     prompt_ids,
@@ -7504,6 +7627,19 @@ impl NativeChatModel {
                     model.continue_resumable_prefill(state, prompt_ids, span_start, span_end)?;
                 (complete, state.prefill_progress())
             }
+            // A prompt with images: the state took the features when it
+            // began, so the artifact only has to be this prompt's.
+            (Self::Inkling2(model), NativeChatDecodeState::Inkling2(state))
+                if prepared.is_none_or(|prepared| {
+                    prepared
+                        .as_inkling2()
+                        .is_some_and(|prepared| prepared.prompt_ids() == prompt_ids)
+                }) =>
+            {
+                let complete =
+                    model.continue_resumable_prefill(state, prompt_ids, span_start, span_end)?;
+                (complete, state.prefill_progress())
+            }
             (Self::Lfm2(model), NativeChatDecodeState::Lfm2(state)) if prepared.is_none() => {
                 let complete = model
                     .continue_resumable_prefill_managed(state, prompt_ids, span_start, span_end)?;
@@ -7549,6 +7685,34 @@ impl NativeChatModel {
         }
     }
 
+    pub(crate) fn start_inkling2_decode_state_managed(
+        &self,
+        prompt_ids: &[u32],
+        prepared: Option<&Inkling2PreparedPrompt>,
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+        windowed: Option<PhysicalPagedKvCache>,
+    ) -> Result<NativeChatDecodeState> {
+        let cache = crate::models::architectures::inkling2::state::Inkling2Caches::new(cache, windowed)?;
+        match (self, prepared) {
+            (Self::Inkling2(model), Some(prepared)) if prepared.prompt_ids() == prompt_ids => {
+                Ok(NativeChatDecodeState::Inkling2(
+                    model.start_prepared_decode_managed(prepared, max_new_tokens, config, cache)?,
+                ))
+            }
+            (Self::Inkling2(_), Some(_)) => Err(Error::InvalidInput(
+                "Inkling 2 was given another prompt's prepared artifact".into(),
+            )),
+            (Self::Inkling2(model), None) => Ok(NativeChatDecodeState::Inkling2(
+                model.start_decode_managed(prompt_ids, max_new_tokens, config, cache)?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "managed Inkling 2 state was routed to another model family".into(),
+            )),
+        }
+    }
+
     pub fn start_decode_state_with_config(
         &self,
         messages: &[ChatMessage],
@@ -7588,7 +7752,7 @@ impl NativeChatModel {
             Self::Gemma3(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this chat model".to_string(),
             )),
-            Self::Lfm2(_) => Err(Error::InvalidInput(
+            Self::Lfm2(_) | Self::Inkling2(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this chat model".to_string(),
             )),
         }
@@ -7596,6 +7760,18 @@ impl NativeChatModel {
 
     pub fn decode_step(&self, state: &mut NativeChatDecodeState) -> Result<NativeChatDecodeStep> {
         match (self, state) {
+            (Self::Inkling2(model), NativeChatDecodeState::Inkling2(state)) => {
+                let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
+                Ok(NativeChatDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    input_tokens_committed: step.input_tokens_committed,
+                    finished: step.finished,
+                    logprobs,
+                })
+            }
             (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) => {
                 let step = model.decode_step(state)?;
                 let logprobs = std::mem::take(&mut state.pending_logprobs);
@@ -7700,6 +7876,37 @@ impl NativeChatModel {
                 tokens_generated: step.tokens_generated,
                 input_tokens_committed: step.input_tokens_committed,
                 finished: step.finished,
+                logprobs,
+            });
+        }
+        if let (Self::Inkling2(model), NativeChatDecodeState::Inkling2(state)) = (self, &mut *state) {
+            // A speculative round where the drafter is served; one step else.
+            let mut delta = String::new();
+            let mut text = String::new();
+            let mut tokens_generated = 0usize;
+            let mut input_tokens_committed = 0usize;
+            let mut finished = false;
+            let mut logprobs = Vec::new();
+            let mut budget = input_budget.max(1);
+            while budget > 0 {
+                let step = model.decode_quantum(state, budget)?;
+                logprobs.extend(std::mem::take(&mut state.pending_logprobs));
+                delta.push_str(&step.delta);
+                text = step.text;
+                tokens_generated = step.tokens_generated;
+                input_tokens_committed += step.input_tokens_committed;
+                finished = step.finished;
+                budget = budget.saturating_sub(step.input_tokens_committed.max(1));
+                if finished {
+                    break;
+                }
+            }
+            return Ok(NativeChatDecodeStep {
+                delta,
+                text,
+                tokens_generated,
+                input_tokens_committed,
+                finished,
                 logprobs,
             });
         }
@@ -7829,6 +8036,34 @@ impl NativeChatModel {
                         text: step.text,
                         tokens_generated: step.tokens_generated,
                         input_tokens_committed: 1,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
+            }
+            Self::Inkling2(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Inkling2(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Inkling 2 continuous batch received another model's state"
+                                    .into(),
+                            ))
+                        }
+                    }
+                }
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
                         finished: step.finished,
                         logprobs,
                     });
@@ -8229,6 +8464,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::Lfm25Audio => "lfm25_audio",
         ModelFamily::Lfm3Audio => "lfm3_audio",
         ModelFamily::Gemma3Chat => "gemma3_chat",
+        ModelFamily::Inkling2Chat => "inkling2_chat",
         ModelFamily::Qwen3ForcedAligner => "qwen3_forced_aligner",
         ModelFamily::Voxtral => "voxtral",
         ModelFamily::Tokenizer => "tokenizer",
@@ -8317,6 +8553,7 @@ fn native_chat_model_kind(model: &NativeChatModel) -> &'static str {
         NativeChatModel::Qwen36Moe(_) => "qwen35_moe_chat",
         NativeChatModel::Qwen38(_) => "qwen38_chat",
         NativeChatModel::Gemma3(_) => "gemma3_chat",
+        NativeChatModel::Inkling2(_) => "inkling2_chat",
         NativeChatModel::Lfm2(_) => "lfm2_chat",
     }
 }
@@ -8624,6 +8861,7 @@ impl ModelRegistry {
                         NativeChatModel::Qwen38(model) => Some(model.runtime_diagnostics()),
                         NativeChatModel::Qwen36Moe(model) => Some(model.runtime_diagnostics()),
                         NativeChatModel::Lfm2(model) => Some(model.runtime_diagnostics()),
+                        NativeChatModel::Inkling2(model) => Some(model.runtime_diagnostics()),
                         _ => None,
                     },
                 ));

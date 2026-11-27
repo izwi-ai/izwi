@@ -70,7 +70,7 @@ Different features require different models:
 | Feature | Required Models |
 |---------|-----------------|
 | Voice | TTS + ASR + Chat model (or one unified model: `LFM3-Audio-2B-GGUF` by default, or `LFM2.5-Audio-1.5B-GGUF`) |
-| Chat | Chat model (Qwen3.5, Qwen3.6, Qwen3.8, LFM2.5, or LFM3) |
+| Chat | Chat model (Qwen3.5, Qwen3.6, Qwen3.8, Inkling 2, LFM2.5, or LFM3) |
 | Speaker Attributed ASR | `Granite-Speech-4.1-2B-Plus` (default) or `Nemotron-3.5-Transcribe-30B-A4B-FP8` |
 | Voices | Built-in voice model for presets; Base, VibeVoice, `FishAudio-S2-Pro`, `FishAudio-Drama-3`, `Audio8-TTS-Realistic-Air`, Chatterbox, Maya 2 Native or Ming 3.0 TTS model for cloning; VoiceDesign, Maya1 or Ming 3.0 TTS model for design |
 | Text-to-Speech | TTS model |

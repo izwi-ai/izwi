@@ -4,7 +4,6 @@ use crate::catalog::ModelFamily;
 use crate::engine::{resolve_backend_model_context, GenerationParams, TaskType};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen35::media_resource_estimate;
 use crate::models::shared::chat::{
     ChatGenerationConfig, ChatMessage, ChatRequestConfig, ChatTruncation,
 };
@@ -228,11 +227,6 @@ impl RuntimeService {
         } else {
             messages
         };
-        if !chat_config.media_inputs.is_empty() && variant.family() != ModelFamily::Qwen35Chat {
-            return Err(Error::InvalidInput(format!(
-                "Chat model {variant} does not support Qwen3.5 media inputs"
-            )));
-        }
         let correlation_id = correlation_id.map(ToOwned::to_owned);
         let backend = self.backend_router.context().backend_kind;
         let configured_context_limit = self.config.portable_context_ceiling();
@@ -243,7 +237,7 @@ impl RuntimeService {
             &params,
             correlation_id.as_ref(),
         )?;
-        let media_estimate = media_resource_estimate(&chat_config.media_inputs)?;
+        let media_estimate = chat_media_resource_estimate(variant, &chat_config.media_inputs)?;
         let media_resources = media_preparation_resources(
             self.backend_router.context().backend_kind,
             media_estimate,
@@ -825,6 +819,28 @@ impl RuntimeService {
             cached_prompt_tokens: output.token_stats.cached_prefix_tokens.map(u64::from),
             logprobs: output.logprobs,
         })
+    }
+}
+
+/// What preparing a chat request's media needs, by the model's family. A
+/// family that takes no media refuses a request that carries any.
+pub(crate) fn chat_media_resource_estimate(
+    variant: ModelVariant,
+    media_inputs: &[crate::models::shared::chat::ChatMediaInput],
+) -> Result<crate::models::shared::media::MediaResourceEstimate> {
+    if media_inputs.is_empty() {
+        return Ok(Default::default());
+    }
+    match variant.family() {
+        ModelFamily::Qwen35Chat => {
+            crate::models::architectures::qwen35::media_resource_estimate(media_inputs)
+        }
+        ModelFamily::Inkling2Chat => {
+            crate::models::architectures::inkling2::chat::media_resource_estimate(media_inputs)
+        }
+        _ => Err(Error::InvalidInput(format!(
+            "Chat model {variant} does not take image input"
+        ))),
     }
 }
 
