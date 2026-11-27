@@ -1094,6 +1094,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
     )
     .aliases(&[("legacy", false)]),
     CoreEnvVar::new(
+        "IZWI_INKLING2_DENSE_DTYPE",
+        Choice,
+        "auto",
+        Load,
+        "Selects the dtype of Inkling 2's large dense matrices: auto or f32 (F32 everywhere), f16 (Metal: halves them, decode products faster, prefill spans over 16 rows slower), or bf16 (CUDA: the stored bytes, with projection activations rounded to BF16).",
+    ),
+    CoreEnvVar::new(
         "IZWI_INKLING2_MOE_BACKEND",
         Choice,
         "auto",
@@ -1866,6 +1873,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "false",
         Startup,
         "Never contacts Hugging Face: downloads are refused and download sizes come from the built-in estimates.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_PAGED_BIAS_SINK_EMULATOR_DIR",
+        Path,
+        "unset (test skipped)",
+        TestHarness,
+        "Directory the ignored kernels::paged_bias_sink emulator test writes its cases to (inputs and the host reference's output), for the C++ harness that runs kernels/cuda/paged_bias_sink.cu thread by thread on a machine without a GPU.",
     ),
     CoreEnvVar::new(
         "IZWI_PARAKEET_ASR_DTYPE",

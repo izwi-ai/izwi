@@ -2,7 +2,10 @@
 //! cells into one language-model embedding each.
 //!
 //! This follows transformers' `Inkling2ImageProcessor` and
-//! `Inkling2VisionModel` operation by operation, in F32.
+//! `Inkling2VisionModel` operation by operation, on F32 activations. The
+//! linear weights are held in the backend's projection dtype (`precision`:
+//! F32 on the CPU, F16 on Metal, BF16 on CUDA when asked for); biases, norms, layer scales
+//! and the class and position embeddings are F32.
 //!
 //! * **No resize.** An image is used at its own resolution: one image token
 //!   per `cell x cell` pixels (40 as published), rounded up per side.
@@ -26,6 +29,7 @@ use candle_nn::ops::softmax;
 
 use super::checkpoint::{Inkling2Checkpoint, VISION_PREFIX};
 use super::config::{Inkling2Config, Inkling2VisionConfig};
+use super::precision::{self, Projection};
 use crate::error::{Error, Result};
 
 /// transformers' default for this tower; the published config does not set
@@ -137,14 +141,14 @@ fn bilinear_taps(index: usize, size: usize, side: usize) -> ([usize; 2], [f32; 2
 }
 
 struct Linear {
-    /// Transposed: `[in, out]`.
-    weight: Tensor,
+    weight: Projection,
+    /// F32.
     bias: Option<Tensor>,
 }
 
 impl Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = x.matmul(&self.weight)?;
+        let out = self.weight.forward(x)?;
         Ok(match &self.bias {
             Some(bias) => out.broadcast_add(bias)?,
             None => out,
@@ -181,11 +185,13 @@ struct Layer {
     scale_mlp: Tensor,
 }
 
-/// The vision tower and its projector, on one device in F32.
+/// The vision tower and its projector, on one device.
 pub struct Inkling2Vision {
     config: Inkling2VisionConfig,
     text_hidden: usize,
     device: Device,
+    /// The dtype the linear weights were loaded in.
+    projection_dtype: DType,
     patch_embedding: Linear,
     /// `[grid * grid, hidden]`.
     positions: Tensor,
@@ -198,10 +204,23 @@ pub struct Inkling2Vision {
 }
 
 impl Inkling2Vision {
+    /// Loads the tower on `device`, its linear weights in the dtype the
+    /// device's backend holds them in ([`precision::projection_dtype`]).
     pub fn load(
         checkpoint: &Inkling2Checkpoint,
         config: &Inkling2Config,
         device: &Device,
+    ) -> Result<Self> {
+        let dtype = precision::projection_dtype(precision::backend_of(device));
+        Self::load_with_dtype(checkpoint, config, device, dtype)
+    }
+
+    /// [`Self::load`] with the linear weights in `projection_dtype`.
+    pub(crate) fn load_with_dtype(
+        checkpoint: &Inkling2Checkpoint,
+        config: &Inkling2Config,
+        device: &Device,
+        projection_dtype: DType,
     ) -> Result<Self> {
         let v = config
             .vision
@@ -215,7 +234,12 @@ impl Inkling2Vision {
         let tensor = |name: String| checkpoint.tensor(&name, device, DType::F32);
         let linear = |name: String, bias: bool| -> Result<Linear> {
             Ok(Linear {
-                weight: tensor(format!("{name}.weight"))?.t()?.contiguous()?,
+                weight: Projection::load(
+                    checkpoint,
+                    &format!("{name}.weight"),
+                    device,
+                    projection_dtype,
+                )?,
                 bias: bias.then(|| tensor(format!("{name}.bias"))).transpose()?,
             })
         };
@@ -247,12 +271,7 @@ impl Inkling2Vision {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            patch_embedding: Linear {
-                weight: tensor(format!("{backbone}.embeddings.patch_embedding.weight"))?
-                    .t()?
-                    .contiguous()?,
-                bias: None,
-            },
+            patch_embedding: linear(format!("{backbone}.embeddings.patch_embedding"), false)?,
             positions: tensor(format!("{backbone}.embeddings.position_embedding"))?,
             class_token,
             norm_in: norm(format!("{backbone}.ln_pre"))?,
@@ -261,8 +280,14 @@ impl Inkling2Vision {
             project_out: linear(format!("{VISION_PREFIX}.proj_out"), false)?,
             text_hidden: config.hidden,
             device: device.clone(),
+            projection_dtype,
             config: v,
         })
+    }
+
+    /// The dtype the linear weights were asked to load in.
+    pub fn projection_dtype(&self) -> DType {
+        self.projection_dtype
     }
 
     pub fn config(&self) -> &Inkling2VisionConfig {

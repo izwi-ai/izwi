@@ -29,6 +29,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod experts;
 pub mod memory;
+pub mod precision;
 pub mod prompt;
 pub mod quant;
 pub mod reply;

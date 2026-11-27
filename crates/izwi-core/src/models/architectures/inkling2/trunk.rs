@@ -1,4 +1,7 @@
-//! The text trunk, composed from plain tensor operations in F32.
+//! The text trunk, composed from plain tensor operations on F32 activations.
+//! The large projection weights are held in the backend's projection dtype
+//! (`precision`: F32 on the CPU, F16 on Metal, BF16 on CUDA when asked for);
+//! everything else is F32.
 //!
 //! This is the reference path: it follows transformers'
 //! `Inkling2LoopTextModel` operation by operation, keeps its own per-sequence
@@ -39,6 +42,7 @@ use super::config::{
     CONV_STATES_PER_APPLICATION,
 };
 use super::experts::Inkling2Moe;
+use super::precision::{self, Projection};
 use crate::error::{Error, Result};
 use crate::kernels::cuda::stretch_graphs::{StepRun, StretchGraphs};
 
@@ -154,8 +158,8 @@ fn short_conv(x: &Tensor, conv: &ConvTaps, history: &Tensor) -> Result<(Tensor, 
 struct DynamicConv {
     /// `[kernel, channels]`, row = backward distance.
     static_taps: Tensor,
-    /// `[hidden, heads * kernel]`.
-    projection: Tensor,
+    /// Hidden to `heads * kernel`.
+    projection: Projection,
     kernel: usize,
     heads: usize,
 }
@@ -166,15 +170,18 @@ impl DynamicConv {
         prefix: &str,
         heads: usize,
         device: &Device,
+        projection_dtype: DType,
     ) -> Result<Self> {
         let static_taps = checkpoint.tensor(&format!("{prefix}.static_w"), device, DType::F32)?;
         let kernel = static_taps.dim(0)?;
         Ok(Self {
             static_taps,
-            projection: checkpoint
-                .tensor(&format!("{prefix}.weight_proj"), device, DType::F32)?
-                .t()?
-                .contiguous()?,
+            projection: Projection::load(
+                checkpoint,
+                &format!("{prefix}.weight_proj"),
+                device,
+                projection_dtype,
+            )?,
             kernel,
             heads,
         })
@@ -186,8 +193,9 @@ impl DynamicConv {
         let (seq, channels) = x.dims2()?;
         let head_dim = channels / self.heads;
         let (extended, next) = extend(history, x)?;
-        let dynamic = input
-            .matmul(&self.projection)?
+        let dynamic = self
+            .projection
+            .forward(input)?
             .reshape((seq, self.heads, self.kernel))?;
         let mut out = x.clone();
         for lag in 0..self.kernel {
@@ -285,14 +293,13 @@ struct Layer {
     attention_query: Option<Tensor>,
     mlp_query: Tensor,
     input_norm: InputNorm,
-    /// Projections, stored transposed (`[in, out]`).
-    query_proj: Tensor,
-    key_proj: Tensor,
-    value_proj: Tensor,
-    output_proj: Tensor,
-    output_gate: Tensor,
-    rel_proj: Tensor,
-    sink_proj: Tensor,
+    query_proj: Projection,
+    key_proj: Projection,
+    value_proj: Projection,
+    output_proj: Projection,
+    output_gate: Projection,
+    rel_proj: Projection,
+    sink_proj: Projection,
     query_scale: Tensor,
     rel_scale: Tensor,
     /// `[d_rel, rel_extent]`.
@@ -437,11 +444,14 @@ pub struct Inkling2Trunk {
     config: Inkling2Config,
     applications: Vec<Inkling2Application>,
     device: Device,
+    /// The dtype the projection weights were loaded in.
+    projection_dtype: DType,
+    /// `[vocab, hidden]`, in the projection dtype.
     embedding: Tensor,
     embedding_norm: Tensor,
     final_norm: Tensor,
-    /// `[hidden, unpadded_vocab]`.
-    unembedding: Tensor,
+    /// Hidden to `unpadded_vocab`.
+    unembedding: Projection,
     output_query: Tensor,
     /// Per loop layer, `[4, hidden]`: query, key, value, mlp.
     message_queries: Vec<Tensor>,
@@ -449,13 +459,26 @@ pub struct Inkling2Trunk {
 }
 
 impl Inkling2Trunk {
+    /// Loads the trunk on `device`, its projection weights in the dtype the
+    /// device's backend holds them in ([`precision::projection_dtype`]).
     pub fn load(
         checkpoint: &Inkling2Checkpoint,
         config: &Inkling2Config,
         device: &Device,
     ) -> Result<Self> {
+        let dtype = precision::projection_dtype(precision::backend_of(device));
+        Self::load_with_dtype(checkpoint, config, device, dtype)
+    }
+
+    /// [`Self::load`] with the projection weights in `projection_dtype`.
+    pub(crate) fn load_with_dtype(
+        checkpoint: &Inkling2Checkpoint,
+        config: &Inkling2Config,
+        device: &Device,
+        projection_dtype: DType,
+    ) -> Result<Self> {
         let dense = |name: &str| checkpoint.tensor(name, device, DType::F32);
-        let transposed = |name: &str| -> Result<Tensor> { Ok(dense(name)?.t()?.contiguous()?) };
+        let projection = |name: &str| Projection::load(checkpoint, name, device, projection_dtype);
         let t = TEXT_PREFIX;
         let h = config.hidden;
 
@@ -522,12 +545,14 @@ impl Inkling2Trunk {
                             &format!("{l}.attn.k_sconv"),
                             heads.kv_heads,
                             device,
+                            projection_dtype,
                         )?,
                         value: DynamicConv::load(
                             checkpoint,
                             &format!("{l}.attn.v_sconv"),
                             heads.kv_heads,
                             device,
+                            projection_dtype,
                         )?,
                     },
                 ),
@@ -552,13 +577,13 @@ impl Inkling2Trunk {
                 attention_query,
                 mlp_query: dense(&format!("{t}.attn_res.mlp_queries.{layer}"))?.reshape((1, h))?,
                 input_norm,
-                query_proj: transposed(&format!("{l}.attn.wq_du.weight"))?,
-                key_proj: transposed(&format!("{l}.attn.wk_dv.weight"))?,
-                value_proj: transposed(&format!("{l}.attn.wv_dv.weight"))?,
-                output_proj: transposed(&format!("{l}.attn.wo_ud.weight"))?,
-                output_gate: transposed(&format!("{l}.attn.gate_attn.weight"))?,
-                rel_proj: transposed(&format!("{l}.attn.wr_du.weight"))?,
-                sink_proj: transposed(&format!("{l}.attn.attn_sink_proj.weight"))?,
+                query_proj: projection(&format!("{l}.attn.wq_du.weight"))?,
+                key_proj: projection(&format!("{l}.attn.wk_dv.weight"))?,
+                value_proj: projection(&format!("{l}.attn.wv_dv.weight"))?,
+                output_proj: projection(&format!("{l}.attn.wo_ud.weight"))?,
+                output_gate: projection(&format!("{l}.attn.gate_attn.weight"))?,
+                rel_proj: projection(&format!("{l}.attn.wr_du.weight"))?,
+                sink_proj: projection(&format!("{l}.attn.attn_sink_proj.weight"))?,
                 query_scale: dense(&format!("{l}.attn.q_l2_clip.scale"))?,
                 rel_scale: dense(&format!("{l}.attn.rel_l2_clip.scale"))?,
                 rel_bank: dense(&format!("{l}.attn.rel_logits_proj.proj"))?,
@@ -584,20 +609,24 @@ impl Inkling2Trunk {
         Ok(Self {
             applications: config.applications(),
             device: device.clone(),
-            embedding: dense(&format!("{t}.embed.weight"))?,
+            projection_dtype,
+            embedding: precision::table(
+                checkpoint,
+                &format!("{t}.embed.weight"),
+                device,
+                projection_dtype,
+            )?,
             embedding_norm: dense(&format!("{t}.embed_norm.weight"))?,
             final_norm: dense(&format!("{t}.norm.weight"))?,
             // Stored padded to the embedding's row count; only the first
             // `unpadded_vocab` rows are the model's.
-            unembedding: checkpoint
-                .tensor_rows(
-                    &format!("{t}.unembed.weight"),
-                    config.unpadded_vocab,
-                    device,
-                    DType::F32,
-                )?
-                .t()?
-                .contiguous()?,
+            unembedding: Projection::load_rows(
+                checkpoint,
+                &format!("{t}.unembed.weight"),
+                config.unpadded_vocab,
+                device,
+                projection_dtype,
+            )?,
             output_query: dense(&format!("{t}.attn_res.output_query"))?.reshape((1, h))?,
             message_queries,
             layers,
@@ -611,6 +640,38 @@ impl Inkling2Trunk {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The dtype the projection weights were asked to load in.
+    pub fn projection_dtype(&self) -> DType {
+        self.projection_dtype
+    }
+
+    /// Projection weights held in F32 although a 16-bit dtype was asked
+    /// for: tensors F16 could not hold. Zero on a healthy load.
+    pub fn widened_projections(&self) -> usize {
+        if self.projection_dtype == DType::F32 {
+            return 0;
+        }
+        let mut held = vec![&self.unembedding];
+        for layer in &self.layers {
+            held.extend([
+                &layer.query_proj,
+                &layer.key_proj,
+                &layer.value_proj,
+                &layer.output_proj,
+                &layer.output_gate,
+                &layer.rel_proj,
+                &layer.sink_proj,
+            ]);
+            if let KvConv::Dynamic { key, value } = &layer.kv_conv {
+                held.extend([&key.projection, &value.projection]);
+            }
+        }
+        held.iter()
+            .filter(|projection| projection.dtype() == DType::F32)
+            .count()
+            + usize::from(self.embedding.dtype() == DType::F32)
     }
 
     /// Runs every layer's experts on the trunk's device
@@ -747,8 +808,9 @@ impl Inkling2Trunk {
             )));
         }
         let ids = Tensor::from_vec(tokens.to_vec(), tokens.len(), &self.device)?;
+        // The rows widen exactly; the norm runs in F32.
         rms_norm(
-            &self.embedding.index_select(&ids, 0)?,
+            &self.embedding.index_select(&ids, 0)?.to_dtype(DType::F32)?,
             &self.embedding_norm,
             self.config.rms_norm_eps,
         )
@@ -872,8 +934,9 @@ impl Inkling2Trunk {
         };
         let full = layer.kind == Inkling2LayerKind::Full;
 
-        let mut queries = query_input
-            .matmul(&layer.query_proj)?
+        let mut queries = layer
+            .query_proj
+            .forward(&query_input)?
             .reshape((seq, g.heads, g.head_dim))?
             .broadcast_mul(&layer.query_scale)?;
         queries = l2_clip(&queries, c.qk_l2_clip_threshold)?;
@@ -881,8 +944,8 @@ impl Inkling2Trunk {
             queries = queries.broadcast_mul(log_scale)?;
         }
 
-        let keys = key_input.matmul(&layer.key_proj)?;
-        let values = value_input.matmul(&layer.value_proj)?;
+        let keys = layer.key_proj.forward(&key_input)?;
+        let values = layer.value_proj.forward(&value_input)?;
         let ((keys, key_next), (values, value_next)) = match &layer.kv_conv {
             KvConv::Static { key, value } => (
                 short_conv(&keys, key, key_history)?,
@@ -902,8 +965,9 @@ impl Inkling2Trunk {
             c.rms_norm_eps,
         )?;
 
-        let mut relative = query_input
-            .matmul(&layer.rel_proj)?
+        let mut relative = layer
+            .rel_proj
+            .forward(&query_input)?
             .reshape((seq, g.heads, c.d_rel))?
             .broadcast_mul(&layer.rel_scale)?;
         relative = l2_clip(&relative, c.rel_l2_clip_threshold)?;
@@ -915,12 +979,13 @@ impl Inkling2Trunk {
             .transpose(0, 1)?
             .contiguous()?;
         // One extra logit per query whose value is zero.
-        let sinks = query_input
-            .matmul(&layer.sink_proj)?
+        let sinks = layer
+            .sink_proj
+            .forward(&query_input)?
             .t()?
             .unsqueeze(2)?
             .contiguous()?;
-        let gate = sigmoid(&query_input.matmul(&layer.output_gate)?)?;
+        let gate = sigmoid(&layer.output_gate.forward(&query_input)?)?;
         Ok(vec![
             queries.transpose(0, 1)?.contiguous()?,
             profiles,
@@ -1028,7 +1093,7 @@ impl Inkling2Trunk {
                 None => return Err(trunk_error("a loop pass is missing its messages")),
             },
         };
-        let projected = (attended * gate)?.matmul(&layer.output_proj)?;
+        let projected = layer.output_proj.forward(&(attended * gate)?)?;
         let (attended, attention_next) =
             short_conv(&projected, &layer.attention_conv, attention_history)?;
 
@@ -1272,7 +1337,7 @@ impl Inkling2Trunk {
     /// Soft-capped logits of final hidden states, `[seq, unpadded_vocab]`.
     pub fn logits(&self, hidden: &Tensor) -> Result<Tensor> {
         let cap = self.config.final_logit_softcap;
-        let logits = hidden.matmul(&self.unembedding)?;
+        let logits = self.unembedding.forward(hidden)?;
         Ok(((logits / cap)?.tanh()? * cap)?)
     }
 }

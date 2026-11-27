@@ -720,6 +720,15 @@ impl Inkling2ChatModel {
             },
             "layer_applications": self.config.application_count(),
             "expert_resident_bytes": self.trunk.expert_resident_bytes(),
+            "prefix_sharing": self.prefix_caching,
+            "dense": {
+                "projection_dtype": format!("{:?}", self.trunk.projection_dtype()),
+                "widened_projections": self.trunk.widened_projections(),
+                "vision_projection_dtype": self
+                    .vision
+                    .as_ref()
+                    .map(|vision| format!("{:?}", vision.projection_dtype())),
+            },
             "max_context_tokens": self.max_context_tokens,
             "decode_graphs": match &self.graphs {
                 Ok(graphs) => graphs.diagnostics(),

@@ -3,7 +3,7 @@
 //! processed pixels and features as transformers computes them, and the
 //! logits of a prompt that carries both.
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use safetensors::SafeTensors;
 
 use super::checkpoint::Inkling2Checkpoint;
@@ -118,18 +118,34 @@ fn transparency_is_composited_over_the_checkerboard() {
     assert!((image.pixels[3] - value(mixed as f32)).abs() < 1e-6);
 }
 
+/// The tiny tower with its linear weights held in `dtype`.
+#[cfg(feature = "metal")]
+fn tiny_vision_in(device: &Device, dtype: DType) -> Inkling2Vision {
+    let config = tiny();
+    let checkpoint = Inkling2Checkpoint::open(&fixture("inkling2_golden"), &config).unwrap();
+    Inkling2Vision::load_with_dtype(&checkpoint, &config, device, dtype).unwrap()
+}
+
 fn features_match(device: &Device, tolerance: f32) {
+    feature_error(&tiny_vision(device), tolerance);
+}
+
+/// Holds both images' features to `tolerance` and returns the worst error.
+fn feature_error(vision: &Inkling2Vision, tolerance: f32) -> f32 {
     let golden = image_golden();
-    let vision = tiny_vision(device);
     let cell = vision.config().cell();
+    let mut worst = 0f32;
     for image in &golden.images {
         let features = vision.encode(&processed(image, cell)).unwrap();
+        assert_eq!(features.dtype(), DType::F32);
         let got = features.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let error = max_error(&got, &image.features);
         assert!(error <= tolerance, "image feature error {error}");
+        worst = worst.max(error);
     }
     // The fixture would not notice a transposed image if both were square.
     assert_ne!(golden.images[0].grid[0], golden.images[0].grid[1]);
+    worst
 }
 
 #[test]
@@ -145,7 +161,36 @@ fn vision_tower_matches_the_reference_features_on_metal() {
     ) else {
         return;
     };
-    features_match(&device, 1e-3);
+    features_match(&device, METAL_F16_FEATURE_TOLERANCE);
+}
+
+/// Feature tolerance on Metal, the same with the linear weights in F32 and
+/// in F16 (what Metal loads: the same weight values, accumulated in F32).
+#[cfg(feature = "metal")]
+const METAL_F16_FEATURE_TOLERANCE: f32 = 1e-3;
+/// With BF16 weights (what CUDA loads on request) every linear rounds its activations
+/// to BF16, as the reference does.
+#[cfg(feature = "metal")]
+const METAL_BF16_FEATURE_TOLERANCE: f32 = 5e-2;
+
+#[cfg(feature = "metal")]
+#[test]
+fn vision_linear_dtypes_agree_on_metal() {
+    let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("vision_linear_dtypes_agree_on_metal")
+    else {
+        return;
+    };
+    for (dtype, tolerance) in [
+        (DType::F32, METAL_F16_FEATURE_TOLERANCE),
+        (DType::F16, METAL_F16_FEATURE_TOLERANCE),
+        (DType::BF16, METAL_BF16_FEATURE_TOLERANCE),
+    ] {
+        let vision = tiny_vision_in(&device, dtype);
+        assert_eq!(vision.projection_dtype(), dtype);
+        let error = feature_error(&vision, tolerance);
+        eprintln!("Metal {dtype:?} vision linears: feature error {error:.3e}");
+    }
 }
 
 /// Image features take the place of the image tokens' embeddings, after the

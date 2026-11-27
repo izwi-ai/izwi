@@ -4,14 +4,27 @@
 //!   scales, MXFP8 values with scale bytes) and are read from the mapped
 //!   file on every backend; they are host (or unified) memory, never copied.
 //! * Every **dense** tensor, the text trunk's and the vision tower's, is
-//!   held in F32 on the device the model is loaded on, the unembedding
-//!   without its padded rows. The routers' weights and biases are host F32.
+//!   held on the device the model is loaded on, the unembedding without its
+//!   padded rows. The large matrices (`precision::is_projection`) are held
+//!   in the backend's projection dtype: F32 on the CPU, F16 on Metal (bar a
+//!   matrix whose input width is not a multiple of 16; the published model
+//!   has none), F32 on CUDA or BF16 when asked for. Everything else is F32. The routers' weights and biases are
+//!   host F32.
 //! * The MTP head is not loaded.
+//!
+//! The footprint is a function of the config, the checkpoint header and the
+//! projection dtype, so it is known before a weight is read. A projection
+//! that F16 cannot hold stays F32 on Metal (the load warns); that is not
+//! known from the header and such a load holds more than is priced here.
 
 use std::path::Path;
 
 use super::checkpoint::{expected_census, Inkling2Checkpoint, Stored, TEXT_PREFIX, VISION_PREFIX};
+use candle_core::DType;
+
 use super::config::Inkling2Config;
+use super::precision::{held_element_bytes, projection_dtype};
+use super::quant::ExpertFormat;
 use crate::backends::BackendKind;
 use crate::error::Result;
 
@@ -19,19 +32,27 @@ use crate::error::Result;
 pub struct Inkling2Footprint {
     /// Stored bytes of every expert tensor.
     pub expert_bytes: u64,
-    /// F32 bytes of the dense tensors on the device, the vision tower's
-    /// among them.
+    /// Bytes of the dense tensors on the device as they are held (the
+    /// projections in the projection dtype, the rest in F32), the vision
+    /// tower's among them.
     pub dense_bytes: u64,
     /// The vision tower's share of `dense_bytes`.
     pub vision_bytes: u64,
     /// F32 bytes of the routers on the host.
     pub router_bytes: u64,
-    /// F32 bytes of the largest dense tensor (the embedding).
+    /// Bytes of the largest dense tensor as it is held (the embedding).
     pub largest_dense_bytes: u64,
 }
 
 impl Inkling2Footprint {
-    pub fn of(config: &Inkling2Config, checkpoint: &Inkling2Checkpoint) -> Self {
+    /// The footprint of `checkpoint` with its projections held in
+    /// `projection`.
+    pub fn of(config: &Inkling2Config, checkpoint: &Inkling2Checkpoint, projection: DType) -> Self {
+        Self::of_census(config, checkpoint.expert_formats(), projection)
+    }
+
+    /// [`Self::of`] from the expert format of every layer.
+    pub fn of_census(config: &Inkling2Config, formats: &[ExpertFormat], projection: DType) -> Self {
         let mut footprint = Self {
             expert_bytes: 0,
             dense_bytes: 0,
@@ -40,15 +61,12 @@ impl Inkling2Footprint {
             largest_dense_bytes: 0,
         };
         let unembedding = format!("{TEXT_PREFIX}.unembed.weight");
-        for entry in expected_census(config, checkpoint.expert_formats()) {
+        for entry in expected_census(config, formats) {
             let vision = entry.name.starts_with(VISION_PREFIX);
             if !vision && !entry.name.starts_with(TEXT_PREFIX) {
                 continue;
             }
             let elements = entry.shape.iter().product::<usize>() as u64;
-            if vision {
-                footprint.vision_bytes += elements * 4;
-            }
             match entry.stored {
                 Stored::Dense | Stored::DenseF32 => {
                     let elements = if entry.name == unembedding {
@@ -59,9 +77,13 @@ impl Inkling2Footprint {
                     if entry.name.contains(".mlp.gate.") {
                         footprint.router_bytes += elements * 4;
                     } else {
-                        footprint.dense_bytes += elements * 4;
-                        footprint.largest_dense_bytes =
-                            footprint.largest_dense_bytes.max(elements * 4);
+                        let bytes =
+                            elements * held_element_bytes(&entry.name, &entry.shape, projection);
+                        footprint.dense_bytes += bytes;
+                        footprint.largest_dense_bytes = footprint.largest_dense_bytes.max(bytes);
+                        if vision {
+                            footprint.vision_bytes += bytes;
+                        }
                     }
                 }
                 // Expert codes, scales and per-expert factors.
@@ -72,10 +94,12 @@ impl Inkling2Footprint {
         footprint
     }
 
-    pub fn load(model_dir: &Path) -> Result<Self> {
+    /// The footprint of the checkpoint in `model_dir` as a load on `backend`
+    /// holds it, read from the header alone.
+    pub fn load(model_dir: &Path, backend: BackendKind) -> Result<Self> {
         let config = Inkling2Config::load(model_dir)?;
         let checkpoint = Inkling2Checkpoint::open(model_dir, &config)?;
-        Ok(Self::of(&config, &checkpoint))
+        Ok(Self::of(&config, &checkpoint, projection_dtype(backend)))
     }
 
     /// Bytes on the host that stay for the model's lifetime: the routers,
@@ -109,8 +133,18 @@ impl Inkling2Footprint {
         }
     }
 
-    /// The load's high point in the load domain: a dense tensor passes
-    /// through a host F32 buffer and, for a projection, a transposed copy.
+    /// The load's high point in the load domain. Beside what stays, one
+    /// dense tensor at a time is in flight, and its flight never takes more
+    /// than twice its held size beyond its final copy where host and device
+    /// share memory, or its held size on each side where they do not:
+    ///
+    /// * an F32 tensor passes through a host F32 buffer and, for a
+    ///   projection, a transposed device copy;
+    /// * an F16 projection (Metal) is converted on the host, the F32 values
+    ///   and the F16 copy together three times its held size before its
+    ///   device copy exists, then uploaded;
+    /// * a BF16 projection (CUDA, on request) uploads the stored bytes through a host
+    ///   copy of the same size and is transposed on the device.
     pub fn load_peak_bytes(&self, backend: BackendKind, experts_on_device: bool) -> u64 {
         let transient = match backend {
             BackendKind::Cpu | BackendKind::Metal => 2 * self.largest_dense_bytes,
@@ -139,7 +173,11 @@ mod tests {
         let dir = fixture("inkling2_golden");
         let config = tiny();
         let checkpoint = Inkling2Checkpoint::open(&dir, &config).unwrap();
-        let footprint = Inkling2Footprint::load(&dir).unwrap();
+        let footprint = Inkling2Footprint::load(&dir, BackendKind::Cpu).unwrap();
+        assert_eq!(
+            footprint,
+            Inkling2Footprint::of(&config, &checkpoint, DType::F32)
+        );
         // The experts are what the packed stacks report holding.
         let packed = (0..config.layers)
             .map(|layer| {
@@ -191,6 +229,61 @@ mod tests {
         );
     }
 
+    /// With 16-bit projections the large matrices cost half and nothing
+    /// else moves.
+    #[test]
+    fn projections_are_priced_at_the_dtype_they_are_held_in() {
+        let dir = fixture("inkling2_golden");
+        let config = tiny();
+        let checkpoint = Inkling2Checkpoint::open(&dir, &config).unwrap();
+        let wide = Inkling2Footprint::of(&config, &checkpoint, DType::F32);
+        let (mut text, mut vision, mut unreadable) = (0u64, 0u64, 0u64);
+        for entry in expected_census(&config, checkpoint.expert_formats()) {
+            let held = |dtype| held_element_bytes(&entry.name, &entry.shape, dtype);
+            // Every projection halves in BF16; in F16 all but the tiny
+            // patch embedding, whose input width the Metal kernel cannot
+            // read.
+            if held(DType::BF16) != 2 {
+                continue;
+            }
+            if held(DType::F16) != 2 {
+                assert!(entry.name.ends_with(".patch_embedding.weight"));
+                unreadable += (entry.shape[0] * entry.shape[1]) as u64;
+            }
+            let rows = if entry.name.ends_with(".unembed.weight") {
+                config.unpadded_vocab
+            } else {
+                entry.shape[0]
+            };
+            let elements = (rows * entry.shape[1]) as u64;
+            if entry.name.starts_with(VISION_PREFIX) {
+                vision += elements;
+            } else {
+                text += elements;
+            }
+        }
+        assert!(text > 0 && vision > 0);
+        for (dtype, wide_vision) in [(DType::F16, unreadable), (DType::BF16, 0)] {
+            let narrow = Inkling2Footprint::of(&config, &checkpoint, dtype);
+            let vision = vision - wide_vision;
+            assert_eq!(narrow.dense_bytes, wide.dense_bytes - 2 * (text + vision));
+            assert_eq!(narrow.vision_bytes, wide.vision_bytes - 2 * vision);
+            assert_eq!(
+                narrow.largest_dense_bytes,
+                (config.vocab * config.hidden * 2) as u64
+            );
+            assert_eq!(narrow.expert_bytes, wide.expert_bytes);
+            assert_eq!(narrow.router_bytes, wide.router_bytes);
+        }
+        // What a load on each backend prices is what its loader holds.
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert_eq!(
+                Inkling2Footprint::load(&dir, backend).unwrap(),
+                Inkling2Footprint::of(&config, &checkpoint, projection_dtype(backend))
+            );
+        }
+    }
+
     /// The published model, priced from its config and the published expert
     /// formats: 14.6 GiB of packed experts, 6.0 GiB of F32 dense text
     /// tensors and 1.2 GiB of F32 vision tensors.
@@ -225,6 +318,34 @@ mod tests {
             }
         }
         let gib = (1u64 << 30) as f64;
+        // As held: 7.1 GiB of dense tensors in F32 (the unembedding without
+        // its padded rows), 3.6 GiB with the projections in 16 bits, of
+        // which the vision tower is 1.2 and 0.6 GiB.
+        let wide = Inkling2Footprint::of_census(&config, &formats, DType::F32);
+        let narrow = Inkling2Footprint::of_census(&config, &formats, DType::BF16);
+        // Every published projection has a width the Metal kernel reads.
+        assert_eq!(
+            narrow,
+            Inkling2Footprint::of_census(&config, &formats, DType::F16)
+        );
+        assert_eq!(wide.expert_bytes, expert_bytes);
+        assert_eq!(narrow.expert_bytes, expert_bytes);
+        for (footprint, dense, vision, largest) in
+            [(wide, 7.15, 1.19, 1.73), (narrow, 3.63, 0.60, 0.86)]
+        {
+            let held = [
+                (footprint.dense_bytes, dense),
+                (footprint.vision_bytes, vision),
+                (footprint.largest_dense_bytes, largest),
+            ];
+            for (bytes, want) in held {
+                assert!(
+                    (bytes as f64 / gib - want).abs() < 0.02,
+                    "{} GiB, not {want}",
+                    bytes as f64 / gib
+                );
+            }
+        }
         assert!(
             (expert_bytes as f64 / gib - 14.59).abs() < 0.05,
             "{}",

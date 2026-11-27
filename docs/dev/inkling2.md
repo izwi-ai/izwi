@@ -85,8 +85,8 @@ Each has a test, and breaking each fails the parity test:
 | Part | CPU | Metal | CUDA |
 | --- | --- | --- | --- |
 | Experts, as stored (14.6 GiB) | mapped file | mapped file | device, uploaded as stored (the mapped file if they run on the host) |
-| Dense text tensors, F32 (6.0 GiB) | host | device | device |
-| Vision tower, F32 (1.2 GiB) | host | device | device |
+| Dense text tensors, F32 (6.0 GiB) | host | device (3.0 GiB with F16 projections on request) | device (3.0 GiB with BF16 projections on request) |
+| Vision tower, F32 (1.2 GiB) | host | device (0.6 GiB with F16) | device (0.6 GiB with BF16) |
 | Routers, F32 | host | host | host, and a device copy with the experts |
 | Keys and values | F32 | F16 | BF16 |
 
@@ -140,8 +140,33 @@ The served path is the composed trunk on every backend:
 
 Not implemented yet: a fused paged attention kernel with the position bias
 and sink (which a whole-step graph needs: until then 48 attention cores per
-token run eagerly), fused convolution kernels, dense
-tensors in the checkpoint's BF16, and the MTP head.
+token run eagerly), fused convolution kernels, and the MTP head.
+
+## Dense weights in 16 bits
+
+`precision.rs` decides the dtype of the large matrices (embedding,
+unembedding, attention projections, the vision tower's linears) and holds
+the one product they go through. Everything is F32 by default.
+`IZWI_INKLING2_DENSE_DTYPE` asks for 16 bits on an accelerator:
+
+- `f16` on Metal: the weights are converted at load (checked per tensor; one
+  that does not fit stays F32), activations and accumulation stay F32
+  through the mixed-dtype mat-vec kernel, and the numbers equal the F32
+  path's up to summation order (logits within 1.4e-3 on the fixture, the
+  same as F32 against the reference). Dense memory halves and a decode
+  step's products are faster (97 against 166 microseconds for a layer
+  projection on an M1 Pro). It is not the default because a prefill span
+  wider than 16 rows widens each weight for the call, which makes that
+  product about a quarter slower than with F32 weights; end-to-end prefill
+  time on the real model has not been measured.
+- `bf16` on CUDA: the stored bytes are uploaded as they are and each
+  projection rounds its activations to BF16. That is the reference's own
+  arithmetic, but on the random fixture it flips expert routing and moves
+  logits by whole units, so it stays a request until a product of F32
+  activations with a BF16 weight exists there (`Projection` is the place).
+  Type-checked only.
+
+Load admission prices the dense tensors at the dtype they will be held in.
 
 ## Releasing window pages
 

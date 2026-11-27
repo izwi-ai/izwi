@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use safetensors::SafeTensors;
 
 use super::checkpoint::Inkling2Checkpoint;
@@ -66,6 +66,13 @@ pub(crate) fn tiny_trunk(device: &Device) -> Inkling2Trunk {
     Inkling2Trunk::load(&checkpoint, &config, device).unwrap()
 }
 
+/// The tiny trunk with its projection weights held in `dtype`.
+pub(crate) fn tiny_trunk_in(device: &Device, dtype: DType) -> Inkling2Trunk {
+    let config = tiny();
+    let checkpoint = Inkling2Checkpoint::open(&fixture("inkling2_golden"), &config).unwrap();
+    Inkling2Trunk::load_with_dtype(&checkpoint, &config, device, dtype).unwrap()
+}
+
 fn values(tensor: &Tensor) -> Vec<f32> {
     tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap()
 }
@@ -95,8 +102,9 @@ fn composed_trunk_matches_the_reference_logits() {
     trunk_matches_the_reference(&Device::Cpu, 2e-4, 2e-3);
 }
 
-/// The same composed trunk on the Metal device (F32 activations; Candle's
-/// Metal kernels use fast math, so the tolerance is wider).
+/// The same composed trunk on the Metal device as a load holds it there: F16
+/// projection weights under F32 activations, accumulated in F32. Candle's
+/// Metal kernels use fast math, so the tolerance is wider than the host's.
 #[cfg(feature = "metal")]
 #[test]
 fn composed_trunk_matches_the_reference_logits_on_metal() {
@@ -105,12 +113,104 @@ fn composed_trunk_matches_the_reference_logits_on_metal() {
     ) else {
         return;
     };
-    trunk_matches_the_reference(&device, 5e-3, 5e-2);
+    let trunk = tiny_trunk(&device);
+    if crate::env::value(super::precision::DENSE_DTYPE_ENV).is_none() {
+        assert_eq!(trunk.projection_dtype(), DType::F32);
+    }
+    assert_eq!(trunk.widened_projections(), 0);
+    reference_errors(&trunk, METAL_F16_TOLERANCES.0, METAL_F16_TOLERANCES.1);
+}
+
+/// Activation (relative to each activation's scale) and logit tolerances on
+/// Metal, the same with the projections in F32 and in F16.
+#[cfg(feature = "metal")]
+const METAL_F16_TOLERANCES: (f32, f32) = (5e-3, 5e-2);
+
+/// The projection dtypes on Metal against the reference and against one
+/// another. F32 is the path before 16-bit weights and F16 is what Metal
+/// loads: its weights are the same values and it accumulates in F32, so it
+/// stays as close to the reference as F32 does. BF16 is what CUDA loads on
+/// request, run here because its code path is the same on any device: it rounds the
+/// activations of every projection to BF16 as the reference does, and on
+/// this random fixture, whose experts route on near-ties, that moves the
+/// logits by whole units. It is measured and only held to be finite.
+#[cfg(feature = "metal")]
+#[test]
+fn projection_dtypes_agree_on_metal() {
+    let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("projection_dtypes_agree_on_metal")
+    else {
+        return;
+    };
+    let golden = golden();
+    let mut logits = Vec::new();
+    for (dtype, (activation, logit)) in [
+        (DType::F32, METAL_F16_TOLERANCES),
+        (DType::F16, METAL_F16_TOLERANCES),
+        (DType::BF16, (f32::MAX, f32::MAX)),
+    ] {
+        let trunk = tiny_trunk_in(&device, dtype);
+        assert_eq!(trunk.projection_dtype(), dtype);
+        assert_eq!(trunk.widened_projections(), 0);
+        let (activation_error, logit_error) = reference_errors(&trunk, activation, logit);
+        eprintln!(
+            "Metal {dtype:?} projections: activation error {activation_error:.3e} of scale, logit error {logit_error:.3e}"
+        );
+        // One span, then the same tokens a row at a time: the decode step's
+        // kernel and the span's product agree.
+        let mut state = trunk.new_state().unwrap();
+        let hidden = trunk.forward(&golden.tokens, &mut state, None).unwrap();
+        let span = values(&trunk.logits(&hidden).unwrap());
+        let mut state = trunk.new_state().unwrap();
+        let mut stepped = Vec::new();
+        for token in &golden.tokens {
+            let hidden = trunk.forward(&[*token], &mut state, None).unwrap();
+            stepped.extend(values(&trunk.logits(&hidden).unwrap()));
+        }
+        let step_error = max_error(&stepped, &span);
+        eprintln!(
+            "Metal {dtype:?} projections: one row at a time against one span {step_error:.3e}"
+        );
+        if dtype != DType::BF16 {
+            assert!(step_error <= METAL_F16_TOLERANCES.1, "{step_error}");
+        }
+        logits.push(span);
+    }
+    let f16_error = max_error(&logits[1], &logits[0]);
+    let bf16_error = max_error(&logits[2], &logits[0]);
+    eprintln!("Metal logits against F32 projections: F16 {f16_error:.3e}, BF16 {bf16_error:.3e}");
+    assert!(f16_error <= 5e-3, "F16 {f16_error}");
+    assert!(bf16_error.is_finite());
+    // F16 weights do not change which token the model picks anywhere in the
+    // fixture.
+    let vocab = tiny().unpadded_vocab;
+    let picks = |logits: &[f32]| {
+        logits
+            .chunks(vocab)
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(token, _)| token)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(picks(&logits[1]), picks(&logits[0]));
 }
 
 fn trunk_matches_the_reference(device: &Device, activation_tolerance: f32, logit_tolerance: f32) {
+    reference_errors(&tiny_trunk(device), activation_tolerance, logit_tolerance);
+}
+
+/// Runs the fixture through `trunk`, holds every recorded activation and the
+/// logits to the tolerances, and returns the worst activation error
+/// (relative to its activation's scale) and the logit error.
+fn reference_errors(
+    trunk: &Inkling2Trunk,
+    activation_tolerance: f32,
+    logit_tolerance: f32,
+) -> (f32, f32) {
     let golden = golden();
-    let trunk = tiny_trunk(device);
     let mut state = trunk.new_state().unwrap();
     let mut trace = Inkling2Trace::default();
     let hidden = trunk
@@ -121,6 +221,7 @@ fn trunk_matches_the_reference(device: &Device, activation_tolerance: f32, logit
     // Every recorded activation, in order, so a mismatch names the first
     // place the trunks diverge.
     assert_eq!(trace.entries.len(), golden.trace.len());
+    let mut worst = 0f32;
     for (name, tensor) in &trace.entries {
         let want = golden
             .trace
@@ -132,14 +233,16 @@ fn trunk_matches_the_reference(device: &Device, activation_tolerance: f32, logit
             error <= activation_tolerance * scale,
             "{name}: error {error} at scale {scale}"
         );
+        worst = worst.max(error / scale);
     }
     let logits = values(&trunk.logits(&hidden).unwrap());
     let error = max_error(&logits, &golden.logits);
-    eprintln!("{device:?}: logit error {error}");
+    eprintln!("{:?}: logit error {error}", trunk.device());
     assert!(error <= logit_tolerance, "logit error {error}");
     // The fixture is not degenerate: logits spread over several units.
     let spread = golden.logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     assert!(spread > 5.0);
+    (worst, error)
 }
 
 /// Prefill in uneven spans, then one token at a time: the same logits as one
