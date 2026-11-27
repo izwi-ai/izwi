@@ -827,7 +827,8 @@ impl Inkling2ChatModel {
         true
     }
 
-    /// Rows of a continuous batch run one after another inside the step.
+    /// A continuous batch's rows run in one pass where the model batches
+    /// rows, else one after another inside the step.
     pub fn supports_continuous_decode_batch(&self) -> bool {
         true
     }
@@ -1487,7 +1488,7 @@ impl Inkling2ChatModel {
             let mut context = Inkling2RowsPagedContext::new(&self.config, rows)?;
             let mut convs = working.iter_mut().collect::<Vec<_>>();
             self.trunk
-                .forward_rows(&embeddings, &positions, &mut convs, &mut context)
+                .forward_rows(&embeddings, &positions, &mut convs, &mut context, None)
         })();
         let hidden = match hidden {
             Ok(hidden) => hidden,

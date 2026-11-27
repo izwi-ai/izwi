@@ -323,3 +323,66 @@ fn a_state_snapshot_restores_exactly() {
     );
     assert!(max_error(&cold, &first) > 1e-2);
 }
+
+/// A recorded pass gives the convolution state after any prefix of its
+/// span, as a pass over that prefix alone leaves it, and the taps it asks
+/// for: the input of an application, and the final output for the id past
+/// the last application.
+#[test]
+fn a_recorded_pass_gives_the_state_after_any_prefix_and_its_taps() {
+    use super::trunk::{Inkling2DenseContext, Inkling2PassRecord};
+    let golden = golden();
+    let device = Device::Cpu;
+    let trunk = tiny_trunk(&device);
+    let config = tiny();
+    let tokens = &golden.tokens[..9];
+    let embeddings = trunk.embed(tokens).unwrap();
+    let applications = config.application_count();
+
+    let mut conv = trunk.new_conv_state().unwrap();
+    let mut context = Inkling2DenseContext::new(applications);
+    let mut record = Inkling2PassRecord::with_taps(vec![3, applications]);
+    record.keep_conv_inputs = true;
+    let hidden = trunk
+        .forward_span_recorded(&embeddings, 0, &mut conv, &mut context, None, &mut record)
+        .unwrap();
+    let taps = record.taps.clone().unwrap();
+    assert_eq!(taps.dims(), [9, 2, config.hidden]);
+    // The last tap is the pass's output.
+    let last = taps.narrow(1, 1, 1).unwrap().squeeze(1).unwrap();
+    assert_eq!(values(&last), values(&hidden));
+
+    for consumed in [1, 4, 9] {
+        let mut alone = trunk.new_conv_state().unwrap();
+        let mut context = Inkling2DenseContext::new(applications);
+        trunk
+            .forward_span(
+                &embeddings.narrow(0, 0, consumed).unwrap(),
+                0,
+                &mut alone,
+                &mut context,
+                None,
+                None,
+            )
+            .unwrap();
+        let after = record.conv_after(consumed, config.conv_kernel).unwrap();
+        for (got, want) in after.histories.iter().zip(&alone.histories) {
+            // The same histories up to the summation order of a product
+            // over more rows.
+            for (got, want) in got.tensors().iter().zip(want.tensors()) {
+                let want = values(want);
+                let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                let error = max_error(&values(got), &want);
+                assert!(
+                    error <= 2e-4 * scale,
+                    "after {consumed} tokens: {error} of {scale}"
+                );
+            }
+        }
+    }
+    // The span's own end state is the state after all of it.
+    let end = record.conv_after(9, config.conv_kernel).unwrap();
+    for (got, want) in end.histories.iter().zip(&conv.histories) {
+        assert_eq!(values(&got.key), values(&want.key));
+    }
+}
