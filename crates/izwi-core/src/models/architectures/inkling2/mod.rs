@@ -27,6 +27,7 @@
 pub mod chat;
 pub mod checkpoint;
 pub mod config;
+pub mod drafter;
 pub mod experts;
 pub mod memory;
 pub mod precision;
@@ -39,6 +40,8 @@ pub mod vision;
 
 #[cfg(test)]
 mod chat_tests;
+#[cfg(test)]
+mod drafter_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod synthetic;
 #[cfg(test)]
