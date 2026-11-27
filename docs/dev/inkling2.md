@@ -141,8 +141,28 @@ The served path is the composed trunk on every backend:
 Not implemented yet: a fused paged attention kernel with the position bias
 and sink (which a whole-step graph needs: until then 48 attention cores per
 token run eagerly), fused convolution kernels, dense
-tensors in the checkpoint's BF16, releasing windowed pages, and the MTP
-head.
+tensors in the checkpoint's BF16, and the MTP head.
+
+## Releasing window pages
+
+Forty of the 48 layer applications look back 1,024 tokens. When prefix
+sharing is off, their keys and values are a state domain of their own
+(`INKLING2_WINDOWED_STATE_DOMAIN`), all with one window, and the engine
+releases that domain's pages once no query can reach them. A long
+conversation then holds whole-history keys and values only for the eight
+full-attention applications: about a sixth of the 192 KiB a token costs in
+BF16 beyond the window. The model takes two caches (`state::Inkling2Caches`)
+and routes each application to its cache; the engine passes the second one
+where it passes another family's second domain.
+
+Prefix sharing and page release do not combine. The engine shares snapshot
+prefixes only for a contract with one paged domain, and frees window pages
+only for a domain whose layers share one window. So the contract has one
+shape or the other, chosen at load: prefix sharing where the catalog engages
+it (CPU, Metal) or the operator forces it, page release otherwise (CUDA by
+default, and anywhere with `enable_prefix_caching` off and catalog
+selection off). Load-time arena sizing is not window-aware yet, so the gain
+is pages left for other sequences, not a smaller arena.
 
 ## Prefix sharing
 
@@ -235,6 +255,10 @@ is part of the load's admission figures.
 | The reference fixture against Transformers itself, every layer application and the logits | `generate_inkling2_golden.py --check-transformers`, Transformers 5.24.1 | passes: F64 logits within 1e-12 |
 | Image cells, vision features and the logits of a prompt with two images against the reference fixture; prefill in spans that cut an image; replay with images | CPU test | passes |
 | An image chat through the runtime: PNG data URLs, two requests at once, failures that leave the model serving | CPU test, synthetic checkpoint | passes |
+| Prefix sharing: an attached prefix against a fresh run (CPU, and Metal with F16 keys), and a second turn through the runtime | CPU and Metal tests | passes |
+| The split layout: same logits and tokens as one cache, and on a windowed view that has released its early pages; through the runtime, replies equal the single-domain run's | CPU test | passes |
+| Tool calls and JSON replies held to their grammar on random weights | CPU test | passes |
+| A separate worker process serving the synthetic checkpoint over HTTP and through the gateway | CPU process test | passes |
 | Real checkpoint on any backend | a machine with 24 GB+ | not run |
 | Device experts inside the served model, on the kernels' CPU reference: load check, logits, greedy tokens equal to the host path | CPU test | passes |
 | The Metal expert kernels against the CPU reference (ids equal, outputs within 3e-7 relative, a token's result bit-identical alone and in a batch), and inside the served model with the load check | Metal tests, M-series Mac | passes |

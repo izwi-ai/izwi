@@ -19,9 +19,7 @@ use super::prompt::{
     forced_call, json_reply, render_prompt, CONTENT_TEXT, IMAGE_SLOT, JSON_REPLY_GRAMMAR,
 };
 use super::reply::{Inkling2Reply, Inkling2ReplyTokens};
-use super::state::{
-    kv_dtype, managed_contract, paged_geometry, Inkling2ConvRuntimeState, Inkling2PagedContext,
-};
+use super::state::{kv_dtype, managed_contract, Inkling2Caches, Inkling2ConvRuntimeState};
 use super::trunk::Inkling2Trunk;
 use super::vision::{image_tokens, preprocess_image, Inkling2Vision};
 use crate::backends::kv::KvWriteBatchCompletion;
@@ -225,7 +223,7 @@ struct SpanImages<'a> {
 
 pub struct ChatDecodeState {
     conv: Inkling2ConvRuntimeState,
-    physical_kv: PhysicalPagedKvCache,
+    physical_kv: Inkling2Caches,
     physical_tensor_sequence: Option<PhysicalStateSequenceId>,
     /// Logits of the last prefilled token, `[vocab]`, not sampled yet.
     unconsumed_logits: Option<Tensor>,
@@ -249,7 +247,7 @@ pub struct ChatDecodeState {
 
 pub(crate) struct ChatDecodeCheckpoint {
     conv: Inkling2ConvRuntimeState,
-    physical_kv: PhysicalPagedKvCache,
+    physical_kv: Inkling2Caches,
     unconsumed_logits: Option<Tensor>,
     pending_token: Option<u32>,
     generated_ids: Vec<u32>,
@@ -325,10 +323,8 @@ impl ChatDecodeState {
         })
     }
 
-    fn continues(&self, cache: &PhysicalPagedKvCache) -> Result<()> {
-        if cache.arena().id() != self.physical_kv.arena().id()
-            || cache.context_len() != self.physical_kv.context_len()
-        {
+    fn continues(&self, cache: &Inkling2Caches) -> Result<()> {
+        if !self.physical_kv.continued_by(cache) {
             return Err(chat_error(
                 "a managed reservation does not continue the session",
             ));
@@ -336,10 +332,14 @@ impl ChatDecodeState {
         Ok(())
     }
 
+    /// Takes the next quantum's reservation: the main cache and, when the
+    /// sliding-window applications have their own domain, theirs.
     pub(crate) fn begin_managed_quantum(
         &mut self,
         cache: PhysicalPagedKvCache,
+        windowed: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeCheckpoint> {
+        let cache = Inkling2Caches::new(cache, windowed)?;
         self.continues(&cache)?;
         Ok(ChatDecodeCheckpoint {
             conv: self.conv.clone(),
@@ -358,7 +358,9 @@ impl ChatDecodeState {
     pub(crate) fn install_managed_reservation(
         &mut self,
         cache: PhysicalPagedKvCache,
+        windowed: Option<PhysicalPagedKvCache>,
     ) -> Result<()> {
+        let cache = Inkling2Caches::new(cache, windowed)?;
         self.continues(&cache)?;
         self.physical_kv = cache;
         Ok(())
@@ -427,8 +429,12 @@ impl ChatDecodeState {
         self.finished
     }
 
-    /// The reservation the engine would hand back for the next quantum.
+    /// The sliding-window domain's cache, when the state has one.
     #[cfg(test)]
+    pub(crate) fn windowed_cache_for_test(&self) -> Option<&PhysicalPagedKvCache> {
+        self.physical_kv.windowed()
+    }
+
     /// The convolution ring as the engine would publish it at a snapshot.
     #[cfg(test)]
     pub(crate) fn conv_for_test(&self) -> Inkling2ConvRuntimeState {
@@ -442,18 +448,20 @@ impl ChatDecodeState {
         self.conv = conv;
     }
 
+    /// The reservation the engine would hand back for the next quantum.
+    #[cfg(test)]
     pub(crate) fn cache_view_for_test(&self) -> PhysicalPagedKvCache {
-        let layers = self.physical_kv.arena().config().layers.len() as u32;
+        let main = self.physical_kv.main();
         PhysicalPagedKvCache::new(
-            self.physical_kv.arena().clone(),
-            (0..layers)
-                .map(|layer| crate::kv::KvLayerBinding {
-                    model_layer: layer,
-                    physical_layer: layer,
-                })
+            main.arena().clone(),
+            main.arena()
+                .config()
+                .layers
+                .iter()
+                .map(|layer| layer.binding)
                 .collect(),
-            self.physical_kv.blocks.clone(),
-            self.physical_kv.context_len(),
+            main.blocks.clone(),
+            main.context_len(),
         )
         .unwrap()
     }
@@ -920,7 +928,7 @@ impl Inkling2ChatModel {
         &self,
         tokens: &[u32],
         start: usize,
-        cache: &mut PhysicalPagedKvCache,
+        cache: &mut Inkling2Caches,
         conv: &mut Inkling2ConvRuntimeState,
         want_logits: bool,
         images: Option<SpanImages<'_>>,
@@ -932,7 +940,7 @@ impl Inkling2ChatModel {
                 conv.cursor()
             )));
         }
-        cache.validate_sparse_model_layers(&paged_geometry(&self.config))?;
+        cache.validate(&self.config)?;
         let embeddings = match images {
             Some(images) if images.prompt > 0 => {
                 let prompt = images.prompt.min(tokens.len());
@@ -953,10 +961,7 @@ impl Inkling2ChatModel {
         let mut working = conv.conv()?.clone();
         let mut prepared = cache.prepare_append(start, tokens.len())?;
         let hidden = {
-            let mut context = Inkling2PagedContext {
-                cache: &*cache,
-                prepared: &mut prepared,
-            };
+            let mut context = cache.context(&self.config, &mut prepared);
             self.trunk.forward_span(
                 &embeddings,
                 start,
@@ -971,13 +976,13 @@ impl Inkling2ChatModel {
             Err(error) => {
                 // The trunk's error is the one to report; an abort that
                 // also fails must not replace it.
-                if let Err(abort) = cache.abort_prepared(prepared) {
+                if let Err(abort) = cache.abort(prepared) {
                     tracing::warn!("Inkling 2: aborting a failed span also failed: {abort}");
                 }
                 return Err(error);
             }
         };
-        cache.commit_prepared(prepared)?;
+        cache.commit(prepared)?;
         conv.advance(working, tokens.len());
         if !want_logits {
             return Ok(None);
@@ -991,7 +996,7 @@ impl Inkling2ChatModel {
         prompt_ids: &[u32],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        cache: PhysicalPagedKvCache,
+        cache: Inkling2Caches,
     ) -> Result<ChatDecodeState> {
         let attached = cache.context_len();
         let forced = forced_call(&config.request)?;
@@ -1044,8 +1049,9 @@ impl Inkling2ChatModel {
         prepared: &Inkling2PreparedPrompt,
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        cache: PhysicalPagedKvCache,
+        cache: impl Into<Inkling2Caches>,
     ) -> Result<ChatDecodeState> {
+        let cache = cache.into();
         // The slots of two images are the same tokens: a prompt with images
         // shares no prefix.
         if cache.context_len() != 0 {
@@ -1068,8 +1074,9 @@ impl Inkling2ChatModel {
         prompt_ids: &[u32],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        cache: PhysicalPagedKvCache,
+        cache: impl Into<Inkling2Caches>,
     ) -> Result<ChatDecodeState> {
+        let cache = cache.into();
         // An attached prefix starts the cache above zero: its pages hold the
         // prompt's first `attached` tokens, and the engine restores the
         // convolution ring's snapshot at that cursor before the first span.
@@ -1144,12 +1151,12 @@ impl Inkling2ChatModel {
     }
 
     /// Starts a session and prefills its whole prompt.
-    pub fn start_decode_managed(
+    pub(crate) fn start_decode_managed(
         &self,
         prompt_ids: &[u32],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        cache: PhysicalPagedKvCache,
+        cache: impl Into<Inkling2Caches>,
     ) -> Result<ChatDecodeState> {
         let mut state =
             self.begin_resumable_prefill_managed(prompt_ids, max_new_tokens, config, cache)?;
@@ -1158,12 +1165,12 @@ impl Inkling2ChatModel {
     }
 
     /// [`Self::start_decode_managed`] for a prompt with images.
-    pub fn start_prepared_decode_managed(
+    pub(crate) fn start_prepared_decode_managed(
         &self,
         prepared: &Inkling2PreparedPrompt,
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        cache: PhysicalPagedKvCache,
+        cache: impl Into<Inkling2Caches>,
     ) -> Result<ChatDecodeState> {
         let mut state =
             self.begin_prepared_prefill_managed(prepared, max_new_tokens, config, cache)?;
@@ -1176,8 +1183,9 @@ impl Inkling2ChatModel {
     pub(crate) fn begin_replay_managed(
         &self,
         saved: &ChatReplayCheckpoint,
-        cache: PhysicalPagedKvCache,
+        cache: impl Into<Inkling2Caches>,
     ) -> Result<ChatDecodeState> {
+        let cache = cache.into();
         if cache.context_len() != 0 || saved.replay_tokens == 0 {
             return Err(Error::InvalidInput(
                 "Inkling 2 replay requires an empty reservation and a non-empty journal".into(),

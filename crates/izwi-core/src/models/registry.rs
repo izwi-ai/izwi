@@ -6512,16 +6512,10 @@ impl NativeChatDecodeState {
                     .begin_managed_quantum(cache)
                     .map(NativeChatDecodeCheckpoint::Lfm2)
             }
-            Self::Inkling2(state) => {
-                if mtp_cache.is_some() {
-                    return Err(Error::InvalidInput(
-                        "an MTP reservation was routed to an Inkling 2 state".into(),
-                    ));
-                }
-                state
-                    .begin_managed_quantum(cache)
-                    .map(NativeChatDecodeCheckpoint::Inkling2)
-            }
+            // Inkling 2's second cache is its sliding-window domain's.
+            Self::Inkling2(state) => state
+                .begin_managed_quantum(cache, mtp_cache)
+                .map(NativeChatDecodeCheckpoint::Inkling2),
         }
     }
 
@@ -6623,14 +6617,7 @@ impl NativeChatDecodeState {
                 }
                 state.install_managed_reservation(cache)
             }
-            Self::Inkling2(state) => {
-                if mtp_cache.is_some() {
-                    return Err(Error::InvalidInput(
-                        "an MTP reservation was routed to Inkling 2".into(),
-                    ));
-                }
-                state.install_managed_reservation(cache)
-            }
+            Self::Inkling2(state) => state.install_managed_reservation(cache, mtp_cache),
         }
     }
 
@@ -7164,12 +7151,11 @@ impl NativeChatModel {
                     model.begin_replay_managed(checkpoint, cache)?,
                 ))
             }
-            (Self::Inkling2(model), NativeChatReplayCheckpoint::Inkling2(checkpoint))
-                if mtp_cache.is_none() =>
-            {
-                Ok(NativeChatDecodeState::Inkling2(
-                    model.begin_replay_managed(checkpoint, cache)?,
-                ))
+            (Self::Inkling2(model), NativeChatReplayCheckpoint::Inkling2(checkpoint)) => {
+                Ok(NativeChatDecodeState::Inkling2(model.begin_replay_managed(
+                    checkpoint,
+                    crate::models::architectures::inkling2::state::Inkling2Caches::new(cache, mtp_cache)?,
+                )?))
             }
             (Self::Qwen35(model), NativeChatReplayCheckpoint::Qwen35(checkpoint))
                 if mtp_cache.is_none() =>
@@ -7509,15 +7495,15 @@ impl NativeChatModel {
                     target_cache,
                 )?),
             ),
-            Self::Inkling2(model) if prepared.is_none() && mtp_cache.is_none() => Ok(
-                NativeChatDecodeState::Inkling2(model.begin_resumable_prefill_managed(
+            Self::Inkling2(model) if prepared.is_none() => Ok(NativeChatDecodeState::Inkling2(
+                model.begin_resumable_prefill_managed(
                     prompt_ids,
                     max_new_tokens,
                     config,
-                    target_cache,
-                )?),
-            ),
-            Self::Inkling2(model) if mtp_cache.is_none() => {
+                    crate::models::architectures::inkling2::state::Inkling2Caches::new(target_cache, mtp_cache)?,
+                )?,
+            )),
+            Self::Inkling2(model) => {
                 let prepared = prepared
                     .and_then(NativeChatPreparedPrompt::as_inkling2)
                     .filter(|prepared| prepared.prompt_ids() == prompt_ids)
@@ -7531,7 +7517,7 @@ impl NativeChatModel {
                         prepared,
                         max_new_tokens,
                         config,
-                        target_cache,
+                        crate::models::architectures::inkling2::state::Inkling2Caches::new(target_cache, mtp_cache)?,
                     )?,
                 ))
             }
@@ -7705,7 +7691,9 @@ impl NativeChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
+        windowed: Option<PhysicalPagedKvCache>,
     ) -> Result<NativeChatDecodeState> {
+        let cache = crate::models::architectures::inkling2::state::Inkling2Caches::new(cache, windowed)?;
         match (self, prepared) {
             (Self::Inkling2(model), Some(prepared)) if prepared.prompt_ids() == prompt_ids => {
                 Ok(NativeChatDecodeState::Inkling2(

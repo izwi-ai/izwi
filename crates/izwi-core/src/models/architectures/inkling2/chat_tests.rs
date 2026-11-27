@@ -216,7 +216,7 @@ fn a_rolled_back_quantum_repeats_exactly() {
     generate(&model, &mut state, 3);
     let before = state.generated_ids_for_test().to_vec();
     let view = state.cache_view_for_test();
-    let checkpoint = state.begin_managed_quantum(view).unwrap();
+    let checkpoint = state.begin_managed_quantum(view, None).unwrap();
     let first = generate(&model, &mut state, 2);
     assert_eq!(first.len(), before.len() + 2);
     state.rollback_managed_quantum(checkpoint);
@@ -691,6 +691,92 @@ fn the_history_boundary_is_the_start_of_the_last_message() {
     };
     let opened = model.prompt_token_ids(&[user("Hello")], &json).unwrap();
     assert_eq!(model.history_boundary(&opened), Some(opened.len() - 2));
+}
+
+/// The two caches of the split layout: the full-attention applications' and
+/// the sliding-window ones', each in an arena of its own.
+fn split_caches(model: &Inkling2ChatModel) -> (PhysicalPagedKvCache, PhysicalPagedKvCache) {
+    let config = model.config();
+    let (windowed, full): (Vec<u32>, Vec<u32>) =
+        (0..config.application_count() as u32).partition(|application| {
+            config
+                .heads(config.applications()[*application as usize].layer)
+                .window
+                .is_some()
+        });
+    let cache = |layers: &[u32]| {
+        test_physical_caches_for_model_layers_on(
+            &Device::Cpu,
+            DType::F32,
+            layers,
+            config.full.kv_heads,
+            config.full.head_dim,
+            96,
+            1,
+        )
+        .remove(0)
+    };
+    (cache(&full), cache(&windowed))
+}
+
+/// With the sliding-window applications in a cache of their own, the model
+/// computes what it does with one cache; and it goes on doing so on a view of
+/// that cache that has let go of the pages no window reaches, as the engine
+/// hands it over once they are released.
+#[test]
+fn the_windowed_cache_can_release_pages_no_query_reaches() {
+    use super::state::Inkling2Caches;
+    let golden = golden();
+    let model = tiny_model().without_turn_end_for_test();
+    let window = model.config().sliding.window.unwrap();
+    let prompt = &golden.tokens[..40];
+    let config = ChatGenerationConfig::default();
+    let steps = 12;
+    let mut whole = model
+        .start_decode_managed(prompt, steps, &config, caches(&model, 1).remove(0))
+        .unwrap();
+    let want_logits = values(state_logits(&whole));
+    let want = generate(&model, &mut whole, steps);
+
+    let (full, windowed) = split_caches(&model);
+    let mut state = model
+        .start_decode_managed(
+            prompt,
+            steps,
+            &config,
+            Inkling2Caches::new(full, Some(windowed)).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(values(state_logits(&state)), want_logits);
+    // Two steps in, hand the state the next quantum's reservation: the main
+    // cache as it is, and the windowed one without the pages before the
+    // oldest token the next query can see.
+    assert_eq!(generate(&model, &mut state, 2), want[..2]);
+    let main = state.cache_view_for_test();
+    let held = state.windowed_cache_for_test().unwrap();
+    let context = held.context_len();
+    let page = held.arena().config().page_tokens as usize;
+    let window_start = context + 1 - window;
+    let first_page = window_start / page;
+    assert!(first_page >= 2, "the test must drop pages");
+    let view = PhysicalPagedKvCache::new_windowed(
+        held.arena().clone(),
+        held.arena()
+            .config()
+            .layers
+            .iter()
+            .map(|layer| layer.binding)
+            .collect(),
+        held.blocks[first_page..].to_vec(),
+        window_start,
+        context,
+    )
+    .unwrap();
+    state.begin_managed_quantum(main, Some(view)).unwrap();
+    assert_eq!(generate(&model, &mut state, steps), want);
+    // A reservation in the other layout is not this session's.
+    let other = caches(&model, 1).remove(0);
+    assert!(state.begin_managed_quantum(other, None).is_err());
 }
 
 /// Rows of a batch do not affect each other.

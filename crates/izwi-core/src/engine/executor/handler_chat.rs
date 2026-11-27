@@ -320,9 +320,16 @@ impl NativeExecutor {
         let stream_policy = request.stream_policy;
         let generation_config = Self::chat_generation_config(request);
         let session = scheduled.session_key();
-        if mtp_cache.is_some() && !matches!(model.as_ref(), NativeChatModel::Qwen38(_)) {
+        // A second cache is Qwen3.8's MTP draft domain or Inkling 2's
+        // sliding-window domain.
+        if mtp_cache.is_some()
+            && !matches!(
+                model.as_ref(),
+                NativeChatModel::Qwen38(_) | NativeChatModel::Inkling2(_)
+            )
+        {
             return Err(Error::InferenceError(
-                "managed Qwen3.8 MTP cache was routed to another model family".into(),
+                "a second managed cache was routed to a model family that has one domain".into(),
             ));
         }
         // Prefill scheduling can happen after preemption; only recover state
@@ -508,6 +515,7 @@ impl NativeExecutor {
                             max_new_tokens,
                             &generation_config,
                             cache,
+                            mtp_cache.take(),
                         )
                     })?,
                 },
@@ -1027,6 +1035,12 @@ impl NativeExecutor {
                 super::QWEN36_MOE_TARGET_ATTENTION_DOMAIN,
                 super::QWEN36_MOE_MTP_ATTENTION_DOMAIN,
                 "Qwen3.6-MoE",
+            )
+        } else if family == Some(crate::catalog::ModelFamily::Inkling2Chat) {
+            (
+                super::INKLING2_ATTENTION_DOMAIN,
+                super::INKLING2_WINDOWED_ATTENTION_DOMAIN,
+                "Inkling 2",
             )
         } else {
             return Ok((views.take_only_paged()?, None));

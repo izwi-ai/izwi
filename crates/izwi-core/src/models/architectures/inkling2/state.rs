@@ -33,6 +33,9 @@ use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedP
 
 pub(crate) const INKLING2_ATTENTION_STATE_DOMAIN: StateDomainId = StateDomainId::new(1);
 pub(crate) const INKLING2_CONV_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
+/// Keys and values of the sliding-window layer applications, when they have
+/// a domain of their own.
+pub(crate) const INKLING2_WINDOWED_STATE_DOMAIN: StateDomainId = StateDomainId::new(3);
 const INKLING2_MAIN_STATE_GROUP: StateGroupId = StateGroupId::new(1);
 
 fn state_error(message: impl std::fmt::Display) -> Error {
@@ -78,17 +81,30 @@ fn to_u32(value: usize, what: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::ModelLoadError(format!("Inkling 2 {what} exceeds u32")))
 }
 
-/// The scheduler-owned state contract of a chat sequence. With
-/// `share_prefixes` the keys and values publish their committed pages and
-/// the convolution ring a snapshot at each page, so a prompt that begins as
-/// an earlier one did attaches that work instead of repeating it.
+/// The scheduler-owned state contract of a chat sequence.
+///
+/// With `share_prefixes` the keys and values are one domain that publishes
+/// its committed pages, and the convolution ring a snapshot at each page, so
+/// a prompt that begins as an earlier one did attaches that work instead of
+/// repeating it. Every layer application then keeps every page.
+///
+/// Without it, the sliding-window applications (most of them) have a domain
+/// of their own. The engine releases the pages of a domain whose layers all
+/// look back the same number of tokens once no query can reach them, so a
+/// long conversation holds whole-history keys and values only for the
+/// full-attention applications.
+///
+/// The two do not combine: the engine shares snapshot prefixes only for a
+/// contract with one paged domain, and frees window pages only for a domain
+/// with one window.
 pub(crate) fn managed_contract(
     config: &Inkling2Config,
     kv_dtype: StateDType,
     share_prefixes: bool,
 ) -> Result<InferenceStateContract> {
     let applications = config.applications();
-    let layers = applications
+    let split = !share_prefixes && has_both_kinds(config);
+    let all_layers = applications
         .iter()
         .enumerate()
         .map(|(index, application)| {
@@ -124,16 +140,32 @@ pub(crate) fn managed_contract(
             interval_steps: u64::from(preferred_tokens),
         };
     }
-    let attention = StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-        header: attention_header,
-        layers,
-        page_size: PageSizeConstraint {
-            min_tokens: 1,
-            preferred_tokens,
-            max_tokens: preferred_tokens.max(256),
-            multiple_of: 1,
-        },
-        accepted_dtypes: vec![kv_dtype],
+    let paged = |header, layers| {
+        StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
+            header,
+            layers,
+            page_size: PageSizeConstraint {
+                min_tokens: 1,
+                preferred_tokens,
+                max_tokens: preferred_tokens.max(256),
+                multiple_of: 1,
+            },
+            accepted_dtypes: vec![kv_dtype],
+        })
+    };
+    let (full_layers, windowed_layers): (Vec<_>, Vec<_>) = if split {
+        all_layers
+            .into_iter()
+            .partition(|layer| layer.pattern == AttentionPattern::Full)
+    } else {
+        (all_layers, Vec::new())
+    };
+    let attention = paged(attention_header, full_layers);
+    let windowed = split.then(|| {
+        paged(
+            retained_header(INKLING2_WINDOWED_STATE_DOMAIN),
+            windowed_layers,
+        )
     });
     let mut components = Vec::with_capacity(applications.len() * CONV_STATES_PER_APPLICATION);
     for (index, application) in applications.iter().enumerate() {
@@ -167,12 +199,18 @@ pub(crate) fn managed_contract(
         components_per_step: components,
         capacity_steps: (config.conv_kernel - 1) as u64,
     });
+    let mut domains = vec![attention, convolution];
+    let mut group = vec![INKLING2_ATTENTION_STATE_DOMAIN, INKLING2_CONV_STATE_DOMAIN];
+    if let Some(windowed) = windowed {
+        domains.push(windowed);
+        group.push(INKLING2_WINDOWED_STATE_DOMAIN);
+    }
     let contract = InferenceStateContract {
         abi: CURRENT_INFERENCE_STATE_ABI,
-        domains: vec![attention, convolution],
+        domains,
         groups: vec![StateGroupSpec {
             id: INKLING2_MAIN_STATE_GROUP,
-            domains: vec![INKLING2_ATTENTION_STATE_DOMAIN, INKLING2_CONV_STATE_DOMAIN],
+            domains: group,
             prefix_shareable: false,
         }],
     };
@@ -194,10 +232,186 @@ pub(crate) fn paged_geometry(config: &Inkling2Config) -> Vec<(u32, usize, usize,
         .collect()
 }
 
-/// Keys and values in the engine's paged cache, for one prepared append.
+/// Whether the model has sliding-window and full-attention applications.
+fn has_both_kinds(config: &Inkling2Config) -> bool {
+    let windowed = config
+        .applications()
+        .iter()
+        .filter(|application| config.heads(application.layer).window.is_some())
+        .count();
+    windowed > 0 && windowed < config.application_count()
+}
+
+/// Where a layer application's keys and values live: in the windowed cache
+/// or the main one, and at which of that cache's layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Route {
+    windowed: bool,
+    ordinal: usize,
+}
+
+/// A sequence's keys and values: one cache for every layer application, or
+/// (see [`managed_contract`]) the full-attention applications in `main` and
+/// the sliding-window ones in `windowed`. Both always hold the same number
+/// of tokens' positions; the windowed one may have let old pages go.
+pub(crate) struct Inkling2Caches {
+    main: PhysicalPagedKvCache,
+    windowed: Option<PhysicalPagedKvCache>,
+}
+
+impl From<PhysicalPagedKvCache> for Inkling2Caches {
+    fn from(main: PhysicalPagedKvCache) -> Self {
+        Self {
+            main,
+            windowed: None,
+        }
+    }
+}
+
+/// One prepared append over [`Inkling2Caches`].
+pub(crate) struct Inkling2Prepared {
+    main: PreparedPhysicalPagedStep,
+    windowed: Option<PreparedPhysicalPagedStep>,
+}
+
+impl Inkling2Caches {
+    pub(crate) fn new(
+        main: PhysicalPagedKvCache,
+        windowed: Option<PhysicalPagedKvCache>,
+    ) -> Result<Self> {
+        if let Some(windowed) = &windowed {
+            if windowed.context_len() != main.context_len() {
+                return Err(state_error(format!(
+                    "the windowed cache holds {} tokens, the main one {}",
+                    windowed.context_len(),
+                    main.context_len()
+                )));
+            }
+        }
+        Ok(Self { main, windowed })
+    }
+
+    pub(crate) fn main(&self) -> &PhysicalPagedKvCache {
+        &self.main
+    }
+
+    pub(crate) fn windowed(&self) -> Option<&PhysicalPagedKvCache> {
+        self.windowed.as_ref()
+    }
+
+    pub(crate) fn context_len(&self) -> usize {
+        self.main.context_len()
+    }
+
+    /// Whether `next` is the same sequence's reservation for its next
+    /// quantum: the same arenas, layout and length.
+    pub(crate) fn continued_by(&self, next: &Self) -> bool {
+        let same = |a: &PhysicalPagedKvCache, b: &PhysicalPagedKvCache| {
+            a.arena().id() == b.arena().id() && a.context_len() == b.context_len()
+        };
+        same(&self.main, &next.main)
+            && match (&self.windowed, &next.windowed) {
+                (None, None) => true,
+                (Some(a), Some(b)) => same(a, b),
+                _ => false,
+            }
+    }
+
+    /// Checks that the caches cover exactly the model's layer applications
+    /// in this layout.
+    pub(crate) fn validate(&self, config: &Inkling2Config) -> Result<()> {
+        let geometry = paged_geometry(config);
+        match &self.windowed {
+            None => self.main.validate_sparse_model_layers(&geometry),
+            Some(windowed) => {
+                let (sliding, full): (Vec<_>, Vec<_>) =
+                    geometry.into_iter().partition(|(application, ..)| {
+                        config
+                            .heads(config.applications()[*application as usize].layer)
+                            .window
+                            .is_some()
+                    });
+                self.main.validate_sparse_model_layers(&full)?;
+                windowed.validate_sparse_model_layers(&sliding)
+            }
+        }
+    }
+
+    fn routes(&self, config: &Inkling2Config) -> Vec<Route> {
+        let (mut main, mut sliding) = (0, 0);
+        config
+            .applications()
+            .iter()
+            .map(|application| {
+                let windowed =
+                    self.windowed.is_some() && config.heads(application.layer).window.is_some();
+                let counter = if windowed { &mut sliding } else { &mut main };
+                let ordinal = *counter;
+                *counter += 1;
+                Route { windowed, ordinal }
+            })
+            .collect()
+    }
+
+    pub(crate) fn prepare_append(&self, start: usize, tokens: usize) -> Result<Inkling2Prepared> {
+        Ok(Inkling2Prepared {
+            main: self.main.prepare_append(start, tokens)?,
+            windowed: self
+                .windowed
+                .as_ref()
+                .map(|cache| cache.prepare_append(start, tokens))
+                .transpose()?,
+        })
+    }
+
+    pub(crate) fn commit(&mut self, prepared: Inkling2Prepared) -> Result<()> {
+        self.main.commit_prepared(prepared.main)?;
+        match (&mut self.windowed, prepared.windowed) {
+            (Some(cache), Some(prepared)) => cache.commit_prepared(prepared),
+            (None, None) => Ok(()),
+            _ => Err(state_error("a prepared append does not match its caches")),
+        }
+    }
+
+    /// Aborts both appends; the first failure is returned.
+    pub(crate) fn abort(&mut self, prepared: Inkling2Prepared) -> Result<()> {
+        let main = self.main.abort_prepared(prepared.main);
+        let windowed = match (&mut self.windowed, prepared.windowed) {
+            (Some(cache), Some(prepared)) => cache.abort_prepared(prepared),
+            _ => Ok(()),
+        };
+        main.and(windowed)
+    }
+
+    pub(crate) fn take_completed_writes(
+        &mut self,
+    ) -> Vec<std::sync::Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        let mut writes = self.main.take_completed_writes();
+        if let Some(windowed) = &mut self.windowed {
+            writes.extend(windowed.take_completed_writes());
+        }
+        writes
+    }
+
+    /// The context a span's layer applications write to and read from.
+    pub(crate) fn context<'a>(
+        &'a self,
+        config: &Inkling2Config,
+        prepared: &'a mut Inkling2Prepared,
+    ) -> Inkling2PagedContext<'a> {
+        Inkling2PagedContext {
+            routes: self.routes(config),
+            caches: self,
+            prepared,
+        }
+    }
+}
+
+/// Keys and values in the engine's paged caches, for one prepared append.
 pub(crate) struct Inkling2PagedContext<'a> {
-    pub(crate) cache: &'a PhysicalPagedKvCache,
-    pub(crate) prepared: &'a mut PreparedPhysicalPagedStep,
+    caches: &'a Inkling2Caches,
+    prepared: &'a mut Inkling2Prepared,
+    routes: Vec<Route>,
 }
 
 impl Inkling2Context for Inkling2PagedContext<'_> {
@@ -209,19 +423,32 @@ impl Inkling2Context for Inkling2PagedContext<'_> {
         window: Option<usize>,
         first: usize,
     ) -> Result<(Tensor, Tensor, usize)> {
-        if first != self.cache.context_len() {
+        let route = *self
+            .routes
+            .get(application)
+            .ok_or_else(|| state_error(format!("no layer application {application}")))?;
+        let (cache, prepared) = match (route.windowed, &self.caches.windowed) {
+            (true, Some(cache)) => (
+                cache,
+                self.prepared
+                    .windowed
+                    .as_mut()
+                    .ok_or_else(|| state_error("the windowed append was not prepared"))?,
+            ),
+            _ => (&self.caches.main, &mut self.prepared.main),
+        };
+        if first != cache.context_len() {
             return Err(state_error(format!(
                 "a span at {first} does not continue a cache of {} tokens",
-                self.cache.context_len()
+                cache.context_len()
             )));
         }
         // The arena stores keys and values in its own dtype (F16 on Metal,
         // BF16 on CUDA); activations are F32.
-        let storage = self.cache.arena().config().dtype;
+        let storage = cache.arena().config().dtype;
         let (keys, values) = (keys.to_dtype(storage)?, values.to_dtype(storage)?);
         let (keys, values, oldest) =
-            self.cache
-                .write_and_gather(application, self.prepared, &keys, &values, window)?;
+            cache.write_and_gather(route.ordinal, prepared, &keys, &values, window)?;
         Ok((
             keys.to_dtype(DType::F32)?,
             values.to_dtype(DType::F32)?,
@@ -369,30 +596,84 @@ mod tests {
     use super::super::config::tests::{published, tiny};
     use super::*;
 
+    fn paged(domain: &StateDomainSpec) -> &PagedAttentionDomainSpec {
+        match domain {
+            StateDomainSpec::PagedAttention(attention) => attention,
+            _ => panic!("not a paged attention domain"),
+        }
+    }
+
+    fn windowed_layers(attention: &PagedAttentionDomainSpec) -> usize {
+        attention
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.pattern, AttentionPattern::SlidingWindow { .. }))
+            .count()
+    }
+
+    /// Sharing prefixes: one paged layer per application in one domain that
+    /// publishes its pages, and a ring of four histories per application
+    /// that publishes snapshots.
     #[test]
-    fn the_contract_has_one_paged_layer_and_four_rings_per_application() {
+    fn the_shared_contract_has_one_paged_domain_and_four_rings_per_application() {
         for config in [tiny(), published()] {
-            let contract = managed_contract(&config, StateDType::F32, false).unwrap();
+            let contract = managed_contract(&config, StateDType::F32, true).unwrap();
             let applications = config.application_count();
-            let StateDomainSpec::PagedAttention(attention) = &contract.domains[0] else {
-                panic!("first domain is not paged attention");
-            };
+            assert_eq!(contract.domains.len(), 2);
+            let attention = paged(&contract.domains[0]);
             assert_eq!(attention.layers.len(), applications);
-            let windowed = attention
-                .layers
-                .iter()
-                .filter(|layer| matches!(layer.pattern, AttentionPattern::SlidingWindow { .. }))
-                .count();
+            assert!(matches!(
+                attention.header.prefix,
+                PrefixPolicy::CommittedPages { .. }
+            ));
             let StateDomainSpec::Ring(ring) = &contract.domains[1] else {
                 panic!("second domain is not a ring");
             };
+            assert!(matches!(
+                ring.header.prefix,
+                PrefixPolicy::CommittedSnapshots { .. }
+            ));
             assert_eq!(ring.components_per_step.len(), 4 * applications);
             assert_eq!(ring.capacity_steps, 3);
             if config.hidden == 2304 {
                 // 48 applications: 40 windowed, 8 full.
-                assert_eq!((applications, windowed), (48, 40));
+                assert_eq!((applications, windowed_layers(attention)), (48, 40));
             }
             assert_eq!(paged_geometry(&config).len(), applications);
+        }
+    }
+
+    /// Not sharing: the sliding-window applications have a domain of their
+    /// own, all with one window, so the engine can release their pages.
+    #[test]
+    fn the_unshared_contract_gives_the_windowed_applications_their_own_domain() {
+        for config in [tiny(), published()] {
+            let contract = managed_contract(&config, StateDType::F32, false).unwrap();
+            let applications = config.application_count();
+            assert_eq!(contract.domains.len(), 3);
+            let (full, windowed) = (paged(&contract.domains[0]), paged(&contract.domains[2]));
+            assert_eq!(full.header.id, INKLING2_ATTENTION_STATE_DOMAIN);
+            assert_eq!(windowed.header.id, INKLING2_WINDOWED_STATE_DOMAIN);
+            assert_eq!(windowed_layers(full), 0);
+            assert_eq!(windowed_layers(windowed), windowed.layers.len());
+            assert_eq!(full.layers.len() + windowed.layers.len(), applications);
+            assert!(windowed
+                .layers
+                .windows(2)
+                .all(|pair| pair[0].pattern == pair[1].pattern));
+            for domain in [full, windowed] {
+                assert_eq!(domain.header.prefix, PrefixPolicy::Disabled);
+                // Layer ids rise within a domain.
+                assert!(domain
+                    .layers
+                    .windows(2)
+                    .all(|pair| pair[0].model_layer < pair[1].model_layer));
+            }
+            assert_eq!(contract.groups.len(), 1);
+            assert_eq!(contract.groups[0].domains.len(), 3);
+            if config.hidden == 2304 {
+                assert_eq!((full.layers.len(), windowed.layers.len()), (8, 40));
+            }
         }
     }
 
