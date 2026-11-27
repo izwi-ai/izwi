@@ -454,7 +454,10 @@ mod tests {
         assert!(f16_values(&broken).is_none());
     }
 
-    /// On the host the projection is the plain F32 product.
+    /// On the host the projection is the plain F32 product with the weight
+    /// held transposed and contiguous, as the trunk held it before
+    /// projections had a dtype: the same bits on every CPU. (A product with
+    /// a transposed view sums in another order on x86.)
     #[test]
     fn an_f32_projection_is_the_plain_product() {
         let config = tiny();
@@ -477,6 +480,8 @@ mod tests {
                     .tensor(&name, &device, DType::F32)
                     .unwrap()
                     .t()
+                    .unwrap()
+                    .contiguous()
                     .unwrap(),
             )
             .unwrap();
