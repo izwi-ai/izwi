@@ -35,4 +35,5 @@ model = [
   "Qwen3.8-27B-FP8",
   "LFM2.5-1.2B-Instruct-GGUF",
   "LFM3-1.7B-GGUF",
+  "Inkling-2-Mini",
 ]

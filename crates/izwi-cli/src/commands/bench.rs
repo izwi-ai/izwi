@@ -6693,7 +6693,7 @@ concurrent = [1, 2]
             let manifest: BenchmarkManifest =
                 toml::from_str(&text).expect("valid chat performance manifest");
             let cases = expand_manifest_cases(&manifest).expect("unique chat performance cases");
-            assert_eq!(cases.len(), 4, "{name}");
+            assert_eq!(cases.len(), 5, "{name}");
             assert!(cases.iter().all(|case| case.command == "chat"), "{name}");
             let models: BTreeSet<_> = cases
                 .iter()
@@ -6706,6 +6706,7 @@ concurrent = [1, 2]
                     "Qwen3.8-27B-FP8",
                     "LFM2.5-1.2B-Instruct-GGUF",
                     "LFM3-1.7B-GGUF",
+                    "Inkling-2-Mini",
                 ]),
                 "{name} family coverage"
             );
