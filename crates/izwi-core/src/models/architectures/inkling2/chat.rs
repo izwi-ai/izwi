@@ -15,7 +15,9 @@ use tracing::info;
 
 use super::checkpoint::Inkling2Checkpoint;
 use super::config::Inkling2Config;
-use super::prompt::{forced_call, render_prompt, IMAGE_SLOT};
+use super::prompt::{
+    forced_call, json_reply, render_prompt, CONTENT_TEXT, IMAGE_SLOT, JSON_REPLY_GRAMMAR,
+};
 use super::reply::{Inkling2Reply, Inkling2ReplyTokens};
 use super::state::{
     kv_dtype, managed_contract, paged_geometry, Inkling2ConvRuntimeState, Inkling2PagedContext,
@@ -449,6 +451,8 @@ pub struct Inkling2ChatModel {
     device: DeviceProfile,
     config: Inkling2Config,
     tokenizer: Tokenizer,
+    /// The tokenizer as the sampler's grammar takes it, shared by requests.
+    grammar_tokenizer: Arc<Tokenizer>,
     reply_tokens: Inkling2ReplyTokens,
     trunk: Inkling2Trunk,
     max_context_tokens: usize,
@@ -602,6 +606,7 @@ impl Inkling2ChatModel {
             variant,
             device,
             config,
+            grammar_tokenizer: Arc::new(tokenizer.clone()),
             tokenizer,
             reply_tokens,
             trunk,
@@ -713,7 +718,7 @@ impl Inkling2ChatModel {
                 "an Inkling 2 prompt with images is prepared with its images".to_string(),
             ));
         }
-        render_prompt(messages, &config.request, &[])?.encode(&self.tokenizer)
+        render_prompt(messages, &config.request, &[], json_reply(config))?.encode(&self.tokenizer)
     }
 
     /// Whether this checkpoint takes images.
@@ -776,8 +781,8 @@ impl Inkling2ChatModel {
                     .to_device(&candle_core::Device::Cpu)?,
             );
         }
-        let prompt_ids =
-            render_prompt(messages, &config.request, &slots)?.encode(&self.tokenizer)?;
+        let prompt_ids = render_prompt(messages, &config.request, &slots, json_reply(config))?
+            .encode(&self.tokenizer)?;
         let image_features = Tensor::cat(&features, 0)?;
         let slot_id = self.config.image_token_id;
         if super::prompt::special_id(&self.tokenizer, IMAGE_SLOT)? != slot_id {
@@ -945,6 +950,29 @@ impl Inkling2ChatModel {
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
         let forced = forced_call(&config.request)?;
+        let json_text = json_reply(config);
+        // The sampler holds tool calls to the request's grammar, and a JSON
+        // reply to one object: the same runtime, started inside the text
+        // message the prompt opened. The shared JSON machine is not used: it
+        // would hold the whole reply, message headers included.
+        let mut sampling = config.clone();
+        sampling.constrain_json_object = false;
+        if json_text {
+            sampling.request.tool_constraint = Some(Box::new(crate::chat_tools::ToolConstraint {
+                opener: CONTENT_TEXT.to_string(),
+                call: JSON_REPLY_GRAMMAR.to_string(),
+                forced: Some(JSON_REPLY_GRAMMAR.to_string()),
+                max_calls: Some(1),
+                strict: true,
+            }));
+        }
+        // The end of the turn first (the grammar's end of sequence), then the
+        // end of a message, which closes what a finished constraint leaves
+        // open.
+        let turn_ends = vec![
+            self.reply_tokens.end_sampling,
+            self.reply_tokens.end_message,
+        ];
         Ok(ChatDecodeState {
             conv: Inkling2ConvRuntimeState::new(self.trunk.new_conv_state()?),
             physical_kv: cache,
@@ -952,8 +980,9 @@ impl Inkling2ChatModel {
             unconsumed_logits: None,
             pending_token: None,
             generated_ids: Vec::new(),
-            sampler: ChatSampler::new(config.clone(), prompt_ids),
-            reply: Inkling2Reply::new(self.reply_tokens.clone(), forced.as_ref()),
+            sampler: ChatSampler::new(sampling, prompt_ids)
+                .with_json_object_constraint(self.grammar_tokenizer.clone(), turn_ends),
+            reply: Inkling2Reply::new(self.reply_tokens.clone(), forced.as_ref(), json_text),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             position: 0,

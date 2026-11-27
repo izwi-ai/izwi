@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use izwi_model_catalog::chat::tools::ToolConstraint;
+use izwi_model_catalog::chat::tools::{ToolCallSyntax, ToolConstraint};
 use izwi_model_catalog::{chat_supports_tool_constraint, chat_supports_tools, ModelVariant};
 use serde_json::Value;
 
@@ -138,7 +138,7 @@ fn tool_constraint(
         }
         return Ok(None);
     }
-    let Some(constraint) = plan.constraint(strict) else {
+    let Some(constraint) = plan.constraint_in(strict, ToolCallSyntax::of(variant)) else {
         return Ok(None);
     };
     match check_grammars(&constraint) {
@@ -329,6 +329,29 @@ mod tests {
         assert!(forced.is_forced() && forced.constraint.is_none());
         let error = policy(qwen38, &strict, None).expect_err("refused");
         assert_eq!(error.detail.unwrap().code, Some("unsupported_parameter"));
+
+        // Inkling 2 writes calls as messages of its own; the constraint
+        // starts at the token that opens a call's body. A named function is
+        // forced from its arguments; with `required` the prompt cannot open
+        // the call, so only the body of the call the model opens is held.
+        let inkling = ModelVariant::Inkling2Mini;
+        let constraint = policy(inkling, &strict, None).unwrap().constraint.unwrap();
+        assert_eq!(constraint.opener, "<|content_invoke_tool_json|>");
+        assert!(constraint.strict && constraint.forced.is_none());
+        let named = json!({"type": "function", "function": {"name": "now"}});
+        let constraint = policy(inkling, &plain, Some(named))
+            .unwrap()
+            .constraint
+            .unwrap();
+        assert!(constraint.forced.is_some());
+        let two = [
+            json!({"type": "function", "function": {"name": "now"}}),
+            json!({"type": "function", "function": {"name": "today"}}),
+        ];
+        let required = policy(inkling, &two, Some(json!("required"))).unwrap();
+        assert!(required.is_forced());
+        let constraint = required.constraint.unwrap();
+        assert!(constraint.forced.is_none() && constraint.call.contains("today"));
 
         // A schema the grammar cannot express is refused for a strict tool.
         let broken = [

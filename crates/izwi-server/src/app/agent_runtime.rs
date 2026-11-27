@@ -135,7 +135,12 @@ impl ModelBackend for ChatAgentBackend<'_> {
                     tool_constraint: plan
                         .as_ref()
                         .filter(|_| izwi_core::chat_supports_tool_constraint(variant))
-                        .and_then(|plan| plan.constraint(false))
+                        .and_then(|plan| {
+                            plan.constraint_in(
+                                false,
+                                izwi_core::chat_tools::ToolCallSyntax::of(variant),
+                            )
+                        })
                         .map(Box::new),
                     truncation: ChatTruncation::Auto,
                     ..ChatRequestConfig::default()

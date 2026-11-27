@@ -60,6 +60,22 @@ fn caches_on(
     dtype: DType,
     rows: usize,
 ) -> Vec<PhysicalPagedKvCache> {
+    caches_sized(model, device, dtype, rows, 96)
+}
+
+/// One cache of `tokens` capacity, for prompts the byte-level test tokenizer
+/// makes long.
+fn roomy_cache(model: &Inkling2ChatModel) -> PhysicalPagedKvCache {
+    caches_sized(model, &Device::Cpu, DType::F32, 1, 1024).remove(0)
+}
+
+fn caches_sized(
+    model: &Inkling2ChatModel,
+    device: &Device,
+    dtype: DType,
+    rows: usize,
+    tokens: usize,
+) -> Vec<PhysicalPagedKvCache> {
     let config = model.config();
     let layers = (0..config.application_count() as u32).collect::<Vec<_>>();
     test_physical_caches_for_model_layers_on(
@@ -68,7 +84,7 @@ fn caches_on(
         &layers,
         config.full.kv_heads,
         config.full.head_dim,
-        96,
+        tokens,
         rows,
     )
 }
@@ -410,6 +426,127 @@ fn a_large_image_is_fitted_to_the_token_limit() {
             "{height}x{width} -> {h}x{w}"
         );
     }
+}
+
+/// Decodes until the reply ends and returns its text.
+fn reply_text(model: &Inkling2ChatModel, state: &mut ChatDecodeState, limit: usize) -> String {
+    for _ in 0..limit {
+        let step = model.decode_step(state).unwrap();
+        if step.finished {
+            return step.text;
+        }
+    }
+    panic!("the reply did not end in {limit} steps");
+}
+
+fn weather_tools() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type": "function", "function": {"name": "set_mode", "parameters": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["eco", "boost"]},
+                "level": {"type": "integer", "minimum": 0, "maximum": 9}
+            },
+            "required": ["mode", "level"],
+            "additionalProperties": false
+        }}}),
+    ]
+}
+
+/// A forced call on random weights: the sampler can only write arguments the
+/// tool's schema allows, then close the message and end the turn, and the
+/// reply reads as one call to that tool.
+#[test]
+fn a_forced_call_is_held_to_the_tools_schema() {
+    use crate::chat_tools::{parse_answer, ToolCallSyntax, ToolChoice, ToolDialect, ToolPlan};
+    let model = tiny_model();
+    let plan = ToolPlan::new(
+        ToolDialect::HermesJson,
+        weather_tools(),
+        ToolChoice::Named("set_mode".into()),
+        false,
+    )
+    .unwrap();
+    let messages = [ChatMessage {
+        role: ChatRole::User,
+        content: "Go fast.".into(),
+    }];
+    for seed in 1..=6u64 {
+        let mut config = ChatGenerationConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            seed,
+            ..ChatGenerationConfig::default()
+        };
+        config.request.tools = weather_tools();
+        config.request.response_prefix = plan.response_prefix().unwrap();
+        config.request.tool_constraint = plan
+            .constraint_in(false, ToolCallSyntax::InklingMessage)
+            .map(Box::new);
+        assert!(config.request.tool_constraint.is_some());
+        let prompt = model.prompt_token_ids(&messages, &config).unwrap();
+        let mut state = model
+            .start_decode_managed(&prompt, 200, &config, roomy_cache(&model))
+            .unwrap();
+        let text = reply_text(&model, &mut state, 200);
+        let (content, calls) = parse_answer(plan.parser(), &text);
+        assert_eq!(content, None, "seed {seed}: {text:?}");
+        assert_eq!(calls.len(), 1, "seed {seed}: {text:?}");
+        assert_eq!(calls[0].function.name, "set_mode");
+        let arguments: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert!(
+            matches!(arguments["mode"].as_str(), Some("eco" | "boost")),
+            "seed {seed}: {text:?}"
+        );
+        assert!(
+            arguments["level"]
+                .as_i64()
+                .is_some_and(|level| (0..=9).contains(&level)),
+            "seed {seed}: {text:?}"
+        );
+        assert_eq!(arguments.as_object().unwrap().len(), 2, "seed {seed}");
+    }
+}
+
+/// `response_format: json_object` on random weights: the reply is one JSON
+/// object and nothing else, with no thinking before it.
+#[test]
+fn a_json_reply_is_one_object() {
+    let model = tiny_model();
+    let messages = [ChatMessage {
+        role: ChatRole::User,
+        content: "Two colours, as JSON.".into(),
+    }];
+    let mut complete = 0;
+    for seed in 1..=6u64 {
+        let config = ChatGenerationConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            seed,
+            constrain_json_object: true,
+            ..ChatGenerationConfig::default()
+        };
+        let prompt = model.prompt_token_ids(&messages, &config).unwrap();
+        let mut state = model
+            .start_decode_managed(&prompt, 400, &config, roomy_cache(&model))
+            .unwrap();
+        let text = reply_text(&model, &mut state, 400);
+        assert!(text.starts_with('{'), "seed {seed}: {text:?}");
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(value) => {
+                assert!(value.is_object(), "seed {seed}: {text:?}");
+                complete += 1;
+            }
+            // Random weights can write an object longer than the budget;
+            // what there is of it is still JSON, cut short.
+            Err(error) => {
+                assert!(error.is_eof(), "seed {seed}: {text:?}: {error}");
+                assert_eq!(state.generated_ids_for_test().len(), 400);
+            }
+        }
+    }
+    assert!(complete >= 2, "{complete} of 6 replies closed their object");
 }
 
 /// Rows of a batch do not affect each other.

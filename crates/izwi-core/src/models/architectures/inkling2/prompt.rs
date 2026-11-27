@@ -20,7 +20,8 @@ use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
 use crate::models::shared::chat::{
-    ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole, CHAT_IMAGE_PLACEHOLDER,
+    ChatGenerationConfig, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole,
+    CHAT_IMAGE_PLACEHOLDER,
 };
 use crate::tokenizer::Tokenizer;
 
@@ -155,10 +156,20 @@ pub fn special_id(tokenizer: &Tokenizer, token: &str) -> Result<u32> {
     })
 }
 
+/// Whether the reply must be one JSON object written as text
+/// (`response_format: json_object`). A forced tool call comes first: the
+/// prompt can open only one message.
+pub fn json_reply(config: &ChatGenerationConfig) -> bool {
+    config.constrain_json_object && config.request.response_prefix.is_empty()
+}
+
+/// Grammar of a JSON reply after the text message the prompt opens.
+pub const JSON_REPLY_GRAMMAR: &str = "start: json_0\njson_0: %json {\"type\":\"object\"}\n";
+
 /// The effort number a request asks for. Thinking switched off is effort 0.
-pub fn thinking_effort(request: &ChatRequestConfig) -> f64 {
-    // A turn that must be a tool call does not think first.
-    if request.enable_thinking == Some(false) || !request.response_prefix.is_empty() {
+pub fn thinking_effort(request: &ChatRequestConfig, json_reply: bool) -> f64 {
+    // A turn that must be a tool call or a JSON object does not think first.
+    if request.enable_thinking == Some(false) || !request.response_prefix.is_empty() || json_reply {
         return 0.0;
     }
     match request.reasoning_effort {
@@ -385,11 +396,13 @@ pub fn forced_call(request: &ChatRequestConfig) -> Result<Option<ForcedCall>> {
 /// Renders a conversation. `image_slots` holds the image-token count of
 /// every image the user and tool messages carry, in order; each takes the
 /// place of one image placeholder in their text. With none, placeholders are
-/// plain text.
+/// plain text. With `json_reply` the prompt opens the model's text message,
+/// which the sampler then holds to one JSON object.
 pub fn render_prompt(
     messages: &[ChatMessage],
     request: &ChatRequestConfig,
     image_slots: &[usize],
+    json_reply: bool,
 ) -> Result<Inkling2Prompt> {
     if messages.is_empty() {
         return Err(Error::InvalidInput(
@@ -407,7 +420,7 @@ pub fn render_prompt(
     }
     let effort = format!(
         "Thinking effort level: {}",
-        effort_text(thinking_effort(request))
+        effort_text(thinking_effort(request, json_reply))
     );
     let mut effort_written = false;
     // Names of the calls the latest assistant turn made, for the tool
@@ -473,6 +486,9 @@ pub fn render_prompt(
         prompt.text(name);
         prompt.special(CONTENT_TOOL_JSON);
         prompt.text(json);
+    } else if json_reply {
+        prompt.special(MESSAGE_MODEL);
+        prompt.special(CONTENT_TEXT);
     }
     Ok(prompt)
 }
@@ -575,7 +591,7 @@ mod tests {
             let Some((messages, slots)) = as_server_messages(case) else {
                 continue;
             };
-            let rendered = render_prompt(&messages, &request, &slots)
+            let rendered = render_prompt(&messages, &request, &slots, false)
                 .unwrap()
                 .rendered();
             let want = case["rendered"].as_str().unwrap();
@@ -634,6 +650,28 @@ mod tests {
     }
 
     #[test]
+    fn a_json_reply_opens_the_text_message_without_thinking() {
+        let messages = [ChatMessage {
+            role: ChatRole::User,
+            content: "List two colours as JSON.".into(),
+        }];
+        let request = ChatRequestConfig::default();
+        let rendered = render_prompt(&messages, &request, &[], true)
+            .unwrap()
+            .rendered();
+        assert!(rendered.ends_with(&format!("{END_MESSAGE}{MESSAGE_MODEL}{CONTENT_TEXT}")));
+        assert!(rendered.contains("Thinking effort level: 0<|end_message|>"));
+        // A forced call is the one message the prompt opens.
+        let mut config = ChatGenerationConfig {
+            constrain_json_object: true,
+            ..ChatGenerationConfig::default()
+        };
+        assert!(json_reply(&config));
+        config.request.response_prefix = "<tool_call>\n{\"name\": \"".into();
+        assert!(!json_reply(&config));
+    }
+
+    #[test]
     fn images_take_their_placeholders_in_order() {
         let user = |content: &str| ChatMessage {
             role: ChatRole::User,
@@ -641,7 +679,7 @@ mod tests {
         };
         let request = ChatRequestConfig::default();
         let two = format!("Compare {CHAT_IMAGE_PLACEHOLDER} with {CHAT_IMAGE_PLACEHOLDER}");
-        let rendered = render_prompt(&[user(&two)], &request, &[2, 3])
+        let rendered = render_prompt(&[user(&two)], &request, &[2, 3], false)
             .unwrap()
             .rendered();
         let image = |count: usize| {
@@ -656,10 +694,10 @@ mod tests {
             image(3)
         )));
         // Images and placeholders must pair off.
-        assert!(render_prompt(&[user(&two)], &request, &[2]).is_err());
-        assert!(render_prompt(&[user(&two)], &request, &[2, 3, 1]).is_err());
+        assert!(render_prompt(&[user(&two)], &request, &[2], false).is_err());
+        assert!(render_prompt(&[user(&two)], &request, &[2, 3, 1], false).is_err());
         // Without images the placeholder is text like any other.
-        let plain = render_prompt(&[user(&two)], &request, &[])
+        let plain = render_prompt(&[user(&two)], &request, &[], false)
             .unwrap()
             .rendered();
         assert!(plain.contains(CHAT_IMAGE_PLACEHOLDER));
@@ -675,7 +713,9 @@ mod tests {
             role: ChatRole::User,
             content: "Weather?".into(),
         }];
-        let rendered = render_prompt(&messages, &request, &[]).unwrap().rendered();
+        let rendered = render_prompt(&messages, &request, &[], false)
+            .unwrap()
+            .rendered();
         assert!(rendered.ends_with(
             "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":"
         ));
@@ -687,7 +727,9 @@ mod tests {
             ..ChatRequestConfig::default()
         };
         assert_eq!(forced_call(&request).unwrap(), Some(ForcedCall::Any));
-        let rendered = render_prompt(&messages, &request, &[]).unwrap().rendered();
+        let rendered = render_prompt(&messages, &request, &[], false)
+            .unwrap()
+            .rendered();
         assert!(rendered.ends_with("<|content_text|>Weather?<|end_message|>"));
     }
 
@@ -703,7 +745,7 @@ mod tests {
             ChatMessage { role: ChatRole::Tool, content: "2".into() },
             ChatMessage { role: ChatRole::Tool, content: "3".into() },
         ];
-        let rendered = render_prompt(&messages, &ChatRequestConfig::default(), &[])
+        let rendered = render_prompt(&messages, &ChatRequestConfig::default(), &[], false)
             .unwrap()
             .rendered();
         assert!(rendered.ends_with(

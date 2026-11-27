@@ -106,13 +106,15 @@ enum Owed {
 }
 
 impl Inkling2Reply {
-    /// A reply that starts at the model's own header, or inside the call a
-    /// forced tool choice opened.
-    pub fn new(tokens: Inkling2ReplyTokens, forced: Option<&ForcedCall>) -> Self {
+    /// A reply that starts at the model's own header, inside the call a
+    /// forced tool choice opened, or (`json_text`) inside the text message
+    /// the prompt opened for a JSON reply.
+    pub fn new(tokens: Inkling2ReplyTokens, forced: Option<&ForcedCall>, json_text: bool) -> Self {
         Self {
             tokens,
             section: match forced {
                 Some(ForcedCall::Named { json, .. }) => Section::ToolCall(json.clone()),
+                None if json_text => Section::Text,
                 _ => Section::Idle,
             },
             decoder: IncrementalDecoder::new(false),
@@ -364,7 +366,7 @@ pub(crate) mod tests {
     fn run(pieces: &[&str]) -> (String, Vec<String>, bool) {
         let tokenizer = test_tokenizer();
         let tokens = Inkling2ReplyTokens::load(&tokenizer).unwrap();
-        let mut reply = Inkling2Reply::new(tokens, None);
+        let mut reply = Inkling2Reply::new(tokens, None, false);
         let mut deltas = Vec::new();
         for id in ids(&tokenizer, pieces) {
             deltas.push(reply.push(&tokenizer, id).unwrap());
@@ -431,7 +433,7 @@ pub(crate) mod tests {
             name: "f".into(),
             json: "{\"name\":\"f\",\"args\":".into(),
         };
-        let mut reply = Inkling2Reply::new(tokens.clone(), Some(&forced));
+        let mut reply = Inkling2Reply::new(tokens.clone(), Some(&forced), false);
         for id in ids(&tokenizer, &["{\"k\":1}}", END_MESSAGE, END_SAMPLING]) {
             reply.push(&tokenizer, id).unwrap();
         }
@@ -440,7 +442,7 @@ pub(crate) mod tests {
 
         // Any function: text before the call is not shown, the call continues
         // the server's `<tool_call>\n{"name": "`, and later calls are whole.
-        let mut reply = Inkling2Reply::new(tokens, Some(&ForcedCall::Any));
+        let mut reply = Inkling2Reply::new(tokens, Some(&ForcedCall::Any), false);
         for id in ids(
             &tokenizer,
             &[

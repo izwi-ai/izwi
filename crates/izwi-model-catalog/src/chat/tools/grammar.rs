@@ -44,12 +44,46 @@ pub struct ToolConstraint {
     pub strict: bool,
 }
 
+/// The form a model writes its tool calls in, which is what the sampler
+/// constrains. It is the dialect's text for every family but one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallSyntax {
+    /// The dialect's own markup (`<tool_call>` ... `</tool_call>`).
+    Dialect,
+    /// Inkling 2: a message of its own whose header names the function
+    /// (`<|message_model|>NAME<|content_invoke_tool_json|>`) and whose body
+    /// is `{"name":"NAME","args":{...}}`. The server reads and writes these
+    /// calls as Hermes text, but the sampler sees the model's tokens.
+    InklingMessage,
+}
+
+/// The token that opens the body of an Inkling 2 tool call.
+pub const INKLING_CALL_OPENER: &str = "<|content_invoke_tool_json|>";
+
+impl ToolCallSyntax {
+    pub fn of(variant: crate::ModelVariant) -> Self {
+        if variant.is_inkling2() {
+            Self::InklingMessage
+        } else {
+            Self::Dialect
+        }
+    }
+}
+
 impl ToolPlan {
     /// The constraint for this plan: `Some` when the answer must make a call
     /// (`tool_choice` required or a named function), or when a tool asked
     /// for `strict` arguments (`strict`). Otherwise the model is left free,
     /// as it is on other servers, and its output is parsed leniently.
     pub fn constraint(&self, strict: bool) -> Option<ToolConstraint> {
+        self.constraint_in(strict, ToolCallSyntax::Dialect)
+    }
+
+    /// [`Self::constraint`] for a model that writes calls in `syntax`.
+    pub fn constraint_in(&self, strict: bool, syntax: ToolCallSyntax) -> Option<ToolConstraint> {
+        if syntax == ToolCallSyntax::InklingMessage {
+            return self.inkling_constraint(strict);
+        }
         if !strict && !self.choice.is_forced() {
             return None;
         }
@@ -79,6 +113,69 @@ impl ToolPlan {
         Some(ToolConstraint {
             opener: self.dialect.call_opener().to_string(),
             call: grammar(self.dialect, &tools, After::Opener, self.parallel),
+            forced,
+            max_calls: self.max_calls().map(|max| max as u32),
+            strict,
+        })
+    }
+}
+
+impl ToolPlan {
+    /// The constraint over Inkling 2's own call messages. A call's body
+    /// starts at the opener token, so a call the model opens is held to the
+    /// declared names and schemas. A call to a named function is opened by
+    /// the prompt up to its arguments, and the sampler starts there. When
+    /// any function will do, the prompt cannot open the call (its header
+    /// names the function before the opener), so only the body is held.
+    fn inkling_constraint(&self, strict: bool) -> Option<ToolConstraint> {
+        if !strict && !self.choice.is_forced() {
+            return None;
+        }
+        let tools: Vec<Tool<'_>> = self.tools.iter().filter_map(Tool::new).collect();
+        if tools.is_empty() {
+            return None;
+        }
+        let body = |start: Option<usize>| {
+            let mut rules = Rules::default();
+            let arguments: Vec<String> = tools
+                .iter()
+                .map(|tool| {
+                    let schema = match tool.parameters {
+                        Some(parameters) => Value::Object(parameters.clone()),
+                        None => serde_json::json!({"type": "object"}),
+                    };
+                    rules.json(&schema)
+                })
+                .collect();
+            let start_rule = match start {
+                Some(index) => format!("{} \"}}\"", arguments[index]),
+                None => {
+                    let alternatives: Vec<String> = tools
+                        .iter()
+                        .zip(&arguments)
+                        .map(|(tool, arguments)| {
+                            format!(
+                                "{} {arguments}",
+                                literal(&format!("{}\",\"args\":", tool.name))
+                            )
+                        })
+                        .collect();
+                    rules.push("inkling_call", &alternatives.join(" | "));
+                    "\"{\\\"name\\\":\\\"\" inkling_call \"}\"".to_string()
+                }
+            };
+            format!("start: {start_rule}\n{}", rules.text)
+        };
+        let forced = match &self.choice {
+            ToolChoice::Named(name) => tools
+                .iter()
+                .position(|tool| tool.name == name)
+                .map(|index| body(Some(index))),
+            _ => None,
+        };
+        Some(ToolConstraint {
+            opener: INKLING_CALL_OPENER.to_string(),
+            call: body(None),
             forced,
             max_calls: self.max_calls().map(|max| max as u32),
             strict,
@@ -433,6 +530,46 @@ mod tests {
 
     fn plan(dialect: ToolDialect, choice: ToolChoice, parallel: bool) -> ToolPlan {
         ToolPlan::new(dialect, tools(), choice, parallel).unwrap()
+    }
+
+    #[test]
+    fn inkling_calls_are_constrained_as_the_model_writes_them() {
+        let syntax = ToolCallSyntax::of(crate::ModelVariant::Inkling2Mini);
+        assert_eq!(syntax, ToolCallSyntax::InklingMessage);
+        assert_eq!(
+            ToolCallSyntax::of(crate::ModelVariant::Qwen314BGguf),
+            ToolCallSyntax::Dialect
+        );
+        let auto = plan(ToolDialect::HermesJson, ToolChoice::Auto, true);
+        assert_eq!(auto.constraint_in(false, syntax), None);
+        let strict = auto.constraint_in(true, syntax).unwrap();
+        assert_eq!(strict.opener, "<|content_invoke_tool_json|>");
+        assert_eq!((strict.forced.as_ref(), strict.max_calls), (None, None));
+        // The body is the model's compact JSON, name first.
+        assert!(strict
+            .call
+            .starts_with("start: \"{\\\"name\\\":\\\"\" inkling_call \"}\"\n"));
+        assert!(strict
+            .call
+            .contains("\"get_weather\\\",\\\"args\\\":\" json_0"));
+        assert!(strict.call.contains("\"now\\\",\\\"args\\\":\" json_1"));
+        assert!(!strict.call.contains("</tool_call>"));
+        // A named function: the prompt wrote up to the arguments.
+        let named = plan(
+            ToolDialect::HermesJson,
+            ToolChoice::Named("get_weather".into()),
+            true,
+        )
+        .constraint_in(false, syntax)
+        .unwrap();
+        assert!(named.forced.unwrap().starts_with("start: json_0 \"}\"\n"));
+        assert_eq!(named.max_calls, Some(1));
+        // Any function: the prompt opens nothing, so nothing is forced; the
+        // body of the call the model opens is still held.
+        let required = plan(ToolDialect::HermesJson, ToolChoice::Required, false)
+            .constraint_in(false, syntax)
+            .unwrap();
+        assert_eq!((required.forced, required.max_calls), (None, Some(1)));
     }
 
     #[test]

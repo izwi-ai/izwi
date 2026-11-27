@@ -135,7 +135,7 @@ Not implemented yet: a fused paged attention kernel with the position bias
 and sink (which a whole-step graph needs: until then 48 attention cores per
 token run eagerly), fused convolution kernels, device experts on Metal, dense
 tensors in the checkpoint's BF16, prefix sharing, releasing windowed pages,
-the MTP head, and grammar-constrained tool calls and JSON output.
+and the MTP head.
 
 ## Image input
 
@@ -183,6 +183,18 @@ is part of the load's admission figures.
   `<tool_call>` block, which the server already parses.
 - Sampling defaults to the request's own settings; the published
   `generation_config.json` samples at temperature 1.0.
+- Tool calls are constrained on the model's own tokens
+  (`ToolCallSyntax::InklingMessage` in the catalog): the grammar starts at
+  `<|content_invoke_tool_json|>` and describes `{"name":"NAME","args":{...}}`
+  with each tool's `parameters` schema. A named `tool_choice` starts the
+  sampler inside the arguments the prompt opened. With `required` the prompt
+  cannot open the call (the header names the function before the opener), so
+  the reply is held to a call and the body of the call the model opens to its
+  schema.
+- `response_format: json_object`: the prompt opens the model's text message
+  with thinking off and the sampler holds it to one JSON object, then lets
+  only the message and the turn end. The shared JSON state machine is not
+  used here; it would constrain the message headers as well.
 
 ## Verification
 

@@ -83,6 +83,7 @@ pub fn chat_supports_json_object(variant: ModelVariant) -> bool {
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm3Chat
             | ModelFamily::Qwen35MoeChat
+            | ModelFamily::Inkling2Chat
     )
 }
 
@@ -98,14 +99,10 @@ pub fn chat_supports_tools(variant: ModelVariant) -> bool {
 /// definitions (a `strict` tool, or the names and arguments of a forced
 /// call). Qwen3.8 samples through its own speculative path, which has no
 /// grammar hook yet: its forced calls are opened by the prompt alone, and
-/// `strict` tools are refused. Inkling 2 writes calls as its own JSON
-/// messages, which the text grammar does not describe: the same applies.
+/// `strict` tools are refused. Inkling 2 writes calls as messages of its
+/// own, which have their own grammar (`ToolCallSyntax::InklingMessage`).
 pub fn chat_supports_tool_constraint(variant: ModelVariant) -> bool {
-    chat_supports_tools(variant)
-        && !matches!(
-            variant.family(),
-            ModelFamily::Qwen38Chat | ModelFamily::Inkling2Chat
-        )
+    chat_supports_tools(variant) && variant.family() != ModelFamily::Qwen38Chat
 }
 
 /// Resolve a chat request's sampling. Each value comes from the request when
@@ -244,7 +241,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inkling2_samples_as_published_and_takes_tools_without_a_grammar() {
+    fn inkling2_samples_as_published_and_holds_tool_calls_and_json() {
         let variant = ModelVariant::Inkling2Mini;
         let resolved = resolve_chat_sampling(variant, None, ChatSamplingRequest::default());
         assert_eq!(
@@ -258,8 +255,8 @@ mod tests {
             (1.0, 1.0, 0, 1.0, 0.0)
         );
         assert!(chat_supports_tools(variant));
-        assert!(!chat_supports_tool_constraint(variant));
-        assert!(!chat_supports_json_object(variant));
+        assert!(chat_supports_tool_constraint(variant));
+        assert!(chat_supports_json_object(variant));
     }
 
     const QWEN_THINKING_VARIANTS: [ModelVariant; 2] =
