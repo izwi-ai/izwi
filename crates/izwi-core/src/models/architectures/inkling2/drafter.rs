@@ -383,6 +383,17 @@ struct DrafterFile {
     tensors: BTreeMap<String, Located>,
 }
 
+/// Bytes the drafter in `path` (its weight file) holds once loaded: every
+/// tensor in F32, read from the header alone.
+pub fn held_bytes(path: &Path) -> Result<u64> {
+    let file = DrafterFile::open(path)?;
+    Ok(file
+        .tensors
+        .values()
+        .map(|located| located.shape.iter().product::<usize>() as u64 * 4)
+        .sum())
+}
+
 impl DrafterFile {
     fn open(path: &Path) -> Result<Self> {
         let at = |err: &dyn std::fmt::Display| load_error(format!("{}: {err}", path.display()));
@@ -1200,6 +1211,59 @@ impl<'a> MarkovChain<'a> {
         };
         self.awaiting_token = true;
         Ok(logits.narrow(1, 0, c.vocab)?.squeeze(0)?)
+    }
+
+    /// [`Self::step`] through the main model's own unembedding: `project`
+    /// maps `[1, hidden]` to logits over at least the unpadded vocabulary
+    /// (a served model's unembedding, held without its padded rows and in
+    /// any dtype). The base logits and the head's correction are one
+    /// projection of `hidden_row + hidden_out(latent)`, which is the sum of
+    /// the two up to rounding.
+    pub fn step_projected(
+        &mut self,
+        row: usize,
+        hidden_row: &Tensor,
+        project: &dyn Fn(&Tensor) -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let d = self.drafter;
+        let c = &d.config;
+        if self.awaiting_token || row != self.next_row || row >= c.drafted() {
+            return Err(drafter_error(format!(
+                "row {row} is out of turn (next is {})",
+                self.next_row
+            )));
+        }
+        if hidden_row.dims() != [c.hidden] {
+            return Err(drafter_error("a row of the wrong shape"));
+        }
+        let rank = c.markov_rank;
+        let previous = d
+            .previous_embedding
+            .index_select(&Tensor::new(&[self.previous], &d.device)?, 0)?;
+        let raw = (((&self.fixed + d.recurrent_state.forward(&self.state)?)?
+            + d.recurrent_previous.forward(&previous)?)?
+            + d.recurrent_hidden.forward(&hidden_row.unsqueeze(0)?)?)?;
+        let gate = sigmoid(&raw.narrow(1, 0, rank)?)?;
+        let candidate = raw.narrow(1, rank, rank)?.tanh()?;
+        let latent = raw.narrow(1, 2 * rank, rank)?.tanh()?;
+        let keep = (&gate * &self.state)?;
+        self.state = (keep + (gate.affine(-1.0, 1.0)? * candidate)?)?;
+
+        let corrected = (hidden_row.unsqueeze(0)? + d.hidden_out.forward(&latent)?)?;
+        let logits = project(&corrected)?;
+        if logits.rank() != 2 || logits.dim(0)? != 1 || logits.dim(1)? < c.vocab {
+            return Err(drafter_error(format!(
+                "the unembedding gave logits of shape {:?}",
+                logits.dims()
+            )));
+        }
+        let logits = logits.narrow(1, 0, c.vocab)?.to_dtype(DType::F32)?;
+        let logits = match c.softcap {
+            Some(cap) => ((logits / cap)?.tanh()? * cap)?,
+            None => logits,
+        };
+        self.awaiting_token = true;
+        Ok(logits.squeeze(0)?)
     }
 
     /// The token chosen from the last [`Self::step`]'s logits.

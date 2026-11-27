@@ -99,7 +99,15 @@ impl Inkling2Footprint {
     pub fn load(model_dir: &Path, backend: BackendKind) -> Result<Self> {
         let config = Inkling2Config::load(model_dir)?;
         let checkpoint = Inkling2Checkpoint::open(model_dir, &config)?;
-        Ok(Self::of(&config, &checkpoint, projection_dtype(backend)))
+        let mut footprint = Self::of(&config, &checkpoint, projection_dtype(backend));
+        // The drafter, when the load will serve it, is dense weights in F32
+        // beside the trunk's. Its keys and values are paged state, which the
+        // engine prices per token.
+        let drafter = model_dir.join(super::checkpoint::MTP_FILE);
+        if super::chat::drafter_asked() && drafter.is_file() {
+            footprint.dense_bytes += super::drafter::held_bytes(&drafter)?;
+        }
+        Ok(footprint)
     }
 
     /// Bytes on the host that stay for the model's lifetime: the routers,

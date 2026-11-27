@@ -1115,6 +1115,69 @@ impl PhysicalPagedKvCache {
         Ok(output)
     }
 
+    /// Writes a span's keys and values (`[tokens, kv_heads, head_dim]` in
+    /// the arena's storage dtype) for one layer into the prepared slots,
+    /// without attending: for a layer the model reads only through
+    /// [`Self::gather_committed`].
+    pub(crate) fn write_span(
+        &self,
+        layer_idx: usize,
+        prepared: &mut PreparedPhysicalPagedStep,
+        keys: &Tensor,
+        values: &Tensor,
+    ) -> Result<()> {
+        let token_count = keys.dim(0)?;
+        if values.dim(0)? != token_count
+            || prepared.arena != self.arena.id()
+            || prepared.logical_generation != self.logical_generation
+            || prepared.start_pos != self.context_len
+            || prepared.token_count != token_count
+            || prepared.slots.len() != token_count
+        {
+            return Err(Error::InvalidInput(
+                "physical paged span write received a stale or incompatible prepared step".into(),
+            ));
+        }
+        let binding = self.layer_binding(layer_idx)?;
+        let completion = self.arena.write_slots(
+            binding,
+            KvWriteArgs {
+                keys,
+                values,
+                slots: prepared.slots.as_ref(),
+            },
+        )?;
+        if completion.arena() != self.arena.id()
+            || completion.layer() != binding
+            || completion.slots() != token_count
+        {
+            return Err(Error::InferenceError(
+                "physical paged write returned a mismatched backend completion".into(),
+            ));
+        }
+        prepared.completions.collect(completion)
+    }
+
+    /// The stored keys and values of committed positions
+    /// `first..context_len()` for one layer, `[tokens, kv_heads, head_dim]`
+    /// each in the arena's storage dtype, oldest first. `first` must not
+    /// precede the pages the cache still holds.
+    pub(crate) fn gather_committed(
+        &self,
+        layer_idx: usize,
+        first: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        if first < self.window_start || first >= self.context_len {
+            return Err(Error::InvalidInput(format!(
+                "physical paged cache holds positions {}..{}, not from {first}",
+                self.window_start, self.context_len
+            )));
+        }
+        let binding = self.layer_binding(layer_idx)?;
+        let table = self.sequence_table_from(first, self.context_len)?;
+        self.arena.gather_context(binding, &table)
+    }
+
     /// [`Self::write_and_attend_biased`] for one token of each of several
     /// sequences whose caches share one arena: row `r` of the inputs is
     /// written to `rows[r]`'s prepared slot, then one kernel call attends

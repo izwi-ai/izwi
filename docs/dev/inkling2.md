@@ -141,8 +141,7 @@ The served path is the composed trunk on every backend:
 
 Not implemented yet: whole-step CUDA graphs (the attention core now runs in
 a fused kernel, but a step still uploads per-step positions and builds its
-key/value slot maps on the host), fused convolution kernels, and serving the
-drafter (`drafter.rs` computes it; the decode loop does not use it yet).
+key/value slot maps on the host), and fused convolution kernels.
 
 ## Attention core
 
@@ -184,6 +183,46 @@ on the CPU and Metal), and on the tiny model on Metal a step of eight rows
 takes 217 ms in one pass against 1,309 ms one after another. Where CUDA step
 graphs run (one row wide), and where attention is composed (the CPU by
 default), rows still run one after another.
+
+## Speculative decoding
+
+`mtp.safetensors` is a block drafter, not a next-token head: three dense
+layers that read four of the trunk's states per committed position (the
+inputs of layer applications 5, 23 and 41 and the final-norm output), take
+the pending token and seven mask rows as one block, and a small recurrent
+head that turns the block into seven proposals. No reference implementation
+is published; `drafter.rs` follows the serving engines that run it, which
+agree with one another, and is checked against a torch implementation of
+them on a tiny drafter (`tests/fixtures/inkling2_drafter_golden`).
+
+With `IZWI_INKLING2_DRAFTER=on` and the file in the model directory (it is
+not part of the default download: fetch `mtp.safetensors` from the pinned
+revision into the model directory), the model:
+
+- keeps the drafter's keys and values of every committed position as three
+  more paged layers of the main state domain, written from the taps of each
+  span, so the engine accounts, shares and releases them with the rest;
+- asks for decode quanta of eight tokens. A round drafts up to seven tokens,
+  runs the pending token and the proposals in one span, and then the
+  sequence's own sampler picks each next token from those logits in turn.
+  The round keeps going while its pick equals the proposal at that position;
+  the first pick that differs, or the token after the last proposal, becomes
+  the pending token. Every emitted token is the sampler's own pick, in the
+  same order and from the same random stream, so a reply is the one
+  one-token decoding gives (up to the summation order of a wider span), with
+  greedy and sampled decoding alike, grammars and log probabilities
+  included;
+- keeps the caches and convolution histories at the last kept position
+  (`Inkling2PassRecord::conv_after`, `Inkling2Caches::commit_prefix`).
+
+Tested on the CPU and Metal with the tiny model and drafter: rounds emit the
+tokens one-token steps emit (greedy and seeded sampling), and proposals a
+test chooses are kept exactly up to the first disagreement. A random drafter
+agrees with a random model almost never, so nothing here measures how many
+proposals the published drafter gets accepted or how much faster decoding
+is; that needs the real weights. The diagnostics report rounds, proposals
+and proposals kept. Load admission prices the drafter's weights (F32,
+1.3 GiB as published) when it is served.
 
 ## Dense weights in 16 bits
 

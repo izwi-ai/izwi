@@ -81,6 +81,19 @@ fn to_u32(value: usize, what: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::ModelLoadError(format!("Inkling 2 {what} exceeds u32")))
 }
 
+/// The drafter's layers as the caches hold them: each keeps one key and one
+/// value per committed position (made from the main model's states there),
+/// as a full-attention paged layer of the main domain after the layer
+/// applications, so the engine accounts, shares and releases them with the
+/// rest of the sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrafterLayers {
+    pub(crate) layers: usize,
+    pub(crate) heads: usize,
+    pub(crate) kv_heads: usize,
+    pub(crate) head_dim: usize,
+}
+
 /// The scheduler-owned state contract of a chat sequence.
 ///
 /// With `share_prefixes` the keys and values are one domain that publishes
@@ -101,6 +114,7 @@ pub(crate) fn managed_contract(
     config: &Inkling2Config,
     kv_dtype: StateDType,
     share_prefixes: bool,
+    drafter: Option<DrafterLayers>,
 ) -> Result<InferenceStateContract> {
     let applications = config.applications();
     let split = !share_prefixes && has_both_kinds(config);
@@ -129,6 +143,26 @@ pub(crate) fn managed_contract(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let drafter_layers = drafter
+        .map(|drafter| {
+            (0..drafter.layers)
+                .map(|layer| {
+                    Ok(PagedAttentionLayerSpec {
+                        model_layer: to_u32(applications.len() + layer, "drafter layer")?,
+                        query_heads: to_u32(drafter.heads, "drafter head count")?,
+                        kv_heads: to_u32(drafter.kv_heads, "drafter KV-head count")?,
+                        key_head_dim: to_u32(drafter.head_dim, "drafter head dimension")?,
+                        value_head_dim: to_u32(drafter.head_dim, "drafter head dimension")?,
+                        pattern: AttentionPattern::Full,
+                        mask: AttentionMask::Causal,
+                        key_encoding: KeyEncoding::Raw,
+                        attention_logit_softcap: None,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let preferred_tokens = to_u32(default_kv_page_size(), "page size")?;
     let mut attention_header = retained_header(INKLING2_ATTENTION_STATE_DOMAIN);
     let mut convolution_header = retained_header(INKLING2_CONV_STATE_DOMAIN);
@@ -153,13 +187,14 @@ pub(crate) fn managed_contract(
             accepted_dtypes: vec![kv_dtype],
         })
     };
-    let (full_layers, windowed_layers): (Vec<_>, Vec<_>) = if split {
+    let (mut full_layers, windowed_layers): (Vec<_>, Vec<_>) = if split {
         all_layers
             .into_iter()
             .partition(|layer| layer.pattern == AttentionPattern::Full)
     } else {
         (all_layers, Vec::new())
     };
+    full_layers.extend(drafter_layers);
     let attention = paged(attention_header, full_layers);
     let windowed = split.then(|| {
         paged(
@@ -220,16 +255,30 @@ pub(crate) fn managed_contract(
 
 /// `(model_layer, kv_heads, key_head_dim, value_head_dim)` of every paged
 /// layer, for the cache's geometry check.
-pub(crate) fn paged_geometry(config: &Inkling2Config) -> Vec<(u32, usize, usize, usize)> {
-    config
-        .applications()
+pub(crate) fn paged_geometry(
+    config: &Inkling2Config,
+    drafter: Option<DrafterLayers>,
+) -> Vec<(u32, usize, usize, usize)> {
+    let applications = config.applications();
+    let mut geometry = applications
         .iter()
         .enumerate()
         .map(|(index, application)| {
             let heads = config.heads(application.layer);
             (index as u32, heads.kv_heads, heads.head_dim, heads.head_dim)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(drafter) = drafter {
+        geometry.extend((0..drafter.layers).map(|layer| {
+            (
+                (applications.len() + layer) as u32,
+                drafter.kv_heads,
+                drafter.head_dim,
+                drafter.head_dim,
+            )
+        }));
+    }
+    geometry
 }
 
 /// The widest span the fused attention kernel serves; a wider prefill span
@@ -328,22 +377,74 @@ impl Inkling2Caches {
 
     /// Checks that the caches cover exactly the model's layer applications
     /// in this layout.
-    pub(crate) fn validate(&self, config: &Inkling2Config) -> Result<()> {
-        let geometry = paged_geometry(config);
+    pub(crate) fn validate(
+        &self,
+        config: &Inkling2Config,
+        drafter: Option<DrafterLayers>,
+    ) -> Result<()> {
+        let geometry = paged_geometry(config, drafter);
+        let applications = config.applications();
         match &self.windowed {
             None => self.main.validate_sparse_model_layers(&geometry),
             Some(windowed) => {
+                // The drafter's layers come after the applications and are
+                // full-attention ones.
                 let (sliding, full): (Vec<_>, Vec<_>) =
-                    geometry.into_iter().partition(|(application, ..)| {
-                        config
-                            .heads(config.applications()[*application as usize].layer)
-                            .window
-                            .is_some()
+                    geometry.into_iter().partition(|(layer, ..)| {
+                        applications
+                            .get(*layer as usize)
+                            .is_some_and(|application| {
+                                config.heads(application.layer).window.is_some()
+                            })
                     });
                 self.main.validate_sparse_model_layers(&full)?;
                 windowed.validate_sparse_model_layers(&sliding)
             }
         }
+    }
+
+    /// The main cache's layer that holds drafter layer `layer`: after every
+    /// layer application the main cache holds.
+    pub(crate) fn drafter_ordinal(&self, config: &Inkling2Config, layer: usize) -> usize {
+        self.routes(config)
+            .iter()
+            .filter(|route| !route.windowed)
+            .count()
+            + layer
+    }
+
+    /// Commits the first `accepted` tokens of a prepared append and drops
+    /// the rest (a verified draft that was only partly kept).
+    pub(crate) fn commit_prefix(
+        &mut self,
+        prepared: Inkling2Prepared,
+        accepted: usize,
+    ) -> Result<()> {
+        self.main.commit_prepared_prefix(prepared.main, accepted)?;
+        match (&mut self.windowed, prepared.windowed) {
+            (Some(cache), Some(prepared)) => cache.commit_prepared_prefix(prepared, accepted),
+            (None, None) => Ok(()),
+            _ => Err(state_error("a prepared append does not match its caches")),
+        }
+    }
+
+    /// Writes the drafter's keys and values of a span (`[tokens, kv_heads,
+    /// head_dim]`, F32) for drafter layer `layer`.
+    pub(crate) fn write_drafter_span(
+        &self,
+        config: &Inkling2Config,
+        prepared: &mut Inkling2Prepared,
+        layer: usize,
+        keys: &Tensor,
+        values: &Tensor,
+    ) -> Result<()> {
+        let storage = self.main.arena().config().dtype;
+        self.main.write_span(
+            self.drafter_ordinal(config, layer),
+            &mut prepared.main,
+            &keys.to_dtype(storage)?,
+            &values.to_dtype(storage)?,
+        )
     }
 
     fn routes(&self, config: &Inkling2Config) -> Vec<Route> {
@@ -754,7 +855,7 @@ mod tests {
     #[test]
     fn the_shared_contract_has_one_paged_domain_and_four_rings_per_application() {
         for config in [tiny(), published()] {
-            let contract = managed_contract(&config, StateDType::F32, true).unwrap();
+            let contract = managed_contract(&config, StateDType::F32, true, None).unwrap();
             let applications = config.application_count();
             assert_eq!(contract.domains.len(), 2);
             let attention = paged(&contract.domains[0]);
@@ -776,7 +877,7 @@ mod tests {
                 // 48 applications: 40 windowed, 8 full.
                 assert_eq!((applications, windowed_layers(attention)), (48, 40));
             }
-            assert_eq!(paged_geometry(&config).len(), applications);
+            assert_eq!(paged_geometry(&config, None).len(), applications);
         }
     }
 
@@ -785,7 +886,7 @@ mod tests {
     #[test]
     fn the_unshared_contract_gives_the_windowed_applications_their_own_domain() {
         for config in [tiny(), published()] {
-            let contract = managed_contract(&config, StateDType::F32, false).unwrap();
+            let contract = managed_contract(&config, StateDType::F32, false, None).unwrap();
             let applications = config.application_count();
             assert_eq!(contract.domains.len(), 3);
             let (full, windowed) = (paged(&contract.domains[0]), paged(&contract.domains[2]));
@@ -824,5 +925,32 @@ mod tests {
         }
         assert_eq!(seen.len(), 192);
         assert_eq!(conv_component(0, 0).unwrap(), StateComponentId::new(1));
+    }
+}
+
+/// The drafter's view of a sequence's committed keys and values, read from
+/// the main cache's drafter layers.
+pub(crate) struct Inkling2DrafterCacheContext<'a> {
+    pub(crate) caches: &'a Inkling2Caches,
+    pub(crate) config: &'a Inkling2Config,
+}
+
+impl super::drafter::DrafterContext for Inkling2DrafterCacheContext<'_> {
+    fn committed(&self) -> usize {
+        self.caches.context_len()
+    }
+
+    fn span(&self, layer: usize, first: usize) -> Result<Option<(Tensor, Tensor)>> {
+        if first >= self.caches.context_len() {
+            return Ok(None);
+        }
+        let (keys, values) = self
+            .caches
+            .main
+            .gather_committed(self.caches.drafter_ordinal(self.config, layer), first)?;
+        Ok(Some((
+            keys.to_dtype(DType::F32)?,
+            values.to_dtype(DType::F32)?,
+        )))
     }
 }

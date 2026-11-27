@@ -5468,9 +5468,10 @@ impl NativeChatModel {
                 model.sustained_decode_quantum(),
                 false,
             ),
-            // One token per step: a step is 48 layer applications with the
-            // experts on the host.
-            Self::Qwen3(_) | Self::Gemma3(_) | Self::Inkling2(_) => (1, false, false),
+            // With its drafter served, Inkling 2 takes the anchor and the
+            // drafted tokens per quantum when decoding alone; otherwise one.
+            Self::Inkling2(model) => (model.preferred_decode_tokens(), false, false),
+            Self::Qwen3(_) | Self::Gemma3(_) => (1, false, false),
         }
     }
 }
@@ -7875,6 +7876,37 @@ impl NativeChatModel {
                 tokens_generated: step.tokens_generated,
                 input_tokens_committed: step.input_tokens_committed,
                 finished: step.finished,
+                logprobs,
+            });
+        }
+        if let (Self::Inkling2(model), NativeChatDecodeState::Inkling2(state)) = (self, &mut *state) {
+            // A speculative round where the drafter is served; one step else.
+            let mut delta = String::new();
+            let mut text = String::new();
+            let mut tokens_generated = 0usize;
+            let mut input_tokens_committed = 0usize;
+            let mut finished = false;
+            let mut logprobs = Vec::new();
+            let mut budget = input_budget.max(1);
+            while budget > 0 {
+                let step = model.decode_quantum(state, budget)?;
+                logprobs.extend(std::mem::take(&mut state.pending_logprobs));
+                delta.push_str(&step.delta);
+                text = step.text;
+                tokens_generated = step.tokens_generated;
+                input_tokens_committed += step.input_tokens_committed;
+                finished = step.finished;
+                budget = budget.saturating_sub(step.input_tokens_committed.max(1));
+                if finished {
+                    break;
+                }
+            }
+            return Ok(NativeChatDecodeStep {
+                delta,
+                text,
+                tokens_generated,
+                input_tokens_committed,
+                finished,
                 logprobs,
             });
         }

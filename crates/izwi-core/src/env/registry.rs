@@ -1101,6 +1101,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Selects the dtype of Inkling 2's large dense matrices: auto or f32 (F32 everywhere), f16 (Metal: halves them, decode products faster, prefill spans over 16 rows slower), or bf16 (CUDA: the stored bytes, with projection activations rounded to BF16).",
     ),
     CoreEnvVar::new(
+        "IZWI_INKLING2_DRAFTER",
+        Choice,
+        "off",
+        Load,
+        "Serves Inkling 2's block drafter (mtp.safetensors in the model directory, fetched separately) for speculative decoding: on or off. A round drafts up to seven tokens and keeps those the sampler's own picks agree with, so replies are the same as without it.",
+    ),
+    CoreEnvVar::new(
         "IZWI_INKLING2_FUSED_ATTENTION",
         Choice,
         "auto",

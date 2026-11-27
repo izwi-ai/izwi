@@ -234,7 +234,10 @@ model holds about 14.6 GiB of experts read from the downloaded file and 7.2 GiB 
 other weights, so plan for 24 GB of memory. It reads text and images and answers
 in text. An image takes one token per 40 x 40 pixels; an image larger than about
 1,600 x 1,600 pixels is scaled down first, and a request can carry up to four
-images. A conversation can hold up to 32,768 tokens.
+images. A conversation can hold up to 32,768 tokens. The model's block drafter
+(`mtp.safetensors`, 636 MB, not downloaded by default) can be served for
+speculative decoding with `IZWI_INKLING2_DRAFTER=on` once the file is in the
+model directory; replies are the same with or without it.
 
 `Qwen3.8-27B-FP8` uses the separate `Qwen38Chat` architecture/model family.
 Qwen3.5 compatibility or backend evidence is not applied to it implicitly.

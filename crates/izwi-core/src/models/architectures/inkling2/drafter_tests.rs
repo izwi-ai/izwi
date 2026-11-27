@@ -540,3 +540,48 @@ fn a_weight_file_that_does_not_fit_the_config_is_refused() {
     assert!(Inkling2Drafter::load(&dir, &Device::Cpu).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The head through a projection of the corrected hidden state gives the
+/// logits of base plus correction, up to rounding, and the same greedy
+/// tokens.
+#[test]
+fn the_head_through_a_projection_matches_base_plus_correction() {
+    let device = Device::Cpu;
+    let golden = Golden::load();
+    let drafter = tiny_drafter(&device);
+    let unembed = golden.tensor("unembed", &device);
+    let context = committed_context(&drafter, &golden);
+    let block = drafter
+        .draft_block(
+            &golden.tensor("anchor_embedding", &device),
+            context.committed(),
+            &context,
+        )
+        .unwrap();
+    let anchor = golden.integers["anchor_token"][0];
+    let f_rnn = context.last_head().unwrap().clone();
+    let (want_tokens, want_logits) = drafter
+        .draft_greedy(&block, &f_rnn, anchor, &unembed)
+        .unwrap();
+    let rows = drafter.mask_rows(&block).unwrap();
+    // A served model's unembedding has no padded rows.
+    let unpadded = unembed.narrow(0, 0, drafter.config().vocab).unwrap();
+    let project =
+        |hidden: &Tensor| -> crate::error::Result<Tensor> { Ok(hidden.matmul(&unpadded.t()?)?) };
+    let mut chain = drafter.markov_chain(&f_rnn, anchor).unwrap();
+    for row in 0..drafter.config().drafted() {
+        let logits = chain
+            .step_projected(row, &rows.get(row).unwrap(), &project)
+            .unwrap();
+        let got = logits.to_vec1::<f32>().unwrap();
+        let want = want_logits.get(row).unwrap().to_vec1::<f32>().unwrap();
+        let error = got
+            .iter()
+            .zip(&want)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(error <= 1e-4, "row {row}: {error}");
+        let token = logits.argmax(0).unwrap().to_scalar::<u32>().unwrap();
+        assert_eq!(token, want_tokens[row]);
+        chain.advance(token).unwrap();
+    }
+}

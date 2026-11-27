@@ -77,7 +77,9 @@ fn caches_sized(
     tokens: usize,
 ) -> Vec<PhysicalPagedKvCache> {
     let config = model.config();
-    let layers = (0..config.application_count() as u32).collect::<Vec<_>>();
+    let layers = (0..(config.application_count() + model.drafter_layers().map_or(0, |d| d.layers))
+        as u32)
+        .collect::<Vec<_>>();
     test_physical_caches_for_model_layers_on(
         device,
         dtype,
@@ -1179,4 +1181,145 @@ fn the_expert_backend_request_parses() {
     assert!(!ExpertBackendRequest::Auto.wants_device(BackendKind::Cpu));
     assert!(!ExpertBackendRequest::Host.wants_device(BackendKind::Cuda));
     assert!(ExpertBackendRequest::Device.wants_device(BackendKind::Cpu));
+}
+
+/// The tiny model with the tiny drafter written for it
+/// (`tests/fixtures/inkling2_drafter_golden`: taps at applications 3, 7
+/// and 13 and the final state).
+fn with_tiny_drafter(model: Inkling2ChatModel, device: &Device) -> Inkling2ChatModel {
+    let drafter =
+        super::drafter::Inkling2Drafter::load(&fixture("inkling2_drafter_golden"), device).unwrap();
+    model.with_drafter_for_test(drafter)
+}
+
+fn sampled(seed: u64) -> ChatGenerationConfig {
+    ChatGenerationConfig {
+        temperature: 1.0,
+        top_p: 1.0,
+        seed,
+        ..ChatGenerationConfig::default()
+    }
+}
+
+/// Speculative rounds emit exactly the tokens one-token steps emit, with
+/// greedy picks and with seeded sampling: every emitted token is the
+/// sampler's own pick, in the same order, from logits that differ only by
+/// the summation order of a wider span.
+#[test]
+fn speculative_rounds_emit_what_single_steps_emit() {
+    let golden = golden();
+    let model = with_tiny_drafter(tiny_model().without_turn_end_for_test(), &Device::Cpu);
+    assert_eq!(model.preferred_decode_tokens(), 8);
+    let prompt = &golden.tokens[..20];
+    let steps = 24;
+    for config in [ChatGenerationConfig::default(), sampled(7)] {
+        let mut one = model
+            .start_decode_managed(prompt, steps, &config, caches(&model, 1).remove(0))
+            .unwrap();
+        let want = generate(&model, &mut one, steps);
+        assert_eq!(want.len(), steps);
+
+        let mut state = model
+            .start_decode_managed(prompt, steps, &config, caches(&model, 1).remove(0))
+            .unwrap();
+        // The first step samples from the prefill logits; then quanta.
+        model.decode_step(&mut state).unwrap();
+        while !state.finished_for_test() {
+            model.decode_quantum(&mut state, 8).unwrap();
+        }
+        assert_eq!(state.generated_ids_for_test(), want);
+    }
+}
+
+/// Proposals are kept up to the first one the sampler disagrees with; the
+/// state then continues as if it had decoded those tokens one at a time:
+/// its caches, convolution histories and drafter state stop at the last
+/// kept position.
+#[test]
+fn verified_proposals_are_kept_up_to_the_first_disagreement() {
+    let golden = golden();
+    let model = with_tiny_drafter(tiny_model().without_turn_end_for_test(), &Device::Cpu);
+    let prompt = &golden.tokens[..20];
+    let config = ChatGenerationConfig::default();
+    let steps = 20;
+    let mut one = model
+        .start_decode_managed(prompt, steps, &config, caches(&model, 1).remove(0))
+        .unwrap();
+    let want = generate(&model, &mut one, steps);
+    let vocab = model.config().unpadded_vocab as u32;
+
+    // Three proposals agree and the fourth does not; then all seven agree.
+    let wrong = (want[4] + 1) % vocab;
+    let mut state = model
+        .start_decode_managed(prompt, steps, &config, caches(&model, 1).remove(0))
+        .unwrap();
+    model.decode_step(&mut state).unwrap();
+    let step = model
+        .verify_proposals_for_test(
+            &mut state,
+            vec![want[1], want[2], want[3], wrong, want[5], want[6]],
+        )
+        .unwrap();
+    // The anchor and three proposals were run and kept; the fourth pick
+    // (want[4]) is pending.
+    assert_eq!(step.input_tokens_committed, 4);
+    assert_eq!(state.generated_ids_for_test(), &want[..5]);
+    let step = model
+        .verify_proposals_for_test(&mut state, want[5..12].to_vec())
+        .unwrap();
+    assert_eq!(step.input_tokens_committed, 8);
+    assert_eq!(state.generated_ids_for_test(), &want[..13]);
+    // One-token steps from here give the rest.
+    let rest = generate(&model, &mut state, steps);
+    assert_eq!(rest, want);
+}
+
+/// Batched rows write each row's drafter keys and values too: with the
+/// drafter served, rows still decode as alone, and a speculative round can
+/// follow a batched step.
+#[test]
+fn batched_rows_with_the_drafter_decode_as_alone() {
+    let model = with_tiny_drafter(
+        tiny_model()
+            .without_turn_end_for_test()
+            .with_fused_attention_for_test(),
+        &Device::Cpu,
+    );
+    let pool = caches(&model, 6);
+    batched_rows_decode_as_alone(model, pool);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn speculative_rounds_emit_what_single_steps_emit_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "speculative_rounds_emit_what_single_steps_emit_on_metal",
+    ) else {
+        return;
+    };
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    let golden = golden();
+    let model = with_tiny_drafter(tiny_model_on(profile).without_turn_end_for_test(), &device);
+    let prompt = &golden.tokens[..20];
+    let steps = 16;
+    let config = ChatGenerationConfig::default();
+    let fresh = || {
+        model
+            .start_decode_managed(
+                prompt,
+                steps,
+                &config,
+                caches_on(&model, &device, DType::F32, 1).remove(0),
+            )
+            .unwrap()
+    };
+    let mut one = fresh();
+    let want = generate(&model, &mut one, steps);
+    let mut state = fresh();
+    model.decode_step(&mut state).unwrap();
+    while !state.finished_for_test() {
+        model.decode_quantum(&mut state, 8).unwrap();
+    }
+    assert_eq!(state.generated_ids_for_test(), want);
 }

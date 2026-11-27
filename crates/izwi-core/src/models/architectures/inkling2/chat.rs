@@ -15,14 +15,16 @@ use tracing::info;
 
 use super::checkpoint::Inkling2Checkpoint;
 use super::config::Inkling2Config;
+use super::drafter::Inkling2Drafter;
 use super::prompt::{
     forced_call, json_reply, render_prompt, CONTENT_TEXT, IMAGE_SLOT, JSON_REPLY_GRAMMAR,
 };
 use super::reply::{Inkling2Reply, Inkling2ReplyTokens};
 use super::state::{
-    kv_dtype, managed_contract, Inkling2Caches, Inkling2ConvRuntimeState, Inkling2RowsPagedContext,
+    kv_dtype, managed_contract, DrafterLayers, Inkling2Caches, Inkling2ConvRuntimeState,
+    Inkling2DrafterCacheContext, Inkling2Prepared, Inkling2RowsPagedContext,
 };
-use super::trunk::Inkling2Trunk;
+use super::trunk::{Inkling2ConvState, Inkling2PassRecord, Inkling2Trunk};
 use super::vision::{image_tokens, preprocess_image, Inkling2Vision};
 use crate::backends::kv::KvWriteBatchCompletion;
 use crate::backends::state::{
@@ -57,6 +59,16 @@ pub const EXPERT_BACKEND_ENV: &str = "IZWI_INKLING2_MOE_BACKEND";
 /// the CPU), `on` (the fused kernel wherever it passes) or `off` (always
 /// composed).
 pub const FUSED_ATTENTION_ENV: &str = "IZWI_INKLING2_FUSED_ATTENTION";
+/// Serves the block drafter (`mtp.safetensors`) for speculative decoding:
+/// `on` loads it when the file is present; `off` (the default) does not.
+pub const DRAFTER_ENV: &str = "IZWI_INKLING2_DRAFTER";
+/// Whether [`DRAFTER_ENV`] asks for the drafter.
+pub fn drafter_asked() -> bool {
+    crate::env::value(DRAFTER_ENV)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "on" | "1" | "true"))
+}
+
 /// Kill switch for the decode step's CUDA graphs.
 pub const DECODE_GRAPHS_ENV: &str = "IZWI_INKLING2_DECODE_GRAPHS";
 /// Device memory the decode graphs hold once captured: stable copies of one
@@ -220,6 +232,27 @@ impl Inkling2PreparedPrompt {
     }
 }
 
+/// What sampling one token did to the reply.
+enum Taken {
+    /// A configured stop: not emitted.
+    Stop,
+    /// The reply ended on it; the text it completed.
+    Ended(String),
+    /// A token kept, now pending; the text it added.
+    Next(u32, String),
+}
+
+/// A span run through the trunk, its writes prepared and not committed.
+struct SpanRun {
+    hidden: Tensor,
+    prepared: Inkling2Prepared,
+    /// The convolution state after the whole span.
+    conv: Inkling2ConvState,
+    record: Inkling2PassRecord,
+    /// The drafter head's fused state of each position, when served.
+    drafter_heads: Option<Tensor>,
+}
+
 /// The image features a span needs: `used` of them belong to tokens before
 /// the span, and only the span's first `prompt` tokens are prompt tokens (a
 /// generated token is never an image slot, whatever its id).
@@ -251,9 +284,13 @@ pub struct ChatDecodeState {
     pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
     /// Features of the prompt's image tokens, on the host.
     image_features: Option<Tensor>,
+    /// The drafter head's fused state of the last committed position, when
+    /// the drafter is served.
+    drafter_head: Option<Tensor>,
 }
 
 pub(crate) struct ChatDecodeCheckpoint {
+    drafter_head: Option<Tensor>,
     conv: Inkling2ConvRuntimeState,
     physical_kv: Inkling2Caches,
     unconsumed_logits: Option<Tensor>,
@@ -350,6 +387,7 @@ impl ChatDecodeState {
         let cache = Inkling2Caches::new(cache, windowed)?;
         self.continues(&cache)?;
         Ok(ChatDecodeCheckpoint {
+            drafter_head: self.drafter_head.clone(),
             conv: self.conv.clone(),
             physical_kv: std::mem::replace(&mut self.physical_kv, cache),
             unconsumed_logits: self.unconsumed_logits.clone(),
@@ -375,6 +413,7 @@ impl ChatDecodeState {
     }
 
     pub(crate) fn rollback_managed_quantum(&mut self, checkpoint: ChatDecodeCheckpoint) {
+        self.drafter_head = checkpoint.drafter_head;
         self.conv = checkpoint.conv;
         self.physical_kv = checkpoint.physical_kv;
         self.unconsumed_logits = checkpoint.unconsumed_logits;
@@ -496,6 +535,42 @@ pub struct Inkling2ChatModel {
     /// Whether prompts share committed prefixes (set at load from the
     /// catalog's prefix-reuse cell and the operator's setting).
     prefix_caching: bool,
+    /// The block drafter, when served ([`DRAFTER_ENV`]).
+    drafter: Option<Inkling2Drafter>,
+    /// Speculative rounds run and their proposals kept.
+    speculation: SpeculationCounters,
+}
+
+/// Counts of speculative rounds, for the diagnostics.
+#[derive(Debug, Default)]
+struct SpeculationCounters {
+    rounds: std::sync::atomic::AtomicU64,
+    proposed: std::sync::atomic::AtomicU64,
+    kept: std::sync::atomic::AtomicU64,
+}
+
+impl SpeculationCounters {
+    fn record(&self, proposed: usize, kept: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.rounds.fetch_add(1, Relaxed);
+        self.proposed.fetch_add(proposed as u64, Relaxed);
+        self.kept.fetch_add(kept as u64, Relaxed);
+    }
+
+    fn diagnostics(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (rounds, proposed, kept) = (
+            self.rounds.load(Relaxed),
+            self.proposed.load(Relaxed),
+            self.kept.load(Relaxed),
+        );
+        serde_json::json!({
+            "rounds": rounds,
+            "proposed": proposed,
+            "kept": kept,
+            "kept_per_round": if rounds == 0 { 0.0 } else { kept as f64 / rounds as f64 },
+        })
+    }
 }
 
 impl InferenceStateContractProvider for Inkling2ChatModel {
@@ -504,6 +579,7 @@ impl InferenceStateContractProvider for Inkling2ChatModel {
             &self.config,
             kv_dtype(self.device_kind()),
             self.prefix_caching,
+            self.drafter_layers(),
         )?))
     }
 }
@@ -538,6 +614,73 @@ impl Inkling2ChatModel {
             &checkpoint,
             ExpertBackendRequest::from_env(),
         )
+    }
+
+    /// The drafter, when [`DRAFTER_ENV`] asks for it and the model directory
+    /// has its weights. A drafter that does not fit the model fails the load
+    /// rather than serving wrong drafts.
+    fn load_drafter(
+        dir: &Path,
+        config: &Inkling2Config,
+        device: &candle_core::Device,
+    ) -> Result<Option<Inkling2Drafter>> {
+        if !drafter_asked() {
+            return Ok(None);
+        }
+        if !dir.join(super::checkpoint::MTP_FILE).is_file() {
+            tracing::warn!(
+                "Inkling 2: {DRAFTER_ENV}=on, but {} has no {}; decoding without drafts",
+                dir.display(),
+                super::checkpoint::MTP_FILE
+            );
+            return Ok(None);
+        }
+        Self::drafter_from(Inkling2Drafter::load(dir, device)?, config).map(Some)
+    }
+
+    /// Checks that `drafter` drafts for this model.
+    fn drafter_from(drafter: Inkling2Drafter, config: &Inkling2Config) -> Result<Inkling2Drafter> {
+        let c = drafter.config();
+        let applications = config.application_count();
+        if c.hidden != config.hidden
+            || c.vocab != config.unpadded_vocab
+            || c.taps.last() != Some(&applications)
+            || c.taps.iter().any(|tap| *tap > applications)
+        {
+            return Err(Error::ModelLoadError(
+                "Inkling 2: the drafter does not fit the model's width, vocabulary or layers"
+                    .into(),
+            ));
+        }
+        Ok(drafter)
+    }
+
+    /// Serves `drafter` with this model, for a test.
+    #[cfg(test)]
+    pub(crate) fn with_drafter_for_test(mut self, drafter: Inkling2Drafter) -> Self {
+        self.drafter = Some(Self::drafter_from(drafter, &self.config).unwrap());
+        self
+    }
+
+    /// The drafter's layers as the caches hold them.
+    pub(crate) fn drafter_layers(&self) -> Option<DrafterLayers> {
+        self.drafter.as_ref().map(|drafter| {
+            let c = drafter.config();
+            DrafterLayers {
+                layers: c.layers,
+                heads: c.heads,
+                kv_heads: c.kv_heads,
+                head_dim: c.head_dim,
+            }
+        })
+    }
+
+    /// Tokens a decode quantum may take: the anchor and the drafted tokens
+    /// when the drafter is served, else one.
+    pub fn preferred_decode_tokens(&self) -> usize {
+        self.drafter
+            .as_ref()
+            .map_or(1, |drafter| drafter.config().drafted() + 1)
     }
 
     /// Whether attention runs in the arena's fused kernel
@@ -691,6 +834,7 @@ impl Inkling2ChatModel {
         } else {
             Err("the experts run on the host".to_string())
         };
+        let drafter = Self::load_drafter(checkpoint.dir(), &config, &device.device)?;
         let fused_attention =
             Self::resolve_fused_attention(&config, &device.device, BackendKind::from(device.kind));
         if let Err(reason) = &fused_attention {
@@ -724,6 +868,8 @@ impl Inkling2ChatModel {
             fused_attention,
             vision,
             prefix_caching: false,
+            drafter,
+            speculation: SpeculationCounters::default(),
         })
     }
 
@@ -803,6 +949,13 @@ impl Inkling2ChatModel {
             "layer_applications": self.config.application_count(),
             "expert_resident_bytes": self.trunk.expert_resident_bytes(),
             "prefix_sharing": self.prefix_caching,
+            "drafter": match &self.drafter {
+                Some(drafter) => serde_json::json!({
+                    "drafted_per_round": drafter.config().drafted(),
+                    "speculation": self.speculation.diagnostics(),
+                }),
+                None => serde_json::json!(null),
+            },
             "attention": match &self.fused_attention {
                 Ok(error) => serde_json::json!({ "core": "fused", "check_error": error }),
                 Err(reason) => serde_json::json!({ "core": "composed", "reason": reason }),
@@ -1020,15 +1173,19 @@ impl Inkling2ChatModel {
     /// Runs `tokens` at positions `start..` and commits their keys, values
     /// and convolution state. Returns the last token's logits (`[vocab]`)
     /// when asked.
-    fn forward_span(
+    /// Runs `tokens` at positions `start..` through the trunk and writes
+    /// their keys and values (and the drafter's) into the prepared append it
+    /// returns, uncommitted, with the convolution state after the span. On
+    /// an error nothing is left prepared.
+    fn run_span(
         &self,
         tokens: &[u32],
         start: usize,
         cache: &mut Inkling2Caches,
-        conv: &mut Inkling2ConvRuntimeState,
-        want_logits: bool,
+        conv: &Inkling2ConvRuntimeState,
         images: Option<SpanImages<'_>>,
-    ) -> Result<Option<Tensor>> {
+        keep_conv_inputs: bool,
+    ) -> Result<SpanRun> {
         if tokens.is_empty() || cache.context_len() != start || conv.cursor() != start as u64 {
             return Err(chat_error(format!(
                 "a span at {start} does not continue the state (cache {}, convolution {})",
@@ -1036,7 +1193,7 @@ impl Inkling2ChatModel {
                 conv.cursor()
             )));
         }
-        cache.validate(&self.config)?;
+        cache.validate(&self.config, self.drafter_layers())?;
         let embeddings = match images {
             Some(images) if images.prompt > 0 => {
                 let prompt = images.prompt.min(tokens.len());
@@ -1056,35 +1213,97 @@ impl Inkling2ChatModel {
         };
         let mut working = conv.conv()?.clone();
         let mut prepared = cache.prepare_append(start, tokens.len())?;
-        let hidden = {
-            let mut context =
-                cache.context(&self.config, &mut prepared, self.fused_attention.is_ok());
-            self.trunk.forward_span(
-                &embeddings,
-                start,
-                &mut working,
-                &mut context,
-                self.graphs.as_ref().ok(),
-                None,
-            )
-        };
-        let hidden = match hidden {
-            Ok(hidden) => hidden,
+        let mut record = Inkling2PassRecord::with_taps(
+            self.drafter
+                .as_ref()
+                .map(|drafter| drafter.config().taps.clone())
+                .unwrap_or_default(),
+        );
+        record.keep_conv_inputs = keep_conv_inputs;
+        let run = (|| {
+            let hidden = {
+                let mut context =
+                    cache.context(&self.config, &mut prepared, self.fused_attention.is_ok());
+                self.trunk.forward_span_recorded(
+                    &embeddings,
+                    start,
+                    &mut working,
+                    &mut context,
+                    self.graphs.as_ref().ok(),
+                    &mut record,
+                )?
+            };
+            let drafter_heads = self.write_drafter_span(cache, &mut prepared, &record, start)?;
+            Ok((hidden, drafter_heads))
+        })();
+        match run {
+            Ok((hidden, drafter_heads)) => Ok(SpanRun {
+                hidden,
+                prepared,
+                conv: working,
+                record,
+                drafter_heads,
+            }),
             Err(error) => {
-                // The trunk's error is the one to report; an abort that
+                // The span's error is the one to report; an abort that
                 // also fails must not replace it.
                 if let Err(abort) = cache.abort(prepared) {
                     tracing::warn!("Inkling 2: aborting a failed span also failed: {abort}");
                 }
-                return Err(error);
+                Err(error)
             }
+        }
+    }
+
+    /// The drafter's keys and values of a span's positions, from the taps
+    /// the pass recorded, written into the prepared append; returns the
+    /// head's fused state of each position (`[seq, hidden]`).
+    fn write_drafter_span(
+        &self,
+        cache: &Inkling2Caches,
+        prepared: &mut Inkling2Prepared,
+        record: &Inkling2PassRecord,
+        start: usize,
+    ) -> Result<Option<Tensor>> {
+        let Some(drafter) = &self.drafter else {
+            return Ok(None);
         };
-        cache.commit(prepared)?;
-        conv.advance(working, tokens.len());
+        let taps = record
+            .taps
+            .as_ref()
+            .ok_or_else(|| chat_error("the pass recorded no drafter taps"))?;
+        let fused = drafter.fuse(taps)?;
+        for layer in 0..drafter.config().layers {
+            let (keys, values) = drafter.context_kv(layer, &fused.layer(layer)?, start)?;
+            cache.write_drafter_span(&self.config, prepared, layer, &keys, &values)?;
+        }
+        Ok(Some(fused.head()?))
+    }
+
+    /// Runs `tokens` at positions `start..` and commits their keys, values
+    /// and convolution state. Returns the last token's logits (`[vocab]`)
+    /// when asked.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_span(
+        &self,
+        tokens: &[u32],
+        start: usize,
+        cache: &mut Inkling2Caches,
+        conv: &mut Inkling2ConvRuntimeState,
+        drafter_head: &mut Option<Tensor>,
+        want_logits: bool,
+        images: Option<SpanImages<'_>>,
+    ) -> Result<Option<Tensor>> {
+        let run = self.run_span(tokens, start, cache, conv, images, false)?;
+        cache.commit(run.prepared)?;
+        conv.advance(run.conv, tokens.len());
+        if let Some(heads) = run.drafter_heads {
+            *drafter_head = Some(heads.get(tokens.len() - 1)?);
+        }
         if !want_logits {
             return Ok(None);
         }
-        let last = hidden.narrow(0, tokens.len() - 1, 1)?;
+        let last = run.hidden.narrow(0, tokens.len() - 1, 1)?;
         Ok(Some(self.trunk.logits(&last)?.squeeze(0)?))
     }
 
@@ -1137,6 +1356,7 @@ impl Inkling2ChatModel {
             replay_end: None,
             pending_logprobs: Vec::new(),
             image_features: None,
+            drafter_head: None,
         })
     }
 
@@ -1236,6 +1456,7 @@ impl Inkling2ChatModel {
             span_start,
             &mut state.physical_kv,
             &mut state.conv,
+            &mut state.drafter_head,
             complete,
             images,
         )?;
@@ -1304,6 +1525,7 @@ impl Inkling2ChatModel {
             replay_end: Some(saved.replay_tokens),
             pending_logprobs: Vec::new(),
             image_features: saved.image_features.clone(),
+            drafter_head: None,
         })
     }
 
@@ -1342,6 +1564,7 @@ impl Inkling2ChatModel {
             span_start,
             &mut state.physical_kv,
             &mut state.conv,
+            &mut state.drafter_head,
             false,
             images,
         )?;
@@ -1384,6 +1607,7 @@ impl Inkling2ChatModel {
                 state.position,
                 &mut state.physical_kv,
                 &mut state.conv,
+                &mut state.drafter_head,
                 true,
                 None,
             )?;
@@ -1401,15 +1625,36 @@ impl Inkling2ChatModel {
             .take()
             .ok_or_else(|| chat_error("the decode state has no logits to sample"))?;
         state.pending_logprobs.clear();
+        match self.take_token(state, &logits)? {
+            Taken::Stop => self.finish(state, String::new(), committed),
+            Taken::Ended(delta) => self.finish(state, delta, committed),
+            Taken::Next(_, delta) if state.generated_ids.len() >= state.max_new_tokens => {
+                self.finish(state, delta, committed)
+            }
+            Taken::Next(_, delta) => Ok(ChatDecodeStep {
+                delta,
+                text: String::new(),
+                tokens_generated: state.generated_ids.len(),
+                input_tokens_committed: committed,
+                finished: false,
+            }),
+        }
+    }
+
+    /// Samples one token from `logits` with the state's sampler and gives
+    /// it to the reply. A token the reply keeps is generated and becomes
+    /// the pending token (the next one the model runs); one that stops or
+    /// ends the reply is not. The token cap is the caller's.
+    fn take_token(&self, state: &mut ChatDecodeState, logits: &Tensor) -> Result<Taken> {
         let vocab = self.config.unpadded_vocab;
         let (next, entry) = if state.sampler.wants_logprobs() {
-            let (token, raw) = state.sampler.sample_with_logprobs(&logits, vocab)?;
+            let (token, raw) = state.sampler.sample_with_logprobs(logits, vocab)?;
             let entry = raw
                 .map(|raw| resolve_token_logprob(&self.tokenizer, &raw))
                 .transpose()?;
             (token, entry)
         } else {
-            (state.sampler.sample(&logits, vocab)?, None)
+            (state.sampler.sample(logits, vocab)?, None)
         };
         if next as usize >= vocab {
             return Err(chat_error(format!(
@@ -1417,29 +1662,213 @@ impl Inkling2ChatModel {
             )));
         }
         if state.sampler.is_configured_stop(next) {
-            return self.finish(state, String::new(), committed);
+            return Ok(Taken::Stop);
         }
         // Every sampled token advances the reply and, unless it ends the
         // turn, the model's own state on the next step, shown or not.
         let delta = state.reply.push(&self.tokenizer, next)?;
         if state.reply.finished() {
-            return self.finish(state, delta, committed);
+            return Ok(Taken::Ended(delta));
         }
         state.generated_ids.push(next);
         state.pending_token = Some(next);
         if let Some(entry) = entry {
             state.pending_logprobs.push(entry);
         }
-        if state.generated_ids.len() >= state.max_new_tokens {
-            return self.finish(state, delta, committed);
+        Ok(Taken::Next(next, delta))
+    }
+
+    /// Whether a decode quantum of `budget` tokens can run as a speculative
+    /// round for `state`.
+    fn speculates(&self, state: &ChatDecodeState, budget: usize) -> bool {
+        self.drafter.is_some()
+            && budget >= 2
+            && state.replay_end.is_none()
+            && !state.finished
+            && state.pending_token.is_some()
+            && state.unconsumed_logits.is_none()
+            && state.drafter_head.is_some()
+            && state
+                .max_new_tokens
+                .saturating_sub(state.generated_ids.len())
+                >= 2
+    }
+
+    /// One speculative round: the drafter proposes the tokens after the
+    /// pending one (the anchor), the trunk runs the anchor and the proposals
+    /// in one span, and the state's own sampler then picks each next token
+    /// from those logits in turn. While its pick equals the proposal at that
+    /// position the round goes on; the first pick that differs (or the
+    /// token after the last proposal) becomes the pending token. Every
+    /// emitted token is the sampler's own pick from the model's logits given
+    /// the tokens before it, so the reply is what decoding one token at a
+    /// time gives, up to the summation order of a wider span; the drafts
+    /// only decide how many of those logits one pass yields.
+    fn speculative_round(
+        &self,
+        state: &mut ChatDecodeState,
+        budget: usize,
+    ) -> Result<ChatDecodeStep> {
+        let proposals = self.propose(state, budget)?;
+        self.verify_proposals(state, proposals)
+    }
+
+    /// The drafter's proposals after the pending token: as many as the
+    /// quantum and the token cap leave room for.
+    fn propose(&self, state: &ChatDecodeState, budget: usize) -> Result<Vec<u32>> {
+        let drafter = self
+            .drafter
+            .as_ref()
+            .ok_or_else(|| chat_error("speculation without a drafter"))?;
+        let anchor = state
+            .pending_token
+            .ok_or_else(|| chat_error("speculation without an anchor"))?;
+        let f_rnn = state
+            .drafter_head
+            .clone()
+            .ok_or_else(|| chat_error("speculation before any committed position"))?;
+        let position = state.position;
+        // Every proposal kept costs a generated token: leave room for the
+        // token after the last one.
+        let room = state.max_new_tokens - state.generated_ids.len() - 1;
+        let drafted = drafter.config().drafted().min(budget - 1).min(room);
+
+        let anchor_embedding = self.trunk.embed(&[anchor])?.squeeze(0)?;
+        let block = {
+            let context = Inkling2DrafterCacheContext {
+                caches: &state.physical_kv,
+                config: &self.config,
+            };
+            drafter.draft_block(&anchor_embedding, position, &context)?
+        };
+        let rows = drafter.mask_rows(&block)?;
+        let project = |hidden: &Tensor| self.trunk.unembed(hidden);
+        let mut chain = drafter.markov_chain(&f_rnn, anchor)?;
+        let mut proposals = Vec::with_capacity(drafted);
+        for row in 0..drafted {
+            let logits = chain.step_projected(row, &rows.get(row)?, &project)?;
+            let token = logits.argmax(0)?.to_scalar::<u32>()?;
+            chain.advance(token)?;
+            proposals.push(token);
+        }
+        Ok(proposals)
+    }
+
+    /// Runs the pending token and `proposals` in one span and keeps what
+    /// the sampler's own picks agree with (see [`Self::speculative_round`]).
+    fn verify_proposals(
+        &self,
+        state: &mut ChatDecodeState,
+        proposals: Vec<u32>,
+    ) -> Result<ChatDecodeStep> {
+        let anchor = state
+            .pending_token
+            .ok_or_else(|| chat_error("speculation without an anchor"))?;
+        let position = state.position;
+        if state.generated_ids.len() + proposals.len() >= state.max_new_tokens {
+            return Err(chat_error(
+                "more proposals than the token cap leaves room for",
+            ));
+        }
+        let mut tokens = Vec::with_capacity(proposals.len() + 1);
+        tokens.push(anchor);
+        tokens.extend(&proposals);
+        let run = self.run_span(
+            &tokens,
+            position,
+            &mut state.physical_kv,
+            &state.conv,
+            None,
+            true,
+        )?;
+        let logits = match self.trunk.logits(&run.hidden) {
+            Ok(logits) => logits,
+            Err(error) => {
+                let _ = state.physical_kv.abort(run.prepared);
+                return Err(error);
+            }
+        };
+
+        // Pick from each position's logits in turn.
+        state.pending_token = None;
+        state.pending_logprobs.clear();
+        let mut delta = String::new();
+        let mut consumed = 0usize;
+        let mut finished = false;
+        for (index, proposal) in proposals.iter().map(Some).chain([None]).enumerate() {
+            consumed = index + 1;
+            match self.take_token(state, &logits.get(index)?)? {
+                Taken::Stop => {
+                    finished = true;
+                    break;
+                }
+                Taken::Ended(text) => {
+                    delta.push_str(&text);
+                    finished = true;
+                    break;
+                }
+                Taken::Next(next, text) => {
+                    delta.push_str(&text);
+                    if state.generated_ids.len() >= state.max_new_tokens {
+                        finished = true;
+                        break;
+                    }
+                    if proposal != Some(&next) {
+                        break;
+                    }
+                    // The proposal at the next position is the token just
+                    // picked: its keys and values are in the span already.
+                    state.pending_token = None;
+                }
+            }
+        }
+
+        // Keep the anchor and the proposals the picks agreed with.
+        let conv = if consumed == tokens.len() {
+            run.conv
+        } else {
+            run.record.conv_after(consumed, self.config.conv_kernel)?
+        };
+        state.physical_kv.commit_prefix(run.prepared, consumed)?;
+        state.conv.advance(conv, consumed);
+        state.position += consumed;
+        if let Some(heads) = run.drafter_heads {
+            state.drafter_head = Some(heads.get(consumed - 1)?);
+        }
+        self.speculation.record(proposals.len(), consumed - 1);
+        if finished {
+            return self.finish(state, delta, consumed);
         }
         Ok(ChatDecodeStep {
             delta,
             text: String::new(),
             tokens_generated: state.generated_ids.len(),
-            input_tokens_committed: committed,
+            input_tokens_committed: consumed,
             finished: false,
         })
+    }
+
+    /// [`Self::verify_proposals`] with proposals a test chooses.
+    #[cfg(test)]
+    pub(crate) fn verify_proposals_for_test(
+        &self,
+        state: &mut ChatDecodeState,
+        proposals: Vec<u32>,
+    ) -> Result<ChatDecodeStep> {
+        self.verify_proposals(state, proposals)
+    }
+
+    /// A decode quantum of up to `budget` tokens: a speculative round when
+    /// the drafter is served, else one decode step.
+    pub fn decode_quantum(
+        &self,
+        state: &mut ChatDecodeState,
+        budget: usize,
+    ) -> Result<ChatDecodeStep> {
+        if self.speculates(state, budget) {
+            return self.speculative_round(state, budget);
+        }
+        self.decode_step(state)
     }
 
     /// Whether a continuous batch runs its rows in one pass. That needs the
@@ -1466,7 +1895,9 @@ impl Inkling2ChatModel {
                     "a batched row's caches do not continue its position",
                 ));
             }
-            state.physical_kv.validate(&self.config)?;
+            state
+                .physical_kv
+                .validate(&self.config, self.drafter_layers())?;
             tokens.push(token);
             positions.push(state.position);
         }
@@ -1479,19 +1910,49 @@ impl Inkling2ChatModel {
             .iter()
             .map(|state| state.physical_kv.prepare_append(state.position, 1))
             .collect::<Result<Vec<_>>>()?;
+        let mut record = Inkling2PassRecord::with_taps(
+            self.drafter
+                .as_ref()
+                .map(|drafter| drafter.config().taps.clone())
+                .unwrap_or_default(),
+        );
         let hidden = (|| {
-            let rows = states
-                .iter()
-                .zip(prepared.iter_mut())
-                .map(|(state, prepared)| (&state.physical_kv, prepared))
-                .collect();
-            let mut context = Inkling2RowsPagedContext::new(&self.config, rows)?;
-            let mut convs = working.iter_mut().collect::<Vec<_>>();
-            self.trunk
-                .forward_rows(&embeddings, &positions, &mut convs, &mut context, None)
+            let hidden = {
+                let rows = states
+                    .iter()
+                    .zip(prepared.iter_mut())
+                    .map(|(state, prepared)| (&state.physical_kv, prepared))
+                    .collect();
+                let mut context = Inkling2RowsPagedContext::new(&self.config, rows)?;
+                let mut convs = working.iter_mut().collect::<Vec<_>>();
+                self.trunk.forward_rows(
+                    &embeddings,
+                    &positions,
+                    &mut convs,
+                    &mut context,
+                    Some(&mut record),
+                )?
+            };
+            // Each row's drafter keys and values, at its own position.
+            let mut heads = Vec::new();
+            if let Some(taps) = &record.taps {
+                for (row, (state, prepared)) in states.iter().zip(prepared.iter_mut()).enumerate() {
+                    let mut row_record = Inkling2PassRecord::default();
+                    row_record.taps = Some(taps.narrow(0, row, 1)?);
+                    if let Some(head) = self.write_drafter_span(
+                        &state.physical_kv,
+                        prepared,
+                        &row_record,
+                        state.position,
+                    )? {
+                        heads.push(head.get(0)?);
+                    }
+                }
+            }
+            Ok((hidden, heads))
         })();
-        let hidden = match hidden {
-            Ok(hidden) => hidden,
+        let (hidden, heads) = match hidden {
+            Ok(done) => done,
             Err(error) => {
                 for (state, prepared) in states.iter_mut().zip(prepared) {
                     if let Err(abort) = state.physical_kv.abort(prepared) {
@@ -1507,6 +1968,9 @@ impl Inkling2ChatModel {
         {
             state.physical_kv.commit(prepared)?;
             state.conv.advance(conv, 1);
+            if let Some(head) = heads.get(row) {
+                state.drafter_head = Some(head.clone());
+            }
             state.unconsumed_logits = Some(logits.get(row)?);
             state.pending_token = None;
             state.position += 1;

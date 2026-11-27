@@ -521,8 +521,9 @@ fn sov_transcribe_bundle_is_complete(model_dir: &Path) -> bool {
         })
 }
 
-/// Inkling 2 Mini at its pinned revision. `mtp.safetensors` (the
-/// multi-token-prediction head, 636 MB) is not fetched: nothing loads it.
+/// Inkling 2 Mini at its pinned revision. `mtp.safetensors` (the block
+/// drafter, 636 MB) is not fetched: serving it is a request
+/// (`IZWI_INKLING2_DRAFTER`), and the model loads without it.
 const INKLING2_METADATA_FILES: &[&str] = &[
     "config.json",
     "generation_config.json",

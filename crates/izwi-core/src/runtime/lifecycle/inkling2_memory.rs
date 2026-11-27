@@ -11,8 +11,9 @@
 //! The dense tensors are priced at the dtype the backend holds them in (the
 //! same choice the loader makes, its environment switch included). The
 //! load's transient is one dense tensor in flight: the largest one's held
-//! size on the host and again on the device. The MTP head is not loaded, so
-//! it is not priced.
+//! size on the host and again on the device. The block drafter, when the
+//! load serves it, is priced as F32 dense weights; its keys and values are
+//! paged state the engine prices per token.
 
 use std::path::Path;
 

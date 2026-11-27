@@ -1705,4 +1705,11 @@ impl Inkling2Trunk {
         let logits = self.unembedding.forward(hidden)?;
         Ok(((logits / cap)?.tanh()? * cap)?)
     }
+
+    /// Logits of hidden states before the soft cap, `[seq,
+    /// unpadded_vocab]`: the unembedding alone, which the drafter's head
+    /// projects its corrected states through.
+    pub fn unembed(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.unembedding.forward(hidden)
+    }
 }
