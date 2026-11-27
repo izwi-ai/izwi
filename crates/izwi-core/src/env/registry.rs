@@ -1098,7 +1098,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Choice,
         "auto",
         Load,
-        "Selects where Inkling 2's packed experts run: auto (on the device on CUDA once the load-time check against the host path passes, on the host elsewhere), host, or device.",
+        "Selects where Inkling 2's packed experts run: auto (on the device on CUDA once the load-time check against the host path passes, on the host elsewhere), host, or device (also on Metal, with the same check).",
     ),
     CoreEnvVar::new(
         "IZWI_KEEP_NEMO_ARCHIVES",

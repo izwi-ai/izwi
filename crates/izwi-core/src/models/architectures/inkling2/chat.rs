@@ -537,7 +537,9 @@ impl Inkling2ChatModel {
             return host(
                 match request {
                     ExpertBackendRequest::Host => format!("{EXPERT_BACKEND_ENV}=host"),
-                    _ => "the device kernels are CUDA only".to_string(),
+                    _ => format!(
+                        "the host path is the default here; {EXPERT_BACKEND_ENV}=device runs the experts on the device"
+                    ),
                 },
                 None,
             );

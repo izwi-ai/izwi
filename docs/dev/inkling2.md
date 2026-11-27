@@ -119,6 +119,13 @@ The served path is the composed trunk on every backend:
   when they differ by more than 1e-3 relative. `IZWI_INKLING2_MOE_BACKEND`
   (`auto`, `host`, `device`) overrides the choice; the loaded-model
   diagnostics report the backend, the reason and the check's error;
+- on Metal the same kernels exist (ported one for one, fast math off) and
+  `IZWI_INKLING2_MOE_BACKEND=device` selects them, with the same load-time
+  check. They are not the default there: the upload is a second copy of the
+  14.6 GiB of experts in unified memory beside the mapped file, and one
+  layer's experts take about 4 ms for one token at the published geometry
+  on an M-series GPU (measured in a debug build), which has not been
+  compared with the host path on the real model;
 - on CUDA, with the experts on the device, a decode step replays its pure
   stages as CUDA graphs (`kernels::cuda::stretch_graphs`): two per layer
   application (before and after the attention core) and the final read, 97
@@ -133,7 +140,7 @@ The served path is the composed trunk on every backend:
 
 Not implemented yet: a fused paged attention kernel with the position bias
 and sink (which a whole-step graph needs: until then 48 attention cores per
-token run eagerly), fused convolution kernels, device experts on Metal, dense
+token run eagerly), fused convolution kernels, dense
 tensors in the checkpoint's BF16, releasing windowed pages, and the MTP
 head.
 
@@ -230,6 +237,7 @@ is part of the load's admission figures.
 | An image chat through the runtime: PNG data URLs, two requests at once, failures that leave the model serving | CPU test, synthetic checkpoint | passes |
 | Real checkpoint on any backend | a machine with 24 GB+ | not run |
 | Device experts inside the served model, on the kernels' CPU reference: load check, logits, greedy tokens equal to the host path | CPU test | passes |
+| The Metal expert kernels against the CPU reference (ids equal, outputs within 3e-7 relative, a token's result bit-identical alone and in a batch), and inside the served model with the load check | Metal tests, M-series Mac | passes |
 | The CUDA expert kernels' source, run on the host one thread at a time against an independent evaluation | `scripts/cuda-host-emulation/moe_packed.cpp` | passes |
 | CUDA build type check with a stand-in `nvcc` | this Mac | passes |
 | Anything on a GPU | | not run |

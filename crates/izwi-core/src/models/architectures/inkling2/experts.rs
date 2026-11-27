@@ -9,12 +9,15 @@
 //! depend on what else is in the batch.
 //!
 //! This is the reference expert path on every device and the serving path on
-//! the CPU and Metal.
+//! the CPU, and on Metal unless the device path is asked for.
 //!
-//! On CUDA the layer can run on the device instead ([`Inkling2Moe::upload`]):
-//! the packed bytes are uploaded as they are and `kernels::moe_packed` routes
-//! and multiplies there, so a step never reads activations back for the
-//! experts. The model checks that path against this one at load.
+//! On CUDA and Metal the layer can run on the device instead
+//! ([`Inkling2Moe::upload`]): the packed bytes are uploaded as they are and
+//! `kernels::moe_packed` routes and multiplies there, so a step never reads
+//! activations back for the experts. The model checks that path against this
+//! one at load. It is the default on CUDA. On Metal it is opt-in: the upload
+//! is a second copy of the experts in unified memory beside the mapped file,
+//! and which path is faster there has not been measured on the real model.
 
 use candle_core::{DType, Device, Tensor};
 use rayon::prelude::*;

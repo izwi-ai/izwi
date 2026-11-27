@@ -821,6 +821,51 @@ fn device_experts_serve_the_same_reply() {
     assert_eq!(got, generate(&host, &mut state, 12));
 }
 
+/// The experts on the Metal device, inside the served model: the load-time
+/// check passes and prefill tracks the reference logits as closely as the
+/// host expert path does there.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_device_experts_pass_the_load_check_and_track_the_reference() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "metal_device_experts_pass_the_load_check_and_track_the_reference",
+    ) else {
+        return;
+    };
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    // The default on Metal is the host path.
+    assert!(!tiny_model_on(profile.clone()).expert_placement().on_device);
+    let model = tiny_model_with(profile, ExpertBackendRequest::Device).without_turn_end_for_test();
+    let placement = model.expert_placement();
+    assert!(placement.on_device, "{}", placement.reason);
+    assert!(placement.check_error.unwrap() <= 1e-4);
+
+    let golden = golden();
+    let vocab = model.config().unpadded_vocab;
+    let config = ChatGenerationConfig::default();
+    let prompt = &golden.tokens[..golden.prompt_tokens];
+    let mut state = model
+        .start_decode_managed(
+            prompt,
+            8,
+            &config,
+            caches_on(&model, &device, DType::F32, 1).remove(0),
+        )
+        .unwrap();
+    let row = prompt.len() - 1;
+    let error = max_error(
+        &values(state_logits(&state)),
+        &golden.logits[row * vocab..(row + 1) * vocab],
+    );
+    assert!(error <= 5e-2, "logit error {error}");
+    assert_eq!(generate(&model, &mut state, 8).len(), 8);
+}
+
 #[test]
 fn the_expert_backend_request_parses() {
     use crate::backends::BackendKind;

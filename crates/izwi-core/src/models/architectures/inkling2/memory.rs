@@ -99,8 +99,9 @@ impl Inkling2Footprint {
             0
         };
         match backend {
-            // One memory: the mapped experts count whether or not a device
-            // copy exists beside them.
+            // One memory: the mapped experts count beside a device copy.
+            // (With the experts on the device the mapping is no longer read
+            // and the system may drop its pages, but the load holds both.)
             BackendKind::Cpu | BackendKind::Metal => {
                 self.dense_bytes + self.expert_bytes + self.router_bytes + device_experts
             }
