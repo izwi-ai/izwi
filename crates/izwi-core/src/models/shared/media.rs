@@ -90,19 +90,19 @@ fn encoded_media_budget(source: &str) -> Result<u64> {
             .split_once(',')
             .ok_or_else(|| Error::InvalidInput("Invalid data URL image payload".to_string()))?;
         let payload_len = u64::try_from(payload.trim().len())
-            .map_err(|_| Error::Overloaded("Qwen3.5 image payload overflow".to_string()))?;
+            .map_err(|_| Error::Overloaded("Chat image payload overflow".to_string()))?;
         let decoded_upper = if metadata.contains(";base64") {
             payload_len
                 .checked_add(3)
                 .and_then(|value| value.checked_div(4))
                 .and_then(|value| value.checked_mul(3))
-                .ok_or_else(|| Error::Overloaded("Qwen3.5 image payload overflow".to_string()))?
+                .ok_or_else(|| Error::Overloaded("Chat image payload overflow".to_string()))?
         } else {
             payload_len
         };
         if decoded_upper > MAX_ENCODED_IMAGE_BYTES {
             return Err(Error::InvalidInput(format!(
-                "Qwen3.5 encoded image exceeds the {} byte limit",
+                "Chat encoded image exceeds the {} byte limit",
                 MAX_ENCODED_IMAGE_BYTES
             )));
         }
@@ -122,10 +122,10 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<DynamicImage> {
     })?;
     let pixels = u64::from(width)
         .checked_mul(u64::from(height))
-        .ok_or_else(|| Error::InvalidInput("Qwen3.5 image dimensions overflow".to_string()))?;
+        .ok_or_else(|| Error::InvalidInput("Chat image dimensions overflow".to_string()))?;
     if width == 0 || height == 0 || pixels > MAX_IMAGE_PIXELS {
         return Err(Error::InvalidInput(format!(
-            "Qwen3.5 image dimensions {width}x{height} exceed the {MAX_IMAGE_PIXELS} pixel limit"
+            "Chat image dimensions {width}x{height} exceed the {MAX_IMAGE_PIXELS} pixel limit"
         )));
     }
 
@@ -163,7 +163,7 @@ pub(crate) fn fetch_media_bytes(source: &str) -> Result<Vec<u8>> {
             "http" | "https" => fetch_remote_media_bytes(source),
             "file" => fetch_file_media_bytes(source),
             scheme => Err(Error::InvalidInput(format!(
-                "Qwen3.5 media URL scheme {scheme:?} is not supported"
+                "Chat media URL scheme {scheme:?} is not supported"
             ))),
         };
     }
@@ -196,7 +196,7 @@ fn fetch_remote_media_bytes(source: &str) -> Result<Vec<u8>> {
         .is_some_and(|length| length > MAX_ENCODED_IMAGE_BYTES)
     {
         return Err(Error::InvalidInput(format!(
-            "Qwen3.5 remote image exceeds the {} byte limit",
+            "Chat remote image exceeds the {} byte limit",
             MAX_ENCODED_IMAGE_BYTES
         )));
     }
@@ -221,7 +221,7 @@ fn configured_local_media_root_from(root: Option<PathBuf>) -> Result<PathBuf> {
         .filter(|root| !root.as_os_str().is_empty())
         .ok_or_else(|| {
             Error::InvalidInput(format!(
-                "Local Qwen3.5 media is disabled; set {LOCAL_MEDIA_ROOT_ENV} to an explicit media root"
+                "Local chat media is disabled; set {LOCAL_MEDIA_ROOT_ENV} to an explicit media root"
             ))
         })?;
     if !root.is_absolute() {
@@ -285,12 +285,12 @@ fn fetch_file_media_bytes_under_root(source: &str, canonical_root: &Path) -> Res
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(Error::InvalidInput(
-            "Qwen3.5 local media source must be a regular file".to_string(),
+            "Chat local media source must be a regular file".to_string(),
         ));
     }
     if metadata.len() > MAX_ENCODED_IMAGE_BYTES {
         return Err(Error::InvalidInput(format!(
-            "Qwen3.5 local image exceeds the {} byte limit",
+            "Chat local image exceeds the {} byte limit",
             MAX_ENCODED_IMAGE_BYTES
         )));
     }
@@ -312,7 +312,7 @@ fn open_canonical_local_media(path: &Path, canonical_root: &Path) -> Result<File
         })
         .collect::<Result<Vec<_>>>()?;
     let (file_name, directories) = components.split_last().ok_or_else(|| {
-        Error::InvalidInput("Qwen3.5 local media source must name a file".to_string())
+        Error::InvalidInput("Chat local media source must name a file".to_string())
     })?;
 
     let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -372,7 +372,7 @@ fn open_canonical_local_media(_path: &Path, _canonical_root: &Path) -> Result<Fi
     // platforms. Keep local media fail-closed; data and public HTTPS sources
     // remain available on every backend.
     Err(Error::ConfigError(
-        "Secure local Qwen3.5 media opens are not supported on this platform".to_string(),
+        "Secure local chat media opens are not supported on this platform".to_string(),
     ))
 }
 
@@ -574,17 +574,17 @@ fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>> {
 fn read_with_limit(mut reader: impl Read, max_bytes: u64) -> Result<Vec<u8>> {
     let limit = max_bytes
         .checked_add(1)
-        .ok_or_else(|| Error::Overloaded("Qwen3.5 image byte limit overflow".to_string()))?;
+        .ok_or_else(|| Error::Overloaded("Chat image byte limit overflow".to_string()))?;
     let mut bytes = Vec::new();
     reader.by_ref().take(limit).read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
         return Err(Error::InvalidInput(format!(
-            "Qwen3.5 encoded image exceeds the {max_bytes} byte limit"
+            "Chat encoded image exceeds the {max_bytes} byte limit"
         )));
     }
     if bytes.is_empty() {
         return Err(Error::InvalidInput(
-            "Qwen3.5 encoded image is empty".to_string(),
+            "Chat encoded image is empty".to_string(),
         ));
     }
     Ok(bytes)
@@ -593,13 +593,13 @@ fn read_with_limit(mut reader: impl Read, max_bytes: u64) -> Result<Vec<u8>> {
 fn enforce_encoded_media_limit(bytes: Vec<u8>) -> Result<Vec<u8>> {
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_ENCODED_IMAGE_BYTES {
         return Err(Error::InvalidInput(format!(
-            "Qwen3.5 encoded image exceeds the {} byte limit",
+            "Chat encoded image exceeds the {} byte limit",
             MAX_ENCODED_IMAGE_BYTES
         )));
     }
     if bytes.is_empty() {
         return Err(Error::InvalidInput(
-            "Qwen3.5 encoded image is empty".to_string(),
+            "Chat encoded image is empty".to_string(),
         ));
     }
     Ok(bytes)
@@ -704,7 +704,7 @@ mod tests {
         ));
 
         let base = std::env::temp_dir().join(format!(
-            "izwi-qwen35-media-root-test-{}",
+            "izwi-chat-media-root-test-{}",
             uuid::Uuid::new_v4()
         ));
         let root = base.join("root");

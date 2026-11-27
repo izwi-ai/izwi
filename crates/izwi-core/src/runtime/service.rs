@@ -954,7 +954,7 @@ pub(crate) fn media_preparation_resources(
     let total_unified = estimate
         .host_bytes
         .checked_add(estimate.backend_tensor_bytes)
-        .ok_or_else(|| Error::Overloaded("Qwen3.5 media resource overflow".to_string()))?;
+        .ok_or_else(|| Error::Overloaded("Chat media resource overflow".to_string()))?;
     let mut resources = ResourceVector::zero();
     match backend {
         BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(total_unified),
