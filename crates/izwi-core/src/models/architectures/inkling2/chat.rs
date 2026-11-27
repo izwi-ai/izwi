@@ -15,6 +15,8 @@ use tracing::info;
 
 use super::checkpoint::Inkling2Checkpoint;
 use super::config::Inkling2Config;
+use super::config::CONV_STATES_PER_APPLICATION;
+use super::decode_graph::{CacheKey, GraphCache, GraphKey, GraphRowsContext, Inkling2StepGraph};
 use super::drafter::Inkling2Drafter;
 use super::prompt::{
     forced_call, json_reply, render_prompt, CONTENT_TEXT, IMAGE_SLOT, JSON_REPLY_GRAMMAR,
@@ -24,7 +26,7 @@ use super::state::{
     kv_dtype, managed_contract, DrafterLayers, Inkling2Caches, Inkling2ConvRuntimeState,
     Inkling2DrafterCacheContext, Inkling2Prepared, Inkling2RowsPagedContext,
 };
-use super::trunk::{Inkling2ConvState, Inkling2PassRecord, Inkling2Trunk};
+use super::trunk::{Inkling2ConvHistory, Inkling2ConvState, Inkling2PassRecord, Inkling2Trunk};
 use super::vision::{image_tokens, preprocess_image, Inkling2Vision};
 use crate::backends::kv::KvWriteBatchCompletion;
 use crate::backends::state::{
@@ -82,11 +84,14 @@ pub fn decode_graph_device_bytes(backend: BackendKind) -> u64 {
         && crate::env::flag_or(DECODE_GRAPHS_ENV, true)
         && !crate::kernels::cuda::stretch_graphs::decode_graphs_switched_off()
         && ExpertBackendRequest::from_env().wants_device(backend);
-    if on {
-        DECODE_GRAPH_DEVICE_BYTES
+    let stretch = if on { DECODE_GRAPH_DEVICE_BYTES } else { 0 };
+    // The whole-step graphs, when asked for, need the experts there too.
+    let step = if ExpertBackendRequest::from_env().wants_device(backend) {
+        super::decode_graph::step_graph_device_bytes(backend)
     } else {
         0
-    }
+    };
+    stretch + step
 }
 
 /// The decode step runs one row at a time.
@@ -539,6 +544,8 @@ pub struct Inkling2ChatModel {
     drafter: Option<Inkling2Drafter>,
     /// Speculative rounds run and their proposals kept.
     speculation: SpeculationCounters,
+    /// Whole-step decode graphs, or why there are none.
+    step_graph: std::result::Result<Inkling2StepGraph, String>,
 }
 
 /// Counts of speculative rounds, for the diagnostics.
@@ -837,6 +844,19 @@ impl Inkling2ChatModel {
         let drafter = Self::load_drafter(checkpoint.dir(), &config, &device.device)?;
         let fused_attention =
             Self::resolve_fused_attention(&config, &device.device, BackendKind::from(device.kind));
+        // Whole-step graphs: CUDA, the experts on the device (the host path
+        // reads activations back), the fused attention, and no drafter.
+        let step_graph = if BackendKind::from(device.kind) != BackendKind::Cuda {
+            Err("whole-step graphs are CUDA only".to_string())
+        } else if !experts.on_device {
+            Err("the experts run on the host".to_string())
+        } else if fused_attention.is_err() {
+            Err("attention is composed".to_string())
+        } else if drafter.is_some() {
+            Err("the drafter is served".to_string())
+        } else {
+            Inkling2StepGraph::resolve(&device.device)
+        };
         if let Err(reason) = &fused_attention {
             tracing::debug!("Inkling 2 attention is composed: {reason}");
         }
@@ -870,6 +890,7 @@ impl Inkling2ChatModel {
             prefix_caching: false,
             drafter,
             speculation: SpeculationCounters::default(),
+            step_graph,
         })
     }
 
@@ -969,6 +990,10 @@ impl Inkling2ChatModel {
                     .map(|vision| format!("{:?}", vision.projection_dtype())),
             },
             "max_context_tokens": self.max_context_tokens,
+            "step_graphs": match &self.step_graph {
+                Ok(graph) => graph.diagnostics(),
+                Err(reason) => serde_json::json!({ "off": reason }),
+            },
             "decode_graphs": match &self.graphs {
                 Ok(graphs) => graphs.diagnostics(),
                 Err(reason) => serde_json::json!({ "off": reason }),
@@ -1601,6 +1626,10 @@ impl Inkling2ChatModel {
             return self.finish(state, String::new(), 0);
         }
         let mut committed = 0usize;
+        if let (Some(graph), Some(_)) = (self.step_graph(), state.pending_token) {
+            self.graphed_rows(graph, &mut [&mut *state])?;
+            return self.sample_step(state, 1);
+        }
         if let Some(token) = state.pending_token.take() {
             state.unconsumed_logits = self.forward_span(
                 &[token],
@@ -1871,12 +1900,332 @@ impl Inkling2ChatModel {
         self.decode_step(state)
     }
 
+    /// The whole-step graphs, when they serve this load.
+    fn step_graph(&self) -> Option<&Inkling2StepGraph> {
+        self.step_graph.as_ref().ok().filter(|graph| graph.is_on())
+    }
+
+    /// One graphed decode step of every row (see `decode_graph`): each
+    /// row's pending token runs and its logits are left unconsumed. The
+    /// first step of each width is checked against the standard batched
+    /// decode, whose result it then keeps.
+    fn graphed_rows(
+        &self,
+        graph: &Inkling2StepGraph,
+        states: &mut [&mut ChatDecodeState],
+    ) -> Result<()> {
+        use crate::kernels::cuda::decode_step::{graph_width, DecodeStepLayout, DecodeStepRow};
+        let rows = states.len();
+        let width = graph_width(rows)
+            .ok_or_else(|| chat_error(format!("no graphed width holds {rows} rows")))?;
+        let device = self.trunk.device().clone();
+        let mut tokens = Vec::with_capacity(width);
+        let mut positions = Vec::with_capacity(width);
+        for state in states.iter() {
+            let token = state
+                .pending_token
+                .ok_or_else(|| chat_error("a graphed row has no pending token"))?;
+            if state.physical_kv.context_len() != state.position
+                || state.conv.cursor() != state.position as u64
+            {
+                return Err(chat_error(
+                    "a graphed row's caches do not continue its position",
+                ));
+            }
+            state
+                .physical_kv
+                .validate(&self.config, self.drafter_layers())?;
+            tokens.push(token);
+            positions.push(state.position);
+        }
+        let split = states[0].physical_kv.windowed().is_some();
+        if states
+            .iter()
+            .any(|state| state.physical_kv.windowed().is_some() != split)
+        {
+            return Err(chat_error(
+                "the rows of a graphed step differ in cache layout",
+            ));
+        }
+        let routes = states[0].physical_kv.application_routes(&self.config);
+
+        // One side per cache: its step buffer, slots and layers.
+        struct Side {
+            layout: DecodeStepLayout,
+            values: Vec<u32>,
+            step: Tensor,
+            slots: std::sync::Arc<dyn crate::backends::kv::KvSlotMap>,
+            bindings: Vec<crate::kv::KvLayerBinding>,
+            arena: std::sync::Arc<dyn crate::backends::kv::KvArena>,
+        }
+        fn graph_cache<'a>(
+            side: &'a Side,
+            layers: &'a crate::backends::kv::GraphKvLayers,
+            step: &Tensor,
+            width: usize,
+        ) -> Result<GraphCache<'a>> {
+            Ok(GraphCache {
+                layers: &layers.layers,
+                slots: step.narrow(0, side.layout.slots(), width)?,
+                metadata: step.narrow(0, side.layout.metadata(), side.layout.metadata_len())?,
+                host_metadata: &side.values[side.layout.metadata()..],
+                layout: side.layout,
+            })
+        }
+        let side = |pick: &dyn Fn(&Inkling2Caches) -> Option<&PhysicalPagedKvCache>| -> Result<Option<Side>> {
+            let caches = states
+                .iter()
+                .map(|state| pick(&state.physical_kv))
+                .collect::<Option<Vec<_>>>();
+            let Some(caches) = caches else {
+                return Ok(None);
+            };
+            let arena = caches[0].arena().clone();
+            let page_tokens = arena.config().page_tokens;
+            let mut step_rows = Vec::with_capacity(rows);
+            let mut slots = Vec::with_capacity(rows);
+            for (cache, &position) in caches.iter().zip(&positions) {
+                if cache.arena().id() != arena.id() {
+                    return Err(chat_error("the rows of a graphed step span arenas"));
+                }
+                let slot = cache.slots_for_append(position, 1)?[0];
+                let table = cache.sequence_table(position + 1)?;
+                step_rows.push(DecodeStepRow::new(
+                    position as u32,
+                    &slot,
+                    &table,
+                    page_tokens,
+                )?);
+                slots.push(slot);
+            }
+            let longest = step_rows.iter().map(|row| row.blocks.len()).max().unwrap_or(1);
+            let layout = DecodeStepLayout::for_blocks(width, longest);
+            let values = layout.values(&step_rows)?;
+            let step = Tensor::from_vec(values.clone(), layout.len(), &device)?;
+            let bindings = (0..caches[0].layer_count())
+                .map(|layer| caches[0].layer_binding(layer))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(Side {
+                layout,
+                values,
+                step,
+                slots: arena.lower_slots(&slots)?,
+                bindings,
+                arena,
+            }))
+        };
+        let main = side(&|caches| Some(caches.main()))?
+            .ok_or_else(|| chat_error("a graphed step has no main cache"))?;
+        let windowed = side(&|caches| caches.windowed())?;
+
+        // Inputs: ids, log scale, step buffers, then the histories.
+        let mut padded = tokens.clone();
+        padded.resize(width, 0);
+        let ids = Tensor::from_vec(padded, width, &device)?;
+        let mut at = positions.clone();
+        at.resize(width, 0);
+        let log_scale = self.trunk.log_scale_of(&at)?;
+        let mut inputs = vec![ids, log_scale, main.step.clone()];
+        if let Some(windowed) = &windowed {
+            inputs.push(windowed.step.clone());
+        }
+        let fixed = inputs.len();
+        let applications = self.config.application_count();
+        for application in 0..applications {
+            for slot in 0..CONV_STATES_PER_APPLICATION {
+                let mut parts = states
+                    .iter()
+                    .map(|state| {
+                        Ok(state.conv.conv()?.histories[application].tensors()[slot].clone())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let spare = parts[0].zeros_like()?;
+                parts.resize(width, spare);
+                inputs.push(Tensor::stack(&parts, 0)?);
+            }
+        }
+        let tensor_bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let retained = 2 * inputs.iter().map(tensor_bytes).sum::<u64>()
+            + (width * self.config.unpadded_vocab * 4) as u64;
+        let main_decodes = routes.iter().filter(|(windowed, _)| !windowed).count() as u64;
+        let windowed_decodes = routes.len() as u64 - main_decodes;
+
+        let mut outputs = None;
+        let mut windowed_completions = None;
+        let run = |main_layers: &crate::backends::kv::GraphKvLayers,
+                   windowed_layers: Option<&crate::backends::kv::GraphKvLayers>|
+         -> Result<Vec<Tensor>> {
+            let key = GraphKey {
+                width,
+                main: CacheKey {
+                    arena: main.arena.id(),
+                    generation: main_layers.generation,
+                    max_blocks: main.layout.max_blocks,
+                },
+                windowed: windowed
+                    .as_ref()
+                    .zip(windowed_layers)
+                    .map(|(side, layers)| CacheKey {
+                        arena: side.arena.id(),
+                        generation: layers.generation,
+                        max_blocks: side.layout.max_blocks,
+                    }),
+            };
+            let body = |inputs: &[Tensor]| -> Result<Vec<Tensor>> {
+                let main_cache = graph_cache(&main, main_layers, &inputs[2], width)?;
+                let windowed_cache = match (&windowed, windowed_layers) {
+                    (Some(side), Some(layers)) => {
+                        Some(graph_cache(side, layers, &inputs[3], width)?)
+                    }
+                    _ => None,
+                };
+                let mut conv = Inkling2ConvState {
+                    histories: inputs[fixed..]
+                        .chunks(CONV_STATES_PER_APPLICATION)
+                        .map(|chunk| {
+                            Inkling2ConvHistory::from_tensors([
+                                chunk[0].clone(),
+                                chunk[1].clone(),
+                                chunk[2].clone(),
+                                chunk[3].clone(),
+                            ])
+                        })
+                        .collect(),
+                };
+                let mut context = GraphRowsContext {
+                    main: main_cache,
+                    windowed: windowed_cache,
+                    routes: &routes,
+                };
+                let embeddings = self.trunk.embed_ids(&inputs[0])?;
+                let hidden = self.trunk.forward_rows_on_device(
+                    &embeddings,
+                    &inputs[1],
+                    &mut conv,
+                    &mut context,
+                )?;
+                let mut out = vec![self.trunk.logits(&hidden)?];
+                for history in &conv.histories {
+                    out.extend(history.tensors().into_iter().cloned());
+                }
+                Ok(out)
+            };
+            graph.run(key, retained, &inputs, &body)
+        };
+        let main_completions = main.arena.with_graph_writes(
+            &main.bindings,
+            main.slots.as_ref(),
+            main_decodes,
+            &mut |main_layers| {
+                match &windowed {
+                    Some(side) => {
+                        let completions = side.arena.with_graph_writes(
+                            &side.bindings,
+                            side.slots.as_ref(),
+                            windowed_decodes,
+                            &mut |windowed_layers| {
+                                outputs = Some(run(main_layers, Some(windowed_layers))?);
+                                Ok(())
+                            },
+                        )?;
+                        windowed_completions = Some(completions);
+                    }
+                    None => outputs = Some(run(main_layers, None)?),
+                }
+                Ok(())
+            },
+        )?;
+        let outputs = outputs.ok_or_else(|| chat_error("a graphed step returned nothing"))?;
+        let logits = outputs[0].narrow(0, 0, rows)?;
+        graph.record_step(rows, width);
+
+        if graph.needs_check(width) {
+            // The standard batched decode of the same rows writes the same
+            // keys and values and commits them; the graph's writes are left
+            // uncommitted.
+            self.forward_rows(states)?;
+            let reference = Tensor::stack(
+                &states
+                    .iter()
+                    .map(|state| {
+                        state
+                            .unconsumed_logits
+                            .clone()
+                            .ok_or_else(|| chat_error("the reference step left no logits"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                0,
+            )?;
+            match crate::kernels::cuda::decode_step::logits_agree(&logits, &reference) {
+                Ok(_) => graph.mark_checked(width),
+                Err(reason) => {
+                    graph.disable(format!("a {rows}-row step (width {width}): {reason}"))
+                }
+            }
+            return Ok(());
+        }
+
+        let seal = |side: &Side,
+                    completions: Vec<crate::backends::kv::KvWriteCompletion>|
+         -> Result<std::sync::Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+            let mut collector = crate::backends::kv::KvWriteCompletionCollector::new(
+                side.arena.config(),
+                side.slots.logical_slots(),
+            )?;
+            for completion in completions {
+                collector.collect(completion)?;
+            }
+            Ok(std::sync::Arc::new(collector.seal()?))
+        };
+        let main_sealed = seal(&main, main_completions)?;
+        let windowed_sealed = match (&windowed, windowed_completions) {
+            (Some(side), Some(completions)) => Some(seal(side, completions)?),
+            _ => None,
+        };
+        for (row, state) in states.iter_mut().enumerate() {
+            let position = state.position;
+            state.physical_kv.commit_shared(
+                position,
+                main_sealed.clone(),
+                windowed_sealed.clone(),
+            )?;
+            let histories = (0..applications)
+                .map(|application| {
+                    let at = 1 + application * CONV_STATES_PER_APPLICATION;
+                    let take = |slot: usize| -> Result<Tensor> {
+                        Ok(outputs[at + slot].get(row)?.copy()?)
+                    };
+                    Ok(Inkling2ConvHistory::from_tensors([
+                        take(0)?,
+                        take(1)?,
+                        take(2)?,
+                        take(3)?,
+                    ]))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            state.conv.advance(Inkling2ConvState { histories }, 1);
+            state.unconsumed_logits = Some(logits.get(row)?);
+            state.pending_token = None;
+            state.position += 1;
+        }
+        Ok(())
+    }
+
     /// Whether a continuous batch runs its rows in one pass. That needs the
     /// fused attention kernel (the composed form attends one sequence at a
     /// time); where the decode step's CUDA graphs run, rows run one after
     /// another so that each replays them.
     pub(crate) fn batches_rows(&self) -> bool {
-        self.fused_attention.is_ok() && self.graphs.is_err()
+        self.fused_attention.is_ok() && (self.graphs.is_err() || self.step_graph().is_some())
+    }
+
+    /// Runs the decode step's body eagerly through the step graphs' path
+    /// (step buffers, device-slot writes, the fused kernel reading its tables
+    /// from the buffer), for a test off CUDA.
+    #[cfg(test)]
+    pub(crate) fn with_eager_step_graph_for_test(mut self) -> Self {
+        self.step_graph = Ok(Inkling2StepGraph::eager());
+        self
     }
 
     /// Runs every row's pending token through the trunk in one pass and
@@ -1995,6 +2344,15 @@ impl Inkling2ChatModel {
             return Err(Error::InvalidInput(
                 "Inkling 2 continuous batch contains a non-decodable state".into(),
             ));
+        }
+        if let Some(graph) = self.step_graph() {
+            if states.len() <= 64 {
+                self.graphed_rows(graph, states)?;
+                return states
+                    .iter_mut()
+                    .map(|state| self.sample_step(state, 1))
+                    .collect();
+            }
         }
         if states.len() > 1 && self.batches_rows() {
             self.forward_rows(states)?;

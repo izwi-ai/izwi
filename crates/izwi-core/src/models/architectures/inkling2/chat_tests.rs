@@ -1323,3 +1323,68 @@ fn speculative_rounds_emit_what_single_steps_emit_on_metal() {
     }
     assert_eq!(state.generated_ids_for_test(), want);
 }
+
+/// The whole-step graphs' body, run eagerly on Metal through the same step
+/// buffers, device-slot writes and fused attention over the buffers' tables:
+/// rows decode the tokens the standard batched decode gives, after each
+/// width's first step is checked against it.
+#[cfg(feature = "metal")]
+#[test]
+fn graphed_steps_decode_what_the_standard_batch_decodes_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "graphed_steps_decode_what_the_standard_batch_decodes_on_metal",
+    ) else {
+        return;
+    };
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    let golden = golden();
+    let config = ChatGenerationConfig::default();
+    let prompts = [
+        &golden.tokens[..14],
+        &golden.tokens[3..20],
+        &golden.tokens[..33],
+    ];
+    let decode = |model: &Inkling2ChatModel| {
+        let mut pool = caches_on(model, &device, DType::F16, 3).into_iter();
+        let mut states = prompts
+            .iter()
+            .map(|prompt| {
+                let mut state = model
+                    .start_decode_managed(prompt, 10, &config, pool.next().unwrap())
+                    .unwrap();
+                // The first token comes from the prefill logits.
+                model.decode_step(&mut state).unwrap();
+                state
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..8 {
+            let mut rows = states
+                .iter_mut()
+                .filter(|state| !state.finished_for_test())
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                break;
+            }
+            model.decode_step_batch(&mut rows).unwrap();
+        }
+        states
+            .iter()
+            .map(|state| state.generated_ids_for_test().to_vec())
+            .collect::<Vec<_>>()
+    };
+    let standard = tiny_model_on(profile.clone()).without_turn_end_for_test();
+    let want = decode(&standard);
+    let graphed = tiny_model_on(profile)
+        .without_turn_end_for_test()
+        .with_eager_step_graph_for_test();
+    let got = decode(&graphed);
+    assert_eq!(got, want);
+    let diagnostics = graphed.runtime_diagnostics();
+    let steps = diagnostics["step_graphs"]["graphed_steps"]
+        .as_u64()
+        .unwrap();
+    let checks = diagnostics["step_graphs"]["warm_checks"].as_u64().unwrap();
+    assert!(diagnostics["step_graphs"]["off"].is_null(), "{diagnostics}");
+    assert!(steps > checks, "{steps} graphed steps, {checks} checks");
+}

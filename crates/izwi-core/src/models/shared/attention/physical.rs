@@ -637,6 +637,11 @@ impl PhysicalPagedKvCache {
         })
     }
 
+    /// Layers this cache binds.
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layer_bindings.len()
+    }
+
     pub(crate) fn layer_binding(&self, layer_idx: usize) -> Result<KvLayerBinding> {
         self.layer_bindings.get(layer_idx).copied().ok_or_else(|| {
             Error::InvalidInput(format!(

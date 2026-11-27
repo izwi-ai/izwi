@@ -1122,6 +1122,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Selects where Inkling 2's packed experts run: auto (on the device on CUDA once the load-time check against the host path passes, on the host elsewhere), host, or device (also on Metal, with the same check).",
     ),
     CoreEnvVar::new(
+        "IZWI_INKLING2_STEP_GRAPHS",
+        Choice,
+        "off",
+        Load,
+        "Asks for whole-step CUDA graphs of Inkling 2's decode steps (one token per row, up to 64 rows, the experts on the device, the fused attention, no drafter): on or off. Each width's first step is checked against the standard batched decode; a failure turns them off.",
+    ),
+    CoreEnvVar::new(
         "IZWI_KEEP_NEMO_ARCHIVES",
         Flag,
         "false",

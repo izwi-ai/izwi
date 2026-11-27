@@ -403,6 +403,35 @@ impl Inkling2Caches {
         }
     }
 
+    /// Per layer application: whether it lives in the windowed cache, and at
+    /// which of its cache's layers.
+    pub(crate) fn application_routes(&self, config: &Inkling2Config) -> Vec<(bool, usize)> {
+        self.routes(config)
+            .into_iter()
+            .map(|route| (route.windowed, route.ordinal))
+            .collect()
+    }
+
+    /// Commits one token at `position` whose writes a graphed step made and
+    /// the sealed completions vouch for.
+    pub(crate) fn commit_shared(
+        &mut self,
+        position: usize,
+        main: std::sync::Arc<crate::backends::kv::KvWriteBatchCompletion>,
+        windowed: Option<std::sync::Arc<crate::backends::kv::KvWriteBatchCompletion>>,
+    ) -> Result<()> {
+        self.main.commit_shared_completion(position, 1, main)?;
+        match (&mut self.windowed, windowed) {
+            (Some(cache), Some(completion)) => {
+                cache.commit_shared_completion(position, 1, completion)
+            }
+            (None, None) => Ok(()),
+            _ => Err(state_error(
+                "a graphed step's completions do not match the caches",
+            )),
+        }
+    }
+
     /// The main cache's layer that holds drafter layer `layer`: after every
     /// layer application the main cache holds.
     pub(crate) fn drafter_ordinal(&self, config: &Inkling2Config, layer: usize) -> usize {

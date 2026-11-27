@@ -27,6 +27,7 @@
 pub mod chat;
 pub mod checkpoint;
 pub mod config;
+pub mod decode_graph;
 pub mod drafter;
 pub mod experts;
 pub mod memory;

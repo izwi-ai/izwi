@@ -139,9 +139,30 @@ The served path is the composed trunk on every backend:
 - rows of a continuous batch run in one pass where the fused attention
   kernel serves them (see Batched decode rows), else one after another.
 
-Not implemented yet: whole-step CUDA graphs (the attention core now runs in
-a fused kernel, but a step still uploads per-step positions and builds its
-key/value slot maps on the host), and fused convolution kernels.
+Not implemented yet: fused convolution kernels.
+
+## Whole-step CUDA graphs
+
+`decode_graph.rs` captures a whole decode step (one token of each of up to
+64 rows, from the token embeddings to the logits) per padded width and
+replays it, when `IZWI_INKLING2_STEP_GRAPHS=on` on CUDA with the experts on
+the device, the fused attention, and no drafter. The body is the batched
+decode with every per-step value on the device: per cache a U32 step buffer
+holds each row's flat key/value slot and the block table the fused kernel
+reads; keys and values are written by device slot; the token ids, the log
+scale of the rows' positions and every application's convolution histories
+(stacked over the rows) are inputs, the next histories outputs beside the
+logits. Each width's first step is checked against the standard batched
+decode (`decode_step::logits_agree`), and the shared graph cache checks a
+capture bit for bit against the eager body on its first two steps; any
+failure turns the graphs off for the process. Where they run, a step
+replaces the one-row stretch graphs.
+
+They are a request, off by default, because nothing has run on a GPU: the
+CUDA build is type-checked, and the same body run eagerly on Metal (no
+capture) decodes the tokens the standard batched decode gives
+(`graphed_steps_decode_what_the_standard_batch_decodes_on_metal`). Load
+admission prices their device memory (640 MiB) when asked for.
 
 ## Attention core
 

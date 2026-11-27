@@ -471,6 +471,9 @@ enum Attention<'a> {
     },
     Rows {
         positions: &'a [usize],
+        /// The rows' log scale (`[rows, 1, 1]`) when the caller has it on
+        /// the device already (a graphed step); else made from `positions`.
+        log_scale: Option<&'a Tensor>,
         context: &'a mut dyn Inkling2RowsContext,
     },
 }
@@ -481,6 +484,17 @@ impl Attention<'_> {
         match self {
             Self::Span { first, .. } => (*first..*first + seq).collect(),
             Self::Rows { positions, .. } => positions.to_vec(),
+        }
+    }
+
+    /// The rows' log scale when given as a tensor.
+    fn given_log_scale(&self) -> Option<Tensor> {
+        match self {
+            Self::Rows {
+                log_scale: Some(log_scale),
+                ..
+            } => Some((*log_scale).clone()),
+            _ => None,
         }
     }
 }
@@ -976,6 +990,49 @@ impl Inkling2Trunk {
             })
             .collect::<Vec<_>>();
         Ok(Tensor::from_vec(values, (seq, 1, 1), &self.device)?)
+    }
+
+    /// The log scale of a step's rows at `positions`, `[rows, 1, 1]`, for a
+    /// graphed step to take as an input.
+    pub fn log_scale_of(&self, positions: &[usize]) -> Result<Tensor> {
+        self.log_scale(positions)
+    }
+
+    /// [`Self::embed`] of token ids already on the device (`[rows]` U32),
+    /// without reading them back: the caller checks they are in the
+    /// vocabulary.
+    pub fn embed_ids(&self, ids: &Tensor) -> Result<Tensor> {
+        rms_norm(
+            &self.embedding.index_select(ids, 0)?.to_dtype(DType::F32)?,
+            &self.embedding_norm,
+            self.config.rms_norm_eps,
+        )
+    }
+
+    /// The body of a graphed decode step: one token per row through the
+    /// trunk with every per-step value already on the device. `stacked`
+    /// holds each application's histories stacked over the rows (`[rows,
+    /// kernel - 1, channels]`) and is advanced in place; `log_scale` is
+    /// [`Self::log_scale_of`] the rows' positions. Nothing is read back.
+    pub fn forward_rows_on_device(
+        &self,
+        embeddings: &Tensor,
+        log_scale: &Tensor,
+        stacked: &mut Inkling2ConvState,
+        context: &mut dyn Inkling2RowsContext,
+    ) -> Result<Tensor> {
+        self.forward_pass(
+            embeddings,
+            Attention::Rows {
+                positions: &[],
+                log_scale: Some(log_scale),
+                context,
+            },
+            stacked,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Embeddings of `tokens`, `[seq, hidden]`.
@@ -1539,7 +1596,11 @@ impl Inkling2Trunk {
         };
         let out = self.forward_pass(
             embeddings,
-            Attention::Rows { positions, context },
+            Attention::Rows {
+                positions,
+                log_scale: None,
+                context,
+            },
             &mut stacked,
             None,
             None,
@@ -1584,7 +1645,10 @@ impl Inkling2Trunk {
         let mut hidden = embeddings.clone();
         let mut block_states: Vec<Tensor> = Vec::new();
         let mut index = 0usize;
-        let log_scale = self.log_scale(&attention.positions(seq))?;
+        let log_scale = match attention.given_log_scale() {
+            Some(log_scale) => log_scale,
+            None => self.log_scale(&attention.positions(seq))?,
+        };
         let tap_ids = record
             .as_deref()
             .map(|record| record.tap_ids.clone())
