@@ -34,6 +34,7 @@ pub mod quant;
 pub mod reply;
 pub(crate) mod state;
 pub mod trunk;
+pub mod vision;
 
 #[cfg(test)]
 mod chat_tests;
@@ -41,6 +42,8 @@ mod chat_tests;
 pub(crate) mod synthetic;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vision_tests;
 
 pub use chat::{
     ChatDecodeState as Inkling2ChatDecodeState, ChatDecodeStep as Inkling2ChatDecodeStep,

@@ -754,6 +754,53 @@ impl Inkling2Trunk {
         )
     }
 
+    /// [`Self::embed`] with the embeddings of the `image_token` positions
+    /// replaced by image features, as the reference does: the features go in
+    /// after the embedding norm, unnormalised. `features` is `[slots,
+    /// hidden]` for every image token of the whole prompt in order, and
+    /// `used` of them belong to tokens before this span.
+    pub fn embed_with_images(
+        &self,
+        tokens: &[u32],
+        image_token: u32,
+        features: &Tensor,
+        used: usize,
+    ) -> Result<Tensor> {
+        let embedded = self.embed(tokens)?;
+        let slots = tokens.iter().filter(|token| **token == image_token).count();
+        if slots == 0 {
+            return Ok(embedded);
+        }
+        let (available, width) = features.dims2()?;
+        if width != self.config.hidden || used + slots > available {
+            return Err(trunk_error(format!(
+                "image tokens {used}..{} need features of width {}, got {available} of width {width}",
+                used + slots,
+                self.config.hidden
+            )));
+        }
+        let features = features
+            .to_device(&self.device)?
+            .to_dtype(embedded.dtype())?;
+        let mut parts = Vec::new();
+        let (mut at, mut next) = (0, used);
+        while at < tokens.len() {
+            let image = tokens[at] == image_token;
+            let run = tokens[at..]
+                .iter()
+                .take_while(|token| (**token == image_token) == image)
+                .count();
+            if image {
+                parts.push(features.narrow(0, next, run)?);
+                next += run;
+            } else {
+                parts.push(embedded.narrow(0, at, run)?);
+            }
+            at += run;
+        }
+        Ok(Tensor::cat(&parts, 0)?)
+    }
+
     /// The pure stage before a layer application's attention core: the
     /// depth-residual read, the message gates, the input norms, the query,
     /// key and value projections with their convolutions and norms, the

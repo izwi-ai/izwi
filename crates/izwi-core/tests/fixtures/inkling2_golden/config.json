@@ -5,6 +5,7 @@
   ],
   "model_type": "inkling2_loop",
   "eos_token_id": 149,
+  "image_token_id": 140,
   "text_config": {
     "model_type": "inkling2_loop_text",
     "model_max_length": 4096,
@@ -66,6 +67,21 @@
       "gate_rank": 8,
       "is_varloop": false
     }
+  },
+  "vision_config": {
+    "model_type": "inkling2_vision",
+    "text_hidden_size": 64,
+    "temporal_patch_size": 2,
+    "native_patch_size": 2,
+    "adapter_merge_size": 2,
+    "projection_hidden_dim": 48,
+    "projector_bias": false,
+    "hidden_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "mlp_ratio": 2.0,
+    "posemb_grid_size": 4,
+    "layer_norm_eps": 1e-05
   },
   "quantization_config": {
     "quant_method": "modelopt",

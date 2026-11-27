@@ -91,12 +91,36 @@ TEXT_CONFIG = {
     "use_gate_bias": True,
     "loop_config": {"core_start": 2, "core_end": 6, "num_passes": 3, "gate_rank": 8, "is_varloop": False},
 }
+# A tiny vision tower: 2-pixel patches merged 2 x 2 (one image token per 4 x 4
+# pixels), a 4 x 4 position grid, two layers.
+VISION_CONFIG = {
+    "model_type": "inkling2_vision",
+    "text_hidden_size": 64,
+    "temporal_patch_size": 2,
+    "native_patch_size": 2,
+    "adapter_merge_size": 2,
+    "projection_hidden_dim": 48,
+    "projector_bias": False,
+    "hidden_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "mlp_ratio": 2.0,
+    "posemb_grid_size": 4,
+    "layer_norm_eps": 1e-05,
+}
+VISION_ROPE_THETA = 10000.0  # transformers' default; the published config does not set it
+IMAGE_TOKEN_ID = 140
+# (height, width, channels) of the fixture's images: one with transparency whose
+# sides are not multiples of the cell, one opaque single cell.
+IMAGES = [(7, 10, 4), (4, 4, 3)]
 CONFIG = {
     "dtype": "bfloat16",
     "architectures": ["Inkling2LoopForConditionalGeneration"],
     "model_type": "inkling2_loop",
     "eos_token_id": 149,
+    "image_token_id": IMAGE_TOKEN_ID,
     "text_config": TEXT_CONFIG,
+    "vision_config": VISION_CONFIG,
     "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
 }
 # Layers whose experts are stored as MXFP8; the rest are NVFP4 (as published:
@@ -386,9 +410,13 @@ class Reference:
         self.trace[f"{tag}.out"] = out
         return out
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, image_features: torch.Tensor | None = None) -> torch.Tensor:
         positions = torch.arange(tokens.shape[0])
         hidden = rms_norm(self.p("model.llm.embed.weight")[tokens], self.p("model.llm.embed_norm.weight"), self.eps)
+        if image_features is not None:
+            # `Inkling2LoopModel.forward`: image features replace the normed embeddings of the image tokens.
+            hidden = hidden.clone()
+            hidden[tokens == IMAGE_TOKEN_ID] = image_features.to(hidden.dtype)
         self.trace["embed"] = hidden
         block_states: list[torch.Tensor] = []
 
@@ -430,6 +458,177 @@ class Reference:
         self.trace["final_hidden"] = hidden
         unembed = self.p("model.llm.unembed.weight")[: self.c["unpadded_vocab_size"]]
         return softcap(hidden @ unembed.T, self.c["final_logit_softcapping"])
+
+
+# --- vision (transcribed from `Inkling2VisionModel` and `Inkling2ImageProcessor`) ---
+
+
+def preprocess_image(image: torch.Tensor, cell: int) -> tuple[torch.Tensor, int, int]:
+    """`[height, width, 3 or 4]` U8 -> (`[rows * cols, cell, cell, 3]` in [-1, 1], rows, cols).
+
+    Transparency is composited over a checkerboard of 8-pixel squares, the
+    image is padded on the bottom and right to whole cells with -1 on the
+    0-255 scale, and there is no resize: one image token per cell.
+    """
+    height, width, channels = image.shape
+    pixels = image.to(torch.int32)
+    if channels == 4:
+        rows = torch.arange(height)[:, None] // 8
+        columns = torch.arange(width)[None, :] // 8
+        background = torch.where((rows + columns) % 2 == 0, 204, 153)[..., None]
+        alpha = pixels[..., 3:4]
+        pixels = (pixels[..., :3] * alpha + background * (255 - alpha) + 127) // 255
+    rows, columns = math.ceil(height / cell), math.ceil(width / cell)
+    padded = torch.full((rows * cell, columns * cell, 3), -1.0)
+    padded[:height, :width] = pixels.float()
+    padded = (padded * (1.0 / 255.0) - 0.5) / 0.5
+    cells = padded.reshape(rows, cell, columns, cell, 3).permute(0, 2, 1, 3, 4)
+    return cells.reshape(rows * columns, cell, cell, 3), rows, columns
+
+
+def layer_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float) -> torch.Tensor:
+    return F.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+
+
+def vision_forward(w: dict[str, torch.Tensor], pixels: torch.Tensor, rows: int, columns: int) -> torch.Tensor:
+    """One image's `[rows * columns, text_hidden]` features from its `[cells, cell, cell, 3]` pixels."""
+    v, prefix = VISION_CONFIG, "model.visual."
+    backbone = prefix + "backbone."
+    merge, patch, hidden, heads = v["adapter_merge_size"], v["native_patch_size"], v["hidden_size"], v["num_attention_heads"]
+    side, eps = v["posemb_grid_size"], v["layer_norm_eps"]
+    dtype = w[backbone + "ln_pre.weight"].dtype
+    pixels = pixels.to(dtype)
+
+    # Patches in block-major order: a cell's merge x merge patches are adjacent.
+    patches = pixels.reshape(-1, merge, patch, merge, patch, 3).transpose(2, 3).reshape(-1, patch * patch * 3)
+    states = patches @ w[backbone + "embeddings.patch_embedding.weight"].T
+    grid_rows, grid_columns = torch.meshgrid(
+        torch.arange(rows * merge), torch.arange(columns * merge), indexing="ij"
+    )
+    order = (rows, merge, columns, merge)
+    row = grid_rows.reshape(order).transpose(1, 2).flatten()
+    column = grid_columns.reshape(order).transpose(1, 2).flatten()
+
+    # The learned side x side position grid, resampled bilinearly (half-pixel centres, edges clamped).
+    def taps(index: torch.Tensor, size: int):
+        source = (index.to(dtype) + 0.5) * side / size - 0.5
+        floor = torch.floor(source)
+        at = torch.stack([floor.long(), floor.long() + 1], dim=1).clamp(0, side - 1)
+        distance = (source[:, None] - floor[:, None] - torch.arange(2)).abs()
+        return at, (1 - distance).clamp(min=0)
+
+    row_taps, row_weights = taps(row, rows * merge)
+    column_taps, column_weights = taps(column, columns * merge)
+    indices = (row_taps[:, :, None] * side + column_taps[:, None, :]).reshape(-1, 4)
+    weights = (row_weights[:, :, None] * column_weights[:, None, :]).reshape(-1, 4)
+    table = w[backbone + "embeddings.position_embedding"]
+    states = states + (table[indices] * weights[:, :, None]).sum(1)
+
+    # A class token leads the image; it sits at (0, 0) and the patches are 1-indexed.
+    cls = w[backbone + "embeddings.class_embedding"] + w[backbone + "embeddings.cls_position_embedding"]
+    states = torch.cat([cls[None], states])
+    states = layer_norm(states, w[backbone + "ln_pre.weight"], w[backbone + "ln_pre.bias"], eps)
+    row = torch.cat([torch.zeros(1, dtype=torch.long), row + 1])
+    column = torch.cat([torch.zeros(1, dtype=torch.long), column + 1])
+
+    head_dim = hidden // heads
+    spatial = head_dim // 2
+    # The frequencies are an F32 table whatever the model's dtype (a buffer built at construction).
+    inv_freq = torch.tensor(
+        [np.float32(1.0) / np.float32(VISION_ROPE_THETA) ** (np.float32(i) / np.float32(spatial)) for i in range(0, spatial, 2)],
+        dtype=dtype,
+    )
+    # Width angles then height angles, each repeated for an interleaved channel pair.
+    angles = torch.cat([column[:, None].to(dtype) * inv_freq, row[:, None].to(dtype) * inv_freq], dim=-1)
+    cos = angles.cos().repeat_interleave(2, dim=-1)[:, None]
+    sin = angles.sin().repeat_interleave(2, dim=-1)[:, None]
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        pairs = x.view(*x.shape[:-1], -1, 2)
+        turned = torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).flatten(start_dim=-2)
+        return x * cos + turned * sin
+
+    count = states.shape[0]
+    for layer in range(v["num_hidden_layers"]):
+        lp = f"{backbone}layers.{layer}."
+
+        def linear(x: torch.Tensor, name: str) -> torch.Tensor:
+            return x @ w[lp + name + ".weight"].T + w[lp + name + ".bias"]
+
+        x = layer_norm(states, w[lp + "ln_1.weight"], w[lp + "ln_1.bias"], eps)
+        q = rotate(linear(x, "self_attn.q_proj").view(count, heads, head_dim)).transpose(0, 1)
+        k = rotate(linear(x, "self_attn.k_proj").view(count, heads, head_dim)).transpose(0, 1)
+        value = linear(x, "self_attn.v_proj").view(count, heads, head_dim).transpose(0, 1)
+        attention = torch.softmax(q @ k.transpose(-1, -2) * head_dim**-0.5, dim=-1) @ value
+        x = linear(attention.transpose(0, 1).reshape(count, hidden), "self_attn.out_proj")
+        states = states + w[lp + "ls_1.gamma"] * x
+        x = layer_norm(states, w[lp + "ln_2.weight"], w[lp + "ln_2.bias"], eps)
+        x = linear(F.gelu(linear(x, "mlp.c_fc")), "mlp.c_proj")
+        states = states + w[lp + "ls_2.gamma"] * x
+
+    merged = states[1:].reshape(-1, merge * merge * hidden)
+    return F.gelu(merged @ w[prefix + "proj_in.weight"].T) @ w[prefix + "proj_out.weight"].T
+
+
+def build_vision(stored: dict, reference: dict) -> None:
+    """Adds a random vision tower under its published names, from its own generator."""
+    v, backbone = VISION_CONFIG, "model.visual.backbone."
+    generator = torch.Generator().manual_seed(SEED + 1)
+    hidden, width = v["hidden_size"], int(v["hidden_size"] * v["mlp_ratio"])
+    merged = v["adapter_merge_size"] ** 2 * hidden
+
+    def randn(*shape, scale=1.0):
+        return torch.randn(*shape, generator=generator) * scale
+
+    def dense(name: str, tensor: torch.Tensor):
+        value = bf16(tensor)
+        stored[name] = ("BF16", value)
+        reference[name] = value
+
+    dense(backbone + "embeddings.class_embedding", randn(hidden))
+    dense(backbone + "embeddings.cls_position_embedding", randn(hidden))
+    dense(backbone + "embeddings.patch_embedding.weight", randn(hidden, 3 * v["native_patch_size"] ** 2, scale=0.5))
+    dense(backbone + "embeddings.position_embedding", randn(v["posemb_grid_size"] ** 2, hidden))
+    dense(backbone + "ln_pre.weight", 1.0 + randn(hidden, scale=0.2))
+    dense(backbone + "ln_pre.bias", randn(hidden, scale=0.2))
+    for layer in range(v["num_hidden_layers"]):
+        lp = f"{backbone}layers.{layer}."
+        for norm in ("ln_1", "ln_2"):
+            dense(lp + norm + ".weight", 1.0 + randn(hidden, scale=0.2))
+            dense(lp + norm + ".bias", randn(hidden, scale=0.2))
+        for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
+            dense(lp + f"self_attn.{name}.weight", randn(hidden, hidden, scale=hidden**-0.5))
+            dense(lp + f"self_attn.{name}.bias", randn(hidden, scale=0.2))
+        dense(lp + "mlp.c_fc.weight", randn(width, hidden, scale=hidden**-0.5))
+        dense(lp + "mlp.c_fc.bias", randn(width, scale=0.2))
+        dense(lp + "mlp.c_proj.weight", randn(hidden, width, scale=width**-0.5))
+        dense(lp + "mlp.c_proj.bias", randn(hidden, scale=0.2))
+        dense(lp + "ls_1.gamma", 0.5 + randn(hidden, scale=0.2))
+        dense(lp + "ls_2.gamma", 0.5 + randn(hidden, scale=0.2))
+    dense("model.visual.proj_in.weight", randn(v["projection_hidden_dim"], merged, scale=merged**-0.5))
+    dense(
+        "model.visual.proj_out.weight",
+        randn(v["text_hidden_size"], v["projection_hidden_dim"], scale=v["projection_hidden_dim"] ** -0.5),
+    )
+
+
+def build_images(reference: dict):
+    """The fixture's images, their processed pixels and features, and a prompt that carries them."""
+    generator = torch.Generator().manual_seed(SEED + 2)
+    cell = VISION_CONFIG["native_patch_size"] * VISION_CONFIG["adapter_merge_size"]
+    images = []
+    for height, width, channels in IMAGES:
+        image = torch.randint(0, 256, (height, width, channels), generator=generator, dtype=torch.uint8)
+        pixels, rows, columns = preprocess_image(image, cell)
+        images.append({"image": image, "pixels": pixels, "grid": (rows, columns)})
+    with torch.no_grad():
+        for entry in images:
+            entry["features"] = vision_forward(reference, entry["pixels"], *entry["grid"])
+    # Text, the first image, text, the second image, text.
+    text = lambda count: torch.randint(0, IMAGE_TOKEN_ID, (count,), generator=generator)
+    slots = [torch.full((entry["features"].shape[0],), IMAGE_TOKEN_ID) for entry in images]
+    tokens = torch.cat([text(5), slots[0], text(3), slots[1], text(6)])
+    return images, tokens
 
 
 # --- checkpoint construction ---
@@ -557,17 +756,44 @@ def write_safetensors(path: Path, tensors: dict[str, tuple[str, torch.Tensor]]) 
     path.write_bytes(struct.pack("<Q", len(head)) + head + b"".join(blobs))
 
 
+class widened:
+    """Runs transformers' explicit F32 steps in F64 while it is entered.
+
+    Its grouped matrix product refuses F64, so the same product is done group
+    by group.
+    """
+
+    def __enter__(self):
+        import transformers.integrations.moe as moe
+
+        def grouped_mm(input, weight, offs):
+            rows, start = [], 0
+            for group, end in enumerate(offs.tolist()):
+                rows.append(input[start:end].to(weight.dtype) @ weight[group])
+                start = end
+            return torch.cat(rows, 0)
+
+        self.moe = moe
+        self.saved = (torch.float32, torch.float, torch.Tensor.float, moe._grouped_mm)
+        torch.float32 = torch.float = torch.float64
+        torch.Tensor.float, moe._grouped_mm = torch.Tensor.double, grouped_mm
+
+    def __exit__(self, *_):
+        torch.float32, torch.float, torch.Tensor.float, self.moe._grouped_mm = self.saved
+
+
+def double(weights: dict) -> dict:
+    return {name: value.double() if value.is_floating_point() else value for name, value in weights.items()}
+
+
 def check_with_transformers(out: Path, tokens: torch.Tensor, logits: torch.Tensor, reference: dict) -> None:
-    """Compare the transcription with transformers on the written checkpoint.
+    """Compare the text transcription with transformers on the written checkpoint.
 
     In F32 the two differ by rounding alone, and the tiny random model
     amplifies it (activations near 500, sixteen layer applications): about
     2e-3 on the logits. So the deciding comparison runs both in F64, where a
-    transcription error cannot hide: transformers' explicit F32 steps are
-    widened for the duration of the run, and its grouped matrix product, which
-    refuses F64, is replaced by the same product group by group.
+    transcription error cannot hide.
     """
-    import transformers.integrations.moe as moe
     from transformers import Inkling2LoopForCausalLM  # needs the release that carries inkling2_loop
 
     model = Inkling2LoopForCausalLM.from_pretrained(out, dtype=torch.float32).eval()
@@ -576,44 +802,72 @@ def check_with_transformers(out: Path, tokens: torch.Tensor, logits: torch.Tenso
     single = (theirs - logits).abs().max().item()
     print(f"transformers F32 max |logit difference|: {single:.3e}")
 
-    def grouped_mm(input, weight, offs):
-        rows, start = [], 0
-        for group, end in enumerate(offs.tolist()):
-            rows.append(input[start:end].to(weight.dtype) @ weight[group])
-            start = end
-        return torch.cat(rows, 0)
-
     states = []
     hooks = [
         layer.register_forward_hook(lambda _module, _inputs, output: states.append(output))
         for layer in model.model.layers
     ]
-    saved = (torch.float32, torch.Tensor.float, moe._grouped_mm)
-    torch.float32, torch.Tensor.float, moe._grouped_mm = torch.float64, torch.Tensor.double, grouped_mm
-    try:
-        with torch.no_grad():
-            wide = model.double()(input_ids=tokens[None]).logits[0]
-            ours = Reference(
-                TEXT_CONFIG,
-                {name: value.double() if value.is_floating_point() else value for name, value in reference.items()},
-            )
-            ours_logits = ours.forward(tokens)
-    finally:
-        torch.float32, torch.Tensor.float, moe._grouped_mm = saved
-        for hook in hooks:
-            hook.remove()
+    with widened(), torch.no_grad():
+        wide = model.double()(input_ids=tokens[None]).logits[0]
+        ours = Reference(TEXT_CONFIG, double(reference))
+        ours_logits = ours.forward(tokens)
+    for hook in hooks:
+        hook.remove()
     if wide.dtype != torch.float64 or ours_logits.dtype != torch.float64:
         raise SystemExit("the F64 comparison did not run in F64")
-    double = (wide - ours_logits).abs().max().item()
+    exact = (wide - ours_logits).abs().max().item()
     layers = max(
         (state[0] - ours.trace[f"app.{index}.out"].reshape(state[0].shape)).abs().max().item()
         for index, state in enumerate(states)
     )
-    print(f"transformers F64 max |logit difference|: {double:.3e}, worst layer application: {layers:.3e}")
+    print(f"transformers F64 max |logit difference|: {exact:.3e}, worst layer application: {layers:.3e}")
     print(f"F32 against the F64 result: transformers {(theirs - wide).abs().max().item():.3e}, "
           f"transcription {(logits - wide).abs().max().item():.3e}")
-    if double > 1e-9 or layers > 1e-8 or single > 1e-2:
+    if exact > 1e-9 or layers > 1e-8 or single > 1e-2:
         raise SystemExit("the transcription disagrees with transformers")
+
+
+def check_images_with_transformers(out: Path, images: list, tokens, logits, reference: dict) -> None:
+    """The image processor, the vision tower and a prompt with images, against transformers."""
+    from PIL import Image
+    from transformers import Inkling2LoopForConditionalGeneration
+    from transformers.models.inkling2.image_processing_inkling2 import Inkling2ImageProcessor
+
+    cell = VISION_CONFIG["native_patch_size"] * VISION_CONFIG["adapter_merge_size"]
+    processor = Inkling2ImageProcessor(size={"height": cell, "width": cell})
+    pictures = [Image.fromarray(entry["image"].numpy()) for entry in images]
+    processed = processor(images=pictures, return_tensors="pt")
+    pixels = torch.cat([entry["pixels"] for entry in images])
+    grid = torch.tensor([[1, *entry["grid"]] for entry in images])
+    if not torch.equal(processed["image_grid_thw"], grid):
+        raise SystemExit("the image grids disagree with transformers")
+    pixel_error = (processed["pixel_values"] - pixels).abs().max().item()
+    print(f"image processor max |pixel difference|: {pixel_error:.3e}")
+
+    model = Inkling2LoopForConditionalGeneration.from_pretrained(out, dtype=torch.float32).eval()
+    features = torch.cat([entry["features"] for entry in images])
+    with torch.no_grad():
+        theirs = torch.cat(model.model.get_image_features(pixels, grid).pooler_output)
+        theirs_logits = model(input_ids=tokens[None], pixel_values=pixels, image_grid_thw=grid).logits[0]
+    feature_error = (theirs - features).abs().max().item()
+    single = (theirs_logits - logits).abs().max().item()
+    print(f"transformers F32 max |image feature difference|: {feature_error:.3e} "
+          f"(features up to {features.abs().max().item():.2f}), |logit difference| with images: {single:.3e}")
+
+    with widened(), torch.no_grad():
+        model = model.double()
+        wide = torch.cat(model.model.get_image_features(pixels.double(), grid).pooler_output)
+        wide_logits = model(input_ids=tokens[None], pixel_values=pixels.double(), image_grid_thw=grid).logits[0]
+        weights = double(reference)
+        ours = torch.cat([vision_forward(weights, e["pixels"].double(), *e["grid"]) for e in images])
+        ours_logits = Reference(TEXT_CONFIG, weights).forward(tokens, ours)
+    if wide.dtype != torch.float64 or ours.dtype != torch.float64 or ours_logits.dtype != torch.float64:
+        raise SystemExit("the F64 image comparison did not run in F64")
+    exact = (wide - ours).abs().max().item()
+    exact_logits = (wide_logits - ours_logits).abs().max().item()
+    print(f"transformers F64 max |image feature difference|: {exact:.3e}, |logit difference| with images: {exact_logits:.3e}")
+    if pixel_error > 1e-6 or exact > 1e-9 or exact_logits > 1e-9 or feature_error > 1e-3 or single > 1e-2:
+        raise SystemExit("the image transcription disagrees with transformers")
 
 
 def main() -> None:
@@ -622,6 +876,7 @@ def main() -> None:
     torch.manual_seed(SEED)
     generator = torch.Generator().manual_seed(SEED)
     stored, reference = build_checkpoint(generator)
+    build_vision(stored, reference)
 
     c = TEXT_CONFIG
     tokens = torch.randint(0, c["unpadded_vocab_size"] - 1, (TOTAL_TOKENS,), generator=generator)
@@ -650,10 +905,24 @@ def main() -> None:
     for key, value in model.trace.items():
         golden[f"trace.{key}"] = ("F32", value)
     write_safetensors(out / "golden.safetensors", golden)
-    print("wrote", out, "tensors:", len(stored), "trace:", len(model.trace))
+
+    images, image_tokens = build_images(reference)
+    with torch.no_grad():
+        image_logits = Reference(c, reference).forward(image_tokens, torch.cat([e["features"] for e in images]))
+    if not torch.isfinite(image_logits).all():
+        raise SystemExit("non-finite reference logits with images")
+    image_golden = {"tokens": ("I64", image_tokens), "logits": ("F32", image_logits)}
+    for index, entry in enumerate(images):
+        image_golden[f"image.{index}.rgba"] = ("U8", entry["image"])
+        image_golden[f"image.{index}.grid"] = ("I64", torch.tensor(entry["grid"]))
+        image_golden[f"image.{index}.pixels"] = ("F32", entry["pixels"])
+        image_golden[f"image.{index}.features"] = ("F32", entry["features"])
+    write_safetensors(out / "images.safetensors", image_golden)
+    print("wrote", out, "tensors:", len(stored), "trace:", len(model.trace), "images:", len(images))
 
     if "--check-transformers" in sys.argv:
         check_with_transformers(out, tokens, logits, reference)
+        check_images_with_transformers(out, images, image_tokens, image_logits, reference)
 
 
 if __name__ == "__main__":
