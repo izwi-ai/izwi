@@ -549,6 +549,150 @@ fn a_json_reply_is_one_object() {
     assert!(complete >= 2, "{complete} of 6 replies closed their object");
 }
 
+/// A prompt that attaches another's committed prefix (its pages, and the
+/// convolution ring's snapshot at that cursor) prefills and decodes exactly
+/// as a fresh run of the whole prompt does.
+#[test]
+fn an_attached_prefix_continues_exactly_as_a_fresh_run() {
+    let model = tiny_model().without_turn_end_for_test();
+    let rows = caches(&model, 3);
+    attached_prefix_matches_a_fresh_run(model, rows);
+}
+
+/// The same on the Metal device with F16 keys and values, as served.
+#[cfg(feature = "metal")]
+#[test]
+fn an_attached_prefix_continues_exactly_as_a_fresh_run_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "an_attached_prefix_continues_exactly_as_a_fresh_run_on_metal",
+    ) else {
+        return;
+    };
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let model = tiny_model_on(profile).without_turn_end_for_test();
+    let rows = caches_on(&model, &device, DType::F16, 3);
+    attached_prefix_matches_a_fresh_run(model, rows);
+}
+
+fn attached_prefix_matches_a_fresh_run(
+    mut model: Inkling2ChatModel,
+    rows: Vec<PhysicalPagedKvCache>,
+) {
+    let golden = golden();
+    model.set_prefix_caching(true);
+    let prompt = &golden.tokens[..38];
+    // Two whole pages of the test arena.
+    let boundary = 32;
+    let config = ChatGenerationConfig::default();
+    let mut rows = rows.into_iter();
+    let begin = |cache| {
+        model
+            .begin_resumable_prefill_managed(prompt, 8, &config, cache)
+            .unwrap()
+    };
+
+    let mut fresh = begin(rows.next().unwrap());
+    model
+        .continue_resumable_prefill(&mut fresh, prompt, 0, boundary)
+        .unwrap();
+    model
+        .continue_resumable_prefill(&mut fresh, prompt, boundary, prompt.len())
+        .unwrap();
+
+    let mut publisher = begin(rows.next().unwrap());
+    model
+        .continue_resumable_prefill(&mut publisher, prompt, 0, boundary)
+        .unwrap();
+    let ring = publisher.conv_for_test();
+    assert_eq!(ring.cursor(), boundary as u64);
+
+    // The publisher's two prefix pages, then the attacher's own.
+    let shared = publisher.cache_view_for_test();
+    let own = rows.next().unwrap();
+    let blocks = shared.blocks[..2]
+        .iter()
+        .chain(&own.blocks[2..])
+        .copied()
+        .collect::<Vec<_>>();
+    let attach = |boundary| {
+        PhysicalPagedKvCache::new(
+            own.arena().clone(),
+            (0..own.arena().config().layers.len() as u32)
+                .map(|layer| crate::kv::KvLayerBinding {
+                    model_layer: layer,
+                    physical_layer: layer,
+                })
+                .collect(),
+            blocks.clone(),
+            boundary,
+        )
+        .unwrap()
+    };
+    let mut attached = begin(attach(boundary));
+    assert_eq!(attached.prefill_progress(), boundary);
+    attached.restore_conv_for_test(ring);
+    model
+        .continue_resumable_prefill(&mut attached, prompt, boundary, prompt.len())
+        .unwrap();
+    assert_eq!(
+        values(state_logits(&attached)),
+        values(state_logits(&fresh))
+    );
+    assert_eq!(
+        generate(&model, &mut attached, 8),
+        generate(&model, &mut fresh, 8)
+    );
+
+    // The whole prompt as a prefix leaves nothing to prefill; and without
+    // prefix caching a cache that starts above zero is refused rather than
+    // continued from an empty ring.
+    assert!(model
+        .begin_resumable_prefill_managed(&prompt[..boundary], 8, &config, attach(boundary))
+        .is_err());
+    model.set_prefix_caching(false);
+    assert!(model
+        .begin_resumable_prefill_managed(prompt, 8, &config, attach(boundary))
+        .is_err());
+}
+
+/// The history boundary is where the prompt's last message starts, so a
+/// forced call or JSON opening is never part of what the next turn attaches.
+#[test]
+fn the_history_boundary_is_the_start_of_the_last_message() {
+    let model = tiny_model();
+    let user = |text: &str| ChatMessage {
+        role: ChatRole::User,
+        content: text.into(),
+    };
+    let config = ChatGenerationConfig::default();
+    let first = model.prompt_token_ids(&[user("Hello")], &config).unwrap();
+    let boundary = model.history_boundary(&first).unwrap();
+    // The effort line, then the user message: the boundary is between them.
+    assert!(boundary > 0 && boundary < first.len());
+    // The next turn's prompt repeats everything up to it.
+    let assistant = ChatMessage {
+        role: ChatRole::Assistant,
+        content: "Hi.".into(),
+    };
+    let second = model
+        .prompt_token_ids(&[user("Hello"), assistant, user("Again")], &config)
+        .unwrap();
+    assert_eq!(second[..first.len()], first[..]);
+    assert!(model.history_boundary(&second).unwrap() > first.len());
+    // A JSON reply opens a model message; the boundary is before it.
+    let json = ChatGenerationConfig {
+        constrain_json_object: true,
+        ..ChatGenerationConfig::default()
+    };
+    let opened = model.prompt_token_ids(&[user("Hello")], &json).unwrap();
+    assert_eq!(model.history_boundary(&opened), Some(opened.len() - 2));
+}
+
 /// Rows of a batch do not affect each other.
 #[test]
 fn batch_rows_decode_as_they_do_alone() {

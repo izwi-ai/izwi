@@ -134,8 +134,26 @@ The served path is the composed trunk on every backend:
 Not implemented yet: a fused paged attention kernel with the position bias
 and sink (which a whole-step graph needs: until then 48 attention cores per
 token run eagerly), fused convolution kernels, device experts on Metal, dense
-tensors in the checkpoint's BF16, prefix sharing, releasing windowed pages,
-and the MTP head.
+tensors in the checkpoint's BF16, releasing windowed pages, and the MTP
+head.
+
+## Prefix sharing
+
+With prefix sharing on, the keys and values publish their committed pages
+and the convolution ring a snapshot at each page. A prompt declares its
+history boundary at the start of its last message (`history_boundary`): the
+conversation's next turn renders everything before it again, so it attaches
+those pages and the ring's snapshot instead of prefilling them. A forced
+tool call or a JSON reply ends the prompt in a message the next turn does
+not have, which is why the boundary is before the last message and not at
+the prompt's end. A prompt with images shares nothing: two images' slots are
+the same tokens.
+
+It engages by the catalog's prefix-reuse cell: on the CPU and Metal, where
+the attach test ran (an attached prefix prefills and decodes exactly as a
+fresh run; on the CPU also through the runtime, where a second turn attaches
+the first and replies as it does without sharing), and declared but off on
+CUDA until the test runs on a GPU. `enable_prefix_caching` forces it on.
 
 ## Image input
 

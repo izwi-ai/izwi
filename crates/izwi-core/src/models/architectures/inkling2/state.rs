@@ -23,10 +23,10 @@ use crate::error::{Error, Result};
 use crate::kv::v2::{
     AttentionMask, AttentionPattern, BoundedShape, CheckpointPolicy, InferenceStateContract,
     KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec,
-    PlacementPolicy, PrefixPolicy, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeExtent,
-    StateClock, StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec,
-    StateGroupId, StateGroupSpec, StateScope, TensorComponentSpec, TensorRole,
-    CURRENT_INFERENCE_STATE_ABI,
+    PlacementPolicy, PositionSemantics, PrefixPolicy, RingStateDomainSpec, ShapeAxis,
+    ShapeDimension, ShapeExtent, StateClock, StateComponentId, StateDType, StateDomainHeader,
+    StateDomainId, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope, TensorComponentSpec,
+    TensorRole, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
@@ -78,10 +78,14 @@ fn to_u32(value: usize, what: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::ModelLoadError(format!("Inkling 2 {what} exceeds u32")))
 }
 
-/// The scheduler-owned state contract of a chat sequence.
+/// The scheduler-owned state contract of a chat sequence. With
+/// `share_prefixes` the keys and values publish their committed pages and
+/// the convolution ring a snapshot at each page, so a prompt that begins as
+/// an earlier one did attaches that work instead of repeating it.
 pub(crate) fn managed_contract(
     config: &Inkling2Config,
     kv_dtype: StateDType,
+    share_prefixes: bool,
 ) -> Result<InferenceStateContract> {
     let applications = config.applications();
     let layers = applications
@@ -110,8 +114,18 @@ pub(crate) fn managed_contract(
         })
         .collect::<Result<Vec<_>>>()?;
     let preferred_tokens = to_u32(default_kv_page_size(), "page size")?;
+    let mut attention_header = retained_header(INKLING2_ATTENTION_STATE_DOMAIN);
+    let mut convolution_header = retained_header(INKLING2_CONV_STATE_DOMAIN);
+    if share_prefixes {
+        attention_header.prefix = PrefixPolicy::CommittedPages {
+            positions: PositionSemantics::Absolute,
+        };
+        convolution_header.prefix = PrefixPolicy::CommittedSnapshots {
+            interval_steps: u64::from(preferred_tokens),
+        };
+    }
     let attention = StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-        header: retained_header(INKLING2_ATTENTION_STATE_DOMAIN),
+        header: attention_header,
         layers,
         page_size: PageSizeConstraint {
             min_tokens: 1,
@@ -149,7 +163,7 @@ pub(crate) fn managed_contract(
         }
     }
     let convolution = StateDomainSpec::Ring(RingStateDomainSpec {
-        header: retained_header(INKLING2_CONV_STATE_DOMAIN),
+        header: convolution_header,
         components_per_step: components,
         capacity_steps: (config.conv_kernel - 1) as u64,
     });
@@ -358,7 +372,7 @@ mod tests {
     #[test]
     fn the_contract_has_one_paged_layer_and_four_rings_per_application() {
         for config in [tiny(), published()] {
-            let contract = managed_contract(&config, StateDType::F32).unwrap();
+            let contract = managed_contract(&config, StateDType::F32, false).unwrap();
             let applications = config.application_count();
             let StateDomainSpec::PagedAttention(attention) = &contract.domains[0] else {
                 panic!("first domain is not paged attention");

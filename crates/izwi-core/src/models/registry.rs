@@ -480,11 +480,12 @@ fn load_inkling2_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
-    _prefix_reuse: PrefixReuseMode,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
-    Ok(NativeChatModel::Inkling2(Inkling2ChatModel::load(
-        model_dir, variant, device,
-    )?))
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
+    let mut model = Inkling2ChatModel::load(model_dir, variant, device)?;
+    model.set_prefix_caching(prefix_reuse);
+    Ok(NativeChatModel::Inkling2(model))
 }
 
 fn load_sortformer_diarization_model(
@@ -7076,6 +7077,7 @@ impl NativeChatModel {
     pub(crate) fn managed_history_boundary(&self, prompt_ids: &[u32]) -> Option<usize> {
         match self {
             Self::Lfm2(model) if model.prefix_caching() => model.history_boundary(prompt_ids),
+            Self::Inkling2(model) if model.prefix_caching() => model.history_boundary(prompt_ids),
             _ => None,
         }
     }
@@ -7089,6 +7091,7 @@ impl NativeChatModel {
             Self::Qwen36Moe(model) => model.shares_prefixes(),
             Self::Qwen38(model) => model.shares_prefixes(),
             Self::Lfm2(model) => model.prefix_caching(),
+            Self::Inkling2(model) => model.prefix_caching(),
             _ => false,
         }
     }

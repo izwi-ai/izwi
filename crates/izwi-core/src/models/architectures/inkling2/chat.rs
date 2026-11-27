@@ -429,6 +429,19 @@ impl ChatDecodeState {
 
     /// The reservation the engine would hand back for the next quantum.
     #[cfg(test)]
+    /// The convolution ring as the engine would publish it at a snapshot.
+    #[cfg(test)]
+    pub(crate) fn conv_for_test(&self) -> Inkling2ConvRuntimeState {
+        self.conv.clone()
+    }
+
+    /// What the engine does before an attached prefix's first span: puts the
+    /// ring's snapshot at that cursor in place.
+    #[cfg(test)]
+    pub(crate) fn restore_conv_for_test(&mut self, conv: Inkling2ConvRuntimeState) {
+        self.conv = conv;
+    }
+
     pub(crate) fn cache_view_for_test(&self) -> PhysicalPagedKvCache {
         let layers = self.physical_kv.arena().config().layers.len() as u32;
         PhysicalPagedKvCache::new(
@@ -461,6 +474,9 @@ pub struct Inkling2ChatModel {
     graphs: std::result::Result<StretchGraphs, String>,
     /// The vision tower, when the checkpoint has one.
     vision: Option<Inkling2Vision>,
+    /// Whether prompts share committed prefixes (set at load from the
+    /// catalog's prefix-reuse cell and the operator's setting).
+    prefix_caching: bool,
 }
 
 impl InferenceStateContractProvider for Inkling2ChatModel {
@@ -468,6 +484,7 @@ impl InferenceStateContractProvider for Inkling2ChatModel {
         Ok(InferenceStateCapability::Managed(managed_contract(
             &self.config,
             kv_dtype(self.device_kind()),
+            self.prefix_caching,
         )?))
     }
 }
@@ -614,7 +631,32 @@ impl Inkling2ChatModel {
             experts,
             graphs,
             vision,
+            prefix_caching: false,
         })
+    }
+
+    /// Share prompt prefixes across requests.
+    pub(crate) fn set_prefix_caching(&mut self, enabled: bool) {
+        self.prefix_caching = enabled;
+    }
+
+    pub(crate) fn prefix_caching(&self) -> bool {
+        self.prefix_caching
+    }
+
+    /// Tokens of a rendered prompt that the conversation's next turn renders
+    /// again: everything before its last message. The next turn's prompt
+    /// repeats this one and adds the reply and a new message, so keys,
+    /// values and the convolution ring committed up to here are what it
+    /// attaches. The last message is left out because a forced tool call or
+    /// a JSON reply ends the prompt in a message the next turn will not
+    /// have.
+    pub(crate) fn history_boundary(&self, prompt_ids: &[u32]) -> Option<usize> {
+        let tokens = &self.reply_tokens;
+        prompt_ids
+            .iter()
+            .rposition(|id| *id == tokens.message_model || tokens.other_roles.contains(id))
+            .filter(|boundary| *boundary > 0)
     }
 
     /// Where the experts run.
@@ -949,6 +991,7 @@ impl Inkling2ChatModel {
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
+        let attached = cache.context_len();
         let forced = forced_call(&config.request)?;
         let json_text = json_reply(config);
         // The sampler holds tool calls to the request's grammar, and a JSON
@@ -985,8 +1028,8 @@ impl Inkling2ChatModel {
             reply: Inkling2Reply::new(self.reply_tokens.clone(), forced.as_ref(), json_text),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
-            position: 0,
-            prefill_progress: 0,
+            position: attached,
+            prefill_progress: attached,
             replay_end: None,
             pending_logprobs: Vec::new(),
             image_features: None,
@@ -1001,6 +1044,13 @@ impl Inkling2ChatModel {
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
+        // The slots of two images are the same tokens: a prompt with images
+        // shares no prefix.
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(
+                "an Inkling 2 prompt with images does not attach a shared prefix".into(),
+            ));
+        }
         let mut state = self.begin_resumable_prefill_managed(
             &prepared.prompt_ids,
             max_new_tokens,
@@ -1018,10 +1068,19 @@ impl Inkling2ChatModel {
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
-        // Prefix sharing is off for this family: a state starts empty.
-        if prompt_ids.is_empty() || cache.context_len() != 0 {
+        // An attached prefix starts the cache above zero: its pages hold the
+        // prompt's first `attached` tokens, and the engine restores the
+        // convolution ring's snapshot at that cursor before the first span.
+        let attached = cache.context_len();
+        if prompt_ids.is_empty() || attached >= prompt_ids.len() {
             return Err(Error::InvalidInput(
-                "Inkling 2 managed prefill requires a non-empty prompt and an empty reservation"
+                "Inkling 2 managed prefill requires a non-empty prompt beyond any attached prefix"
+                    .into(),
+            ));
+        }
+        if attached > 0 && !self.prefix_caching {
+            return Err(Error::InvalidInput(
+                "Inkling 2 managed prefill received an attached prefix without prefix caching"
                     .into(),
             ));
         }

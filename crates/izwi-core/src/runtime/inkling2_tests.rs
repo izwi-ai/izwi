@@ -231,6 +231,103 @@ async fn synthetic_chats_see_their_images_body() {
         .expect("unload");
 }
 
+async fn conversation(
+    runtime: &RuntimeService,
+    messages: Vec<ChatMessage>,
+) -> crate::error::Result<ChatGeneration> {
+    let params = crate::engine::GenerationParams {
+        temperature: 0.0,
+        max_tokens: MAX_TOKENS,
+        ..Default::default()
+    };
+    Box::pin(runtime.chat_generate_with_generation_params(VARIANT, messages, params)).await
+}
+
+/// The counter of prompt tokens served from shared prefixes.
+async fn prefix_hit_tokens(runtime: &RuntimeService) -> u64 {
+    runtime
+        .telemetry_prometheus()
+        .await
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("izwi_engine_kv_cache_prefix_hit_tokens_total ")
+                .and_then(|value| value.trim().parse::<f64>().ok())
+        })
+        .unwrap_or(0.0) as u64
+}
+
+/// With prefix sharing, a conversation's next turn attaches the keys, values
+/// and convolution ring the previous turn committed, and replies exactly as
+/// it does on a server that shares nothing.
+async fn a_second_turn_attaches_the_first_turns_prefix_body() {
+    // Long enough that the history spans several pages of keys and values.
+    let opening = "Tell me about rivers. ".repeat(40);
+    let first = user(&opening);
+    let second = |reply: &str| {
+        let mut messages = user(&opening);
+        messages.push(ChatMessage {
+            role: ChatRole::Assistant,
+            content: reply.to_string(),
+        });
+        messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: "And lakes?".to_string(),
+        });
+        messages
+    };
+
+    let plain_models = models_dir("prefix-off");
+    let plain = runtime_with(&plain_models, 2).await;
+    let plain_first = conversation(&plain, first.clone())
+        .await
+        .expect("first turn");
+    let plain_second = conversation(&plain, second(&plain_first.text))
+        .await
+        .expect("second turn");
+    assert_eq!(prefix_hit_tokens(&plain).await, 0);
+
+    let models = models_dir("prefix-on");
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: models.0.clone(),
+        backend: crate::backends::BackendPreference::Cpu,
+        max_batch_size: crate::config::BatchSizePreference::Fixed(
+            std::num::NonZeroUsize::new(2).unwrap(),
+        ),
+        enable_prefix_caching: true,
+        managed_prefix_cache_salt: Some("inkling2-test".into()),
+        ..Default::default()
+    })
+    .expect("runtime");
+    Box::pin(runtime.load_model(VARIANT))
+        .await
+        .expect("load with prefix sharing");
+    let shared_first = conversation(&runtime, first.clone())
+        .await
+        .expect("first turn");
+    assert_eq!(shared_first.text, plain_first.text);
+    let before = prefix_hit_tokens(&runtime).await;
+    let shared_second = conversation(&runtime, second(&shared_first.text))
+        .await
+        .expect("second turn");
+    assert_eq!(shared_second.text, plain_second.text);
+    assert_eq!(shared_second.prompt_tokens, plain_second.prompt_tokens);
+    let attached = prefix_hit_tokens(&runtime).await - before;
+    assert!(
+        attached >= 256,
+        "the second turn attached {attached} tokens of the first turn's prefix"
+    );
+    // The same first turn again attaches too, and replies the same.
+    let again = conversation(&runtime, first)
+        .await
+        .expect("first turn again");
+    assert_eq!(again.text, plain_first.text);
+}
+
+#[test]
+fn a_second_turn_attaches_the_first_turns_prefix() {
+    crate::block_on_large_stack(4, a_second_turn_attaches_the_first_turns_prefix_body);
+}
+
 #[test]
 fn synthetic_chats_see_their_images() {
     crate::block_on_large_stack(4, synthetic_chats_see_their_images_body);

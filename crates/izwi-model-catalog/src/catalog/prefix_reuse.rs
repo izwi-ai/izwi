@@ -215,13 +215,24 @@ impl ModelFamily {
                     "default-on by operator decision ahead of CUDA evidence; the GPU pre-flight runs the qwen36moe device attach test (cuda_attached_prefill_matches_the_fresh_run); IZWI_ENABLE_PREFIX_CACHING=0 turns it off",
                 ),
             },
-            // Inkling 2 keeps a ring of convolution inputs and three passes of
-            // loop state beside its keys and values. Its contract publishes
-            // neither committed pages nor snapshots yet, so nothing is shared.
-            Self::Inkling2Chat => not_enabled(
-                PrefixReuseEvidenceLevel::NotRun,
-                "the state contract declares no prefix policy; sharing waits for an exact snapshot-restore test over keys, values and the convolution ring",
-            ),
+            // Inkling 2 keeps a ring of convolution inputs beside its keys
+            // and values (the loop's messages are per token and need none).
+            // Its contract publishes committed pages and a ring snapshot at
+            // each page, at the start of the prompt's last message.
+            Self::Inkling2Chat => match backend {
+                BackendKind::Cpu => supported(
+                    PrefixReuseEvidenceLevel::FixtureSuite,
+                    "Inkling 2 attach tests: an attached prefix (shared pages plus the convolution ring's snapshot) prefills and decodes exactly as a fresh run; through the runtime a second turn attaches the first turn's pages and replies as it does without sharing",
+                ),
+                BackendKind::Metal => supported(
+                    PrefixReuseEvidenceLevel::FixtureSuite,
+                    "Inkling 2 attach test on the Metal device with F16 keys and values: an attached prefix prefills and decodes exactly as a fresh run",
+                ),
+                BackendKind::Cuda => not_enabled(
+                    PrefixReuseEvidenceLevel::ContractDeclared,
+                    "the contract declares committed pages and convolution ring snapshots; no CUDA GPU run yet",
+                ),
+            },
             // Hybrid snapshots: attention publishes committed pages and the
             // ShortConv ring a snapshot at each page, at the conversation's
             // history boundary (before the final `<|im_start|>`).
@@ -433,6 +444,19 @@ mod tests {
             BackendKind::Cpu,
             PrefixReuseMode::Disabled
         ));
+    }
+
+    /// Inkling 2 shares prefixes where its attach test ran (CPU, Metal) and
+    /// declares the contract on CUDA without engaging it.
+    #[test]
+    fn inkling2_shares_prefixes_on_cpu_and_metal_only() {
+        let variant = ModelVariant::Inkling2Mini;
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert!(variant.prefix_reuse_support(backend).engages(), "{backend:?}");
+        }
+        let cuda = variant.prefix_reuse_support(BackendKind::Cuda);
+        assert!(!cuda.engages());
+        assert_eq!(cuda.evidence, PrefixReuseEvidenceLevel::ContractDeclared);
     }
 
     /// LFM chat shares prefixes where its attach is proven (CPU, Metal) and
