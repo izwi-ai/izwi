@@ -858,6 +858,33 @@ impl Inkling2ConvRuntimeState {
     }
 }
 
+/// The drafter's view of a sequence's committed keys and values, read from
+/// the main cache's drafter layers.
+pub(crate) struct Inkling2DrafterCacheContext<'a> {
+    pub(crate) caches: &'a Inkling2Caches,
+    pub(crate) config: &'a Inkling2Config,
+}
+
+impl super::drafter::DrafterContext for Inkling2DrafterCacheContext<'_> {
+    fn committed(&self) -> usize {
+        self.caches.context_len()
+    }
+
+    fn span(&self, layer: usize, first: usize) -> Result<Option<(Tensor, Tensor)>> {
+        if first >= self.caches.context_len() {
+            return Ok(None);
+        }
+        let (keys, values) = self
+            .caches
+            .main
+            .gather_committed(self.caches.drafter_ordinal(self.config, layer), first)?;
+        Ok(Some((
+            keys.to_dtype(DType::F32)?,
+            values.to_dtype(DType::F32)?,
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::config::tests::{published, tiny};
@@ -954,32 +981,5 @@ mod tests {
         }
         assert_eq!(seen.len(), 192);
         assert_eq!(conv_component(0, 0).unwrap(), StateComponentId::new(1));
-    }
-}
-
-/// The drafter's view of a sequence's committed keys and values, read from
-/// the main cache's drafter layers.
-pub(crate) struct Inkling2DrafterCacheContext<'a> {
-    pub(crate) caches: &'a Inkling2Caches,
-    pub(crate) config: &'a Inkling2Config,
-}
-
-impl super::drafter::DrafterContext for Inkling2DrafterCacheContext<'_> {
-    fn committed(&self) -> usize {
-        self.caches.context_len()
-    }
-
-    fn span(&self, layer: usize, first: usize) -> Result<Option<(Tensor, Tensor)>> {
-        if first >= self.caches.context_len() {
-            return Ok(None);
-        }
-        let (keys, values) = self
-            .caches
-            .main
-            .gather_committed(self.caches.drafter_ordinal(self.config, layer), first)?;
-        Ok(Some((
-            keys.to_dtype(DType::F32)?,
-            values.to_dtype(DType::F32)?,
-        )))
     }
 }

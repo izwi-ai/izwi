@@ -209,19 +209,14 @@ where
     f32: From<K>,
 {
     let mut chains = [0f32; 8];
-    let mut q_blocks = q.chunks_exact(8);
-    let mut k_blocks = k.chunks_exact(8);
-    for (q, k) in (&mut q_blocks).zip(&mut k_blocks) {
+    let (q_blocks, q_rest) = q.as_chunks::<8>();
+    let (k_blocks, k_rest) = k.as_chunks::<8>();
+    for (q, k) in q_blocks.iter().zip(k_blocks) {
         for chain in 0..8 {
             chains[chain] = fma(q[chain], f32::from(k[chain]), chains[chain]);
         }
     }
-    for (chain, (q, k)) in q_blocks
-        .remainder()
-        .iter()
-        .zip(k_blocks.remainder())
-        .enumerate()
-    {
+    for (chain, (q, k)) in q_rest.iter().zip(k_rest).enumerate() {
         chains[chain] = fma(*q, f32::from(*k), chains[chain]);
     }
     ((chains[0] + chains[1]) + (chains[2] + chains[3]))
