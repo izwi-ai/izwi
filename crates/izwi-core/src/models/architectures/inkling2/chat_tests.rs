@@ -893,6 +893,140 @@ fn batch_rows_decode_as_they_do_alone() {
     }
 }
 
+/// With the fused attention kernel a continuous batch runs its rows in one
+/// pass; every row decodes the tokens it decodes alone. Rows sit at
+/// different positions, one past the window.
+fn batched_rows_decode_as_alone(model: Inkling2ChatModel, pool: Vec<PhysicalPagedKvCache>) {
+    assert!(model.batches_rows());
+    let golden = golden();
+    let config = ChatGenerationConfig::default();
+    let prompts = [
+        &golden.tokens[..14],
+        &golden.tokens[3..20],
+        &golden.tokens[..33],
+    ];
+    let mut pool = pool.into_iter();
+    let mut states = prompts
+        .iter()
+        .map(|prompt| {
+            let mut state = model
+                .start_decode_managed(prompt, 10, &config, pool.next().unwrap())
+                .unwrap();
+            model.decode_step(&mut state).unwrap();
+            state
+        })
+        .collect::<Vec<_>>();
+    let alone = prompts
+        .iter()
+        .map(|prompt| {
+            let mut state = model
+                .start_decode_managed(prompt, 10, &config, pool.next().unwrap())
+                .unwrap();
+            generate(&model, &mut state, 8)
+        })
+        .collect::<Vec<_>>();
+    for _ in 0..7 {
+        let mut rows = states
+            .iter_mut()
+            .filter(|state| !state.finished_for_test())
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            break;
+        }
+        let steps = model.decode_step_batch(&mut rows).unwrap();
+        assert!(steps.iter().all(|step| step.input_tokens_committed == 1));
+    }
+    for (state, alone) in states.iter().zip(&alone) {
+        assert_eq!(state.generated_ids_for_test(), alone);
+    }
+}
+
+#[test]
+fn batched_rows_decode_as_alone_on_the_cpu() {
+    let model = tiny_model()
+        .without_turn_end_for_test()
+        .with_fused_attention_for_test();
+    let pool = caches(&model, 6);
+    batched_rows_decode_as_alone(model, pool);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn batched_rows_decode_as_alone_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("batched_rows_decode_as_alone_on_metal")
+    else {
+        return;
+    };
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let model = tiny_model_on(profile)
+        .without_turn_end_for_test()
+        .with_fused_attention_for_test();
+    let pool = caches_on(&model, &device, DType::F32, 6);
+    batched_rows_decode_as_alone(model, pool);
+}
+
+/// Times a decode step of 8 rows in one pass against the rows one after
+/// another, on the tiny model on Metal (dispatch-bound, so this measures
+/// what batching saves in launches, not the published model's arithmetic).
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "timing; run with --ignored --nocapture"]
+fn batched_rows_timing_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("batched_rows_timing_on_metal")
+    else {
+        return;
+    };
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    let model = tiny_model_on(profile)
+        .without_turn_end_for_test()
+        .with_fused_attention_for_test();
+    let golden = golden();
+    let config = ChatGenerationConfig::default();
+    let rows = 8;
+    let steps = 6;
+    let mut timings = Vec::new();
+    for batched in [false, true] {
+        let mut states = (0..rows)
+            .map(|row| {
+                let mut state = model
+                    .start_decode_managed(
+                        &golden.tokens[row..row + 12],
+                        steps + 2,
+                        &config,
+                        caches_on(&model, &device, DType::F16, 1).remove(0),
+                    )
+                    .unwrap();
+                model.decode_step(&mut state).unwrap();
+                state
+            })
+            .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        for _ in 0..steps {
+            let mut refs = states.iter_mut().collect::<Vec<_>>();
+            if batched {
+                model.decode_step_batch(&mut refs).unwrap();
+            } else {
+                for state in refs {
+                    model.decode_step(state).unwrap();
+                }
+            }
+        }
+        timings.push(started.elapsed().as_secs_f64() * 1e3 / steps as f64);
+    }
+    eprintln!(
+        "Inkling 2 tiny model, {rows} rows on Metal: one after another {:.2} ms per step, one pass {:.2} ms",
+        timings[0], timings[1]
+    );
+}
+
 /// On Metal. With keys and values stored in F32 the served path tracks the
 /// reference and greedy decode picks the CPU model's tokens. With F16 keys
 /// and values, as served, the logits stay close; the random fixture routes

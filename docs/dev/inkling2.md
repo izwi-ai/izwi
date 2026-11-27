@@ -136,7 +136,8 @@ The served path is the composed trunk on every backend:
   and its shapes grow with the context. `IZWI_INKLING2_DECODE_GRAPHS=off`
   (or `IZWI_CUDA_DECODE_GRAPHS=off`) runs the stages eagerly; the diagnostics
   report warm-ups, captures, verifications and replays. Prefill is eager;
-- rows of a batch run one after another.
+- rows of a continuous batch run in one pass where the fused attention
+  kernel serves them (see Batched decode rows), else one after another.
 
 Not implemented yet: whole-step CUDA graphs (the attention core now runs in
 a fused kernel, but a step still uploads per-step positions and builds its
@@ -169,6 +170,20 @@ one layer application, milliseconds per call with 48 calls queued):
 The fused kernel and the composed form agree to 8e-7 on Metal, and in the
 served model give the same tokens (`fused_attention_serves_what_composed_attention_does`).
 On CUDA the kernel is type-checked and host-emulated only.
+
+## Batched decode rows
+
+Where the fused attention kernel serves decode steps, a continuous batch runs
+its rows in one pass (`Inkling2ChatModel::batches_rows`): the rows' tokens
+go through every projection, convolution and expert product together (each
+row's convolution histories stacked), and one kernel call per layer
+application attends every row over its own pages
+(`PhysicalPagedKvCache::write_and_attend_biased_rows`). Either every row
+advances or none does. Each row decodes the tokens it decodes alone (tested
+on the CPU and Metal), and on the tiny model on Metal a step of eight rows
+takes 217 ms in one pass against 1,309 ms one after another. Where CUDA step
+graphs run (one row wide), and where attention is composed (the CPU by
+default), rows still run one after another.
 
 ## Dense weights in 16 bits
 

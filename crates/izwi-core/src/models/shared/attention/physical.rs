@@ -1115,6 +1115,136 @@ impl PhysicalPagedKvCache {
         Ok(output)
     }
 
+    /// [`Self::write_and_attend_biased`] for one token of each of several
+    /// sequences whose caches share one arena: row `r` of the inputs is
+    /// written to `rows[r]`'s prepared slot, then one kernel call attends
+    /// every row over its own pages. Each prepared step must hold exactly
+    /// one token. Returns F32 `[rows, heads, value_head_dim]`; a row's output
+    /// does not depend on the other rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_and_attend_biased_rows(
+        rows: &mut [(&PhysicalPagedKvCache, &mut PreparedPhysicalPagedStep)],
+        layer_idx: usize,
+        keys: &Tensor,
+        values: &Tensor,
+        queries: &Tensor,
+        profiles: &Tensor,
+        sinks: &Tensor,
+        softmax_scale: f32,
+        window_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        let count = rows.len();
+        let Some((first_cache, _)) = rows.first() else {
+            return Err(Error::InvalidInput(
+                "physical paged biased attention needs at least one row".into(),
+            ));
+        };
+        if keys.dim(0)? != count
+            || values.dim(0)? != count
+            || queries.dim(0)? != count
+            || profiles.dim(0)? != count
+            || sinks.dim(0)? != count
+        {
+            return Err(Error::InvalidInput(
+                "physical paged biased attention needs one input row per sequence".into(),
+            ));
+        }
+        let arena = first_cache.arena.clone();
+        let binding = first_cache.layer_binding(layer_idx)?;
+        let window = match window_tokens {
+            Some(0) => {
+                return Err(Error::InvalidInput(
+                    "physical paged sliding window cannot be zero".into(),
+                ))
+            }
+            Some(window) => Some(
+                u32::try_from(window)
+                    .map_err(|_| Error::InvalidInput("physical paged window exceeds u32".into()))?,
+            ),
+            None => None,
+        };
+        let mut sequences = Vec::with_capacity(count);
+        for (cache, prepared) in rows.iter() {
+            if cache.arena.id() != arena.id()
+                || cache.layer_binding(layer_idx)? != binding
+                || prepared.arena != cache.arena.id()
+                || prepared.logical_generation != cache.logical_generation
+                || prepared.start_pos != cache.context_len
+                || prepared.token_count != 1
+                || prepared.slots.len() != 1
+            {
+                return Err(Error::InvalidInput(
+                    "physical paged biased rows need one fresh one-token step per cache in one arena"
+                        .into(),
+                ));
+            }
+            let start = match window_tokens {
+                Some(window) => (prepared.start_pos + 1)
+                    .saturating_sub(window)
+                    .max(cache.window_start),
+                None => cache.window_start,
+            };
+            sequences.push(cache.sequence_table_from(start, prepared.start_pos + 1)?);
+        }
+        let mut completions = Vec::with_capacity(count);
+        for (row, (_, prepared)) in rows.iter().enumerate() {
+            let written = arena.write_slots(
+                binding,
+                KvWriteArgs {
+                    keys: &keys.narrow(0, row, 1)?,
+                    values: &values.narrow(0, row, 1)?,
+                    slots: prepared.slots.as_ref(),
+                },
+            );
+            match written {
+                Ok(completion)
+                    if completion.arena() == arena.id()
+                        && completion.layer() == binding
+                        && completion.slots() == 1 =>
+                {
+                    completions.push(completion)
+                }
+                outcome => {
+                    for completion in completions {
+                        let _ = completion.wait();
+                    }
+                    return Err(match outcome {
+                        Err(error) => error,
+                        Ok(_) => Error::InferenceError(
+                            "physical paged write returned a mismatched backend completion".into(),
+                        ),
+                    });
+                }
+            }
+        }
+        let batch = KvDecodeBatchMetadata { sequences };
+        let output = arena.paged_decode_biased(
+            binding,
+            PagedKvBiasedDecodeArgs {
+                queries,
+                profiles,
+                sinks,
+                batch: &batch,
+                queries_per_sequence: 1,
+                softmax_scale,
+                window_tokens: window,
+            },
+        );
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                for completion in completions {
+                    let _ = completion.wait();
+                }
+                return Err(error);
+            }
+        };
+        for ((_, prepared), completion) in rows.iter_mut().zip(completions) {
+            prepared.completions.collect(completion)?;
+        }
+        Ok(output)
+    }
+
     /// Decode one token whose rotated key and value a fused kernel writes
     /// straight into this layer's paged cache, then attend against the same
     /// pages.

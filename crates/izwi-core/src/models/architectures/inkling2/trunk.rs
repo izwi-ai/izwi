@@ -129,24 +129,65 @@ impl ConvTaps {
     }
 }
 
-/// `[history, x]` and the history the next span starts from.
-fn extend(history: &Tensor, x: &Tensor) -> Result<(Tensor, Tensor)> {
-    let seq = x.dim(0)?;
-    let extended = Tensor::cat(&[history, x], 0)?;
-    let next = extended.narrow(0, seq, history.dim(0)?)?.copy()?;
-    Ok((extended, next))
+/// A convolution's input with its history before it, along time.
+///
+/// For a span of one sequence `x` is `[seq, channels]` and the history
+/// `[kernel - 1, channels]`; for one token of each of several sequences
+/// (rows) `x` is `[rows, channels]` and the histories are stacked,
+/// `[rows, kernel - 1, channels]`. A row then is a span of one token, with
+/// the same arithmetic.
+struct Extended {
+    tensor: Tensor,
+    rows: bool,
+    seq: usize,
+}
+
+impl Extended {
+    /// `[history, x]` and the history the next span starts from.
+    fn new(history: &Tensor, x: &Tensor) -> Result<(Self, Tensor)> {
+        if history.rank() == 3 {
+            let extended = Tensor::cat(&[history, &x.unsqueeze(1)?], 1)?;
+            let next = extended.narrow(1, 1, history.dim(1)?)?.copy()?;
+            let extended = Self {
+                tensor: extended,
+                rows: true,
+                seq: x.dim(0)?,
+            };
+            return Ok((extended, next));
+        }
+        let seq = x.dim(0)?;
+        let extended = Tensor::cat(&[history, x], 0)?;
+        let next = extended.narrow(0, seq, history.dim(0)?)?.copy()?;
+        Ok((
+            Self {
+                tensor: extended,
+                rows: false,
+                seq,
+            },
+            next,
+        ))
+    }
+
+    /// The inputs `start` steps into the extended time axis, one per output
+    /// (`[seq or rows, channels]`).
+    fn at(&self, start: usize) -> Result<Tensor> {
+        Ok(if self.rows {
+            self.tensor.narrow(1, start, 1)?.squeeze(1)?
+        } else {
+            self.tensor.narrow(0, start, self.seq)?
+        })
+    }
 }
 
 /// The reference's `ShortConvolution`: `(conv(x) + x) / sqrt(kernel + 1)`.
 /// Returns the output and the history the next span starts from.
 fn short_conv(x: &Tensor, conv: &ConvTaps, history: &Tensor) -> Result<(Tensor, Tensor)> {
-    let seq = x.dim(0)?;
-    let (extended, next) = extend(history, x)?;
+    let (extended, next) = Extended::new(history, x)?;
     let mut out = x.clone();
     for tap in 0..conv.kernel {
         out = (out
             + extended
-                .narrow(0, tap, seq)?
+                .at(tap)?
                 .broadcast_mul(&conv.taps.narrow(0, tap, 1)?)?)?;
     }
     Ok(((out * ((conv.kernel + 1) as f64).powf(-0.5))?, next))
@@ -192,7 +233,7 @@ impl DynamicConv {
     fn forward(&self, x: &Tensor, input: &Tensor, history: &Tensor) -> Result<(Tensor, Tensor)> {
         let (seq, channels) = x.dims2()?;
         let head_dim = channels / self.heads;
-        let (extended, next) = extend(history, x)?;
+        let (extended, next) = Extended::new(history, x)?;
         let dynamic = self
             .projection
             .forward(input)?
@@ -204,7 +245,7 @@ impl DynamicConv {
                 .broadcast_as((seq, self.heads, head_dim))?
                 .reshape((seq, channels))?;
             let weights = per_head.broadcast_add(&self.static_taps.narrow(0, lag, 1)?)?;
-            out = (out + (extended.narrow(0, self.kernel - 1 - lag, seq)? * weights)?)?;
+            out = (out + (extended.at(self.kernel - 1 - lag)? * weights)?)?;
         }
         Ok(((out * ((2 * self.kernel + 1) as f64).powf(-0.5))?, next))
     }
@@ -384,6 +425,52 @@ pub trait Inkling2Context {
         _first: usize,
     ) -> Result<Option<Tensor>> {
         Ok(None)
+    }
+}
+
+/// Where the rows of a batched decode step keep their keys and values: one
+/// token of each of several sequences, in one arena.
+pub trait Inkling2RowsContext {
+    /// Writes row `r`'s key and value (`[rows, kv_heads, head_dim]`, F32) of
+    /// layer application `application` at its sequence's next position and
+    /// attends each row over its own sequence: `queries`
+    /// (`[heads, rows, head_dim]`), `profiles` (`[heads, rows, extent]`) and
+    /// `sinks` (`[heads, rows, 1]`) as [`Inkling2Context::attend`] takes
+    /// them. Returns `[rows, heads, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn attend_rows(
+        &mut self,
+        application: usize,
+        keys: &Tensor,
+        values: &Tensor,
+        queries: &Tensor,
+        profiles: &Tensor,
+        sinks: &Tensor,
+        scale: f32,
+        window: Option<usize>,
+    ) -> Result<Tensor>;
+}
+
+/// How a pass reaches its keys and values: a span of one sequence, or one
+/// token of each of several sequences.
+enum Attention<'a> {
+    Span {
+        first: usize,
+        context: &'a mut dyn Inkling2Context,
+    },
+    Rows {
+        positions: &'a [usize],
+        context: &'a mut dyn Inkling2RowsContext,
+    },
+}
+
+impl Attention<'_> {
+    /// The positions of the pass's rows.
+    fn positions(&self, seq: usize) -> Vec<usize> {
+        match self {
+            Self::Span { first, .. } => (*first..*first + seq).collect(),
+            Self::Rows { positions, .. } => positions.to_vec(),
+        }
     }
 }
 
@@ -810,9 +897,11 @@ impl Inkling2Trunk {
 
     /// `1 + alpha * ln(max((position + 1) / n_floor, 1))` per position, on
     /// the host in F64 (device `ln` is not exact on every backend).
-    fn log_scale(&self, first: usize, seq: usize) -> Result<Tensor> {
-        let values = (first..first + seq)
-            .map(|position| {
+    fn log_scale(&self, positions: &[usize]) -> Result<Tensor> {
+        let seq = positions.len();
+        let values = positions
+            .iter()
+            .map(|&position| {
                 let ratio = ((position + 1) as f64 / self.config.log_scaling_n_floor).max(1.0);
                 (1.0 + self.config.log_scaling_alpha * ratio.ln()) as f32
             })
@@ -1030,8 +1119,7 @@ impl Inkling2Trunk {
         &self,
         index: usize,
         staged: &[Tensor],
-        first: usize,
-        context: &mut dyn Inkling2Context,
+        attention: &mut Attention<'_>,
     ) -> Result<Tensor> {
         let g = self.layers[self.applications[index].layer].heads;
         let [queries, profiles, sinks, keys, values, ..] = staged else {
@@ -1039,6 +1127,22 @@ impl Inkling2Trunk {
         };
         let seq = queries.dim(1)?;
         let scale = (g.head_dim as f64).powf(-0.5);
+        let (first, context) = match attention {
+            Attention::Span { first, context } => (*first, &mut **context),
+            Attention::Rows { context, .. } => {
+                let attended = context.attend_rows(
+                    index,
+                    keys,
+                    values,
+                    queries,
+                    profiles,
+                    sinks,
+                    scale as f32,
+                    g.window,
+                )?;
+                return Ok(attended.reshape((seq, g.query_width()))?);
+            }
+        };
         if let Some(attended) = context.attend(
             index,
             keys,
@@ -1171,19 +1275,18 @@ impl Inkling2Trunk {
         hidden: &Tensor,
         block_states: &[Tensor],
         messages: Option<&Tensor>,
-        first: usize,
+        log_scale: &Tensor,
         history: &mut Inkling2ConvHistory,
-        context: &mut dyn Inkling2Context,
+        attention: &mut Attention<'_>,
         run: &mut Option<StepRun<'_>>,
         trace: &mut Option<&mut Inkling2Trace>,
     ) -> Result<Tensor> {
-        let seq = hidden.dim(0)?;
         let shared = messages.into_iter().chain(block_states).cloned();
         let mut inputs = vec![
             hidden.clone(),
             history.key.clone(),
             history.value.clone(),
-            self.log_scale(first, seq)?,
+            log_scale.clone(),
         ];
         inputs.extend(shared.clone());
         let staged = stage(run, 2 * index, &inputs, &|inputs| {
@@ -1192,7 +1295,7 @@ impl Inkling2Trunk {
         let [.., gate, key_next, value_next] = staged.as_slice() else {
             return Err(trunk_error("a layer stage returned too little"));
         };
-        let attended = self.attend(index, &staged, first, context)?;
+        let attended = self.attend(index, &staged, attention)?;
 
         let mut inputs = vec![
             attended,
@@ -1268,6 +1371,87 @@ impl Inkling2Trunk {
         conv: &mut Inkling2ConvState,
         context: &mut dyn Inkling2Context,
         graphs: Option<&StretchGraphs>,
+        trace: Option<&mut Inkling2Trace>,
+    ) -> Result<Tensor> {
+        self.forward_pass(
+            embeddings,
+            Attention::Span { first, context },
+            conv,
+            graphs,
+            trace,
+        )
+    }
+
+    /// One token of each of several sequences in one pass: `embeddings` is
+    /// `[rows, hidden]`, row `r` at position `positions[r]` of its sequence
+    /// with convolution state `convs[r]` (advanced in place) and its keys and
+    /// values reached through `context`. Returns `[rows, hidden]`. A row's
+    /// result is its single-row result up to the summation order of the
+    /// batched products.
+    pub fn forward_rows(
+        &self,
+        embeddings: &Tensor,
+        positions: &[usize],
+        convs: &mut [&mut Inkling2ConvState],
+        context: &mut dyn Inkling2RowsContext,
+    ) -> Result<Tensor> {
+        let rows = embeddings.dim(0)?;
+        if rows == 0 || positions.len() != rows || convs.len() != rows {
+            return Err(trunk_error(
+                "a batch of rows needs one position and one state per row",
+            ));
+        }
+        // Each application's histories, stacked over the rows.
+        let mut stacked = Inkling2ConvState {
+            histories: (0..self.applications.len())
+                .map(|index| {
+                    let stack = |pick: fn(&Inkling2ConvHistory) -> &Tensor| -> Result<Tensor> {
+                        let parts = convs
+                            .iter()
+                            .map(|conv| {
+                                conv.histories.get(index).map(pick).ok_or_else(|| {
+                                    trunk_error("the state belongs to another model")
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok(Tensor::stack(&parts, 0)?)
+                    };
+                    Ok(Inkling2ConvHistory {
+                        key: stack(|h| &h.key)?,
+                        value: stack(|h| &h.value)?,
+                        attention: stack(|h| &h.attention)?,
+                        mlp: stack(|h| &h.mlp)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let out = self.forward_pass(
+            embeddings,
+            Attention::Rows { positions, context },
+            &mut stacked,
+            None,
+            None,
+        )?;
+        for (row, conv) in convs.iter_mut().enumerate() {
+            for (history, next) in conv.histories.iter_mut().zip(&stacked.histories) {
+                let take = |tensor: &Tensor| -> Result<Tensor> { Ok(tensor.get(row)?.copy()?) };
+                *history = Inkling2ConvHistory {
+                    key: take(&next.key)?,
+                    value: take(&next.value)?,
+                    attention: take(&next.attention)?,
+                    mlp: take(&next.mlp)?,
+                };
+            }
+        }
+        Ok(out)
+    }
+
+    fn forward_pass(
+        &self,
+        embeddings: &Tensor,
+        mut attention: Attention<'_>,
+        conv: &mut Inkling2ConvState,
+        graphs: Option<&StretchGraphs>,
         mut trace: Option<&mut Inkling2Trace>,
     ) -> Result<Tensor> {
         let c = &self.config;
@@ -1286,6 +1470,7 @@ impl Inkling2Trunk {
         let mut hidden = embeddings.clone();
         let mut block_states: Vec<Tensor> = Vec::new();
         let mut index = 0usize;
+        let log_scale = self.log_scale(&attention.positions(seq))?;
         // The host expert path reads activations back, which a graph cannot.
         let mut run = match graphs {
             Some(graphs) if seq == 1 && self.experts_on_device() => graphs.begin(1),
@@ -1299,9 +1484,9 @@ impl Inkling2Trunk {
                     &hidden,
                     &block_states,
                     $messages,
-                    first,
+                    &log_scale,
                     &mut conv.histories[index],
-                    &mut *context,
+                    &mut attention,
                     &mut run,
                     &mut trace,
                 )?;

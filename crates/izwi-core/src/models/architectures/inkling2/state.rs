@@ -14,7 +14,7 @@
 use candle_core::{DType, Tensor};
 
 use super::config::{Inkling2Config, CONV_STATES_PER_APPLICATION};
-use super::trunk::{Inkling2Context, Inkling2ConvHistory, Inkling2ConvState};
+use super::trunk::{Inkling2Context, Inkling2ConvHistory, Inkling2ConvState, Inkling2RowsContext};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
@@ -417,6 +417,82 @@ impl Inkling2Caches {
             prepared,
             fused,
         }
+    }
+}
+
+/// The keys and values of a batched decode step: one token of each row's
+/// sequence, every row's caches in one arena and one layout.
+pub(crate) struct Inkling2RowsPagedContext<'a> {
+    rows: Vec<(&'a Inkling2Caches, &'a mut Inkling2Prepared)>,
+    routes: Vec<Route>,
+}
+
+impl<'a> Inkling2RowsPagedContext<'a> {
+    pub(crate) fn new(
+        config: &Inkling2Config,
+        rows: Vec<(&'a Inkling2Caches, &'a mut Inkling2Prepared)>,
+    ) -> Result<Self> {
+        let Some((first, _)) = rows.first() else {
+            return Err(state_error("a batch of rows is empty"));
+        };
+        let split = first.windowed.is_some();
+        // The cache checks each step is one token.
+        if rows
+            .iter()
+            .any(|(caches, _)| caches.windowed.is_some() != split)
+        {
+            return Err(state_error("the rows of a batch differ in cache layout"));
+        }
+        let routes = first.routes(config);
+        Ok(Self { rows, routes })
+    }
+}
+
+impl Inkling2RowsContext for Inkling2RowsPagedContext<'_> {
+    fn attend_rows(
+        &mut self,
+        application: usize,
+        keys: &Tensor,
+        values: &Tensor,
+        queries: &Tensor,
+        profiles: &Tensor,
+        sinks: &Tensor,
+        scale: f32,
+        window: Option<usize>,
+    ) -> Result<Tensor> {
+        let route = *self
+            .routes
+            .get(application)
+            .ok_or_else(|| state_error(format!("no layer application {application}")))?;
+        let mut targets = Vec::with_capacity(self.rows.len());
+        for (caches, prepared) in self.rows.iter_mut() {
+            let (cache, step) = match (route.windowed, &caches.windowed) {
+                (true, Some(cache)) => (
+                    cache,
+                    prepared
+                        .windowed
+                        .as_mut()
+                        .ok_or_else(|| state_error("the windowed append was not prepared"))?,
+                ),
+                _ => (&caches.main, &mut prepared.main),
+            };
+            targets.push((cache, step));
+        }
+        let storage = targets[0].0.arena().config().dtype;
+        let (keys, values) = (keys.to_dtype(storage)?, values.to_dtype(storage)?);
+        let by_row =
+            |tensor: &Tensor| -> Result<Tensor> { Ok(tensor.transpose(0, 1)?.contiguous()?) };
+        PhysicalPagedKvCache::write_and_attend_biased_rows(
+            &mut targets,
+            route.ordinal,
+            &keys,
+            &values,
+            &by_row(queries)?,
+            &by_row(profiles)?,
+            &by_row(&sinks.squeeze(2)?)?,
+            scale,
+            window,
+        )
     }
 }
 

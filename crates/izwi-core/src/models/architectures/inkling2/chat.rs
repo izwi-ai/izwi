@@ -19,7 +19,9 @@ use super::prompt::{
     forced_call, json_reply, render_prompt, CONTENT_TEXT, IMAGE_SLOT, JSON_REPLY_GRAMMAR,
 };
 use super::reply::{Inkling2Reply, Inkling2ReplyTokens};
-use super::state::{kv_dtype, managed_contract, Inkling2Caches, Inkling2ConvRuntimeState};
+use super::state::{
+    kv_dtype, managed_contract, Inkling2Caches, Inkling2ConvRuntimeState, Inkling2RowsPagedContext,
+};
 use super::trunk::Inkling2Trunk;
 use super::vision::{image_tokens, preprocess_image, Inkling2Vision};
 use crate::backends::kv::KvWriteBatchCompletion;
@@ -1387,6 +1389,12 @@ impl Inkling2ChatModel {
             state.position += 1;
             committed = 1;
         }
+        self.sample_step(state, committed)
+    }
+
+    /// Samples the next token from the state's unconsumed logits and
+    /// advances the reply; `committed` input tokens were run to get them.
+    fn sample_step(&self, state: &mut ChatDecodeState, committed: usize) -> Result<ChatDecodeStep> {
         let logits = state
             .unconsumed_logits
             .take()
@@ -1433,7 +1441,80 @@ impl Inkling2ChatModel {
         })
     }
 
-    /// One decode step of every row. Rows run one after another; a row's
+    /// Whether a continuous batch runs its rows in one pass. That needs the
+    /// fused attention kernel (the composed form attends one sequence at a
+    /// time); where the decode step's CUDA graphs run, rows run one after
+    /// another so that each replays them.
+    pub(crate) fn batches_rows(&self) -> bool {
+        self.fused_attention.is_ok() && self.graphs.is_err()
+    }
+
+    /// Runs every row's pending token through the trunk in one pass and
+    /// leaves its logits unconsumed. Either every row advances or none does.
+    fn forward_rows(&self, states: &mut [&mut ChatDecodeState]) -> Result<()> {
+        let mut tokens = Vec::with_capacity(states.len());
+        let mut positions = Vec::with_capacity(states.len());
+        for state in states.iter() {
+            let token = state
+                .pending_token
+                .ok_or_else(|| chat_error("a batched row has no pending token"))?;
+            if state.physical_kv.context_len() != state.position
+                || state.conv.cursor() != state.position as u64
+            {
+                return Err(chat_error(
+                    "a batched row's caches do not continue its position",
+                ));
+            }
+            state.physical_kv.validate(&self.config)?;
+            tokens.push(token);
+            positions.push(state.position);
+        }
+        let embeddings = self.trunk.embed(&tokens)?;
+        let mut working = states
+            .iter()
+            .map(|state| Ok(state.conv.conv()?.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut prepared = states
+            .iter()
+            .map(|state| state.physical_kv.prepare_append(state.position, 1))
+            .collect::<Result<Vec<_>>>()?;
+        let hidden = (|| {
+            let rows = states
+                .iter()
+                .zip(prepared.iter_mut())
+                .map(|(state, prepared)| (&state.physical_kv, prepared))
+                .collect();
+            let mut context = Inkling2RowsPagedContext::new(&self.config, rows)?;
+            let mut convs = working.iter_mut().collect::<Vec<_>>();
+            self.trunk
+                .forward_rows(&embeddings, &positions, &mut convs, &mut context)
+        })();
+        let hidden = match hidden {
+            Ok(hidden) => hidden,
+            Err(error) => {
+                for (state, prepared) in states.iter_mut().zip(prepared) {
+                    if let Err(abort) = state.physical_kv.abort(prepared) {
+                        tracing::warn!("Inkling 2: aborting a failed batch also failed: {abort}");
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let logits = self.trunk.logits(&hidden)?;
+        for (row, ((state, prepared), conv)) in
+            states.iter_mut().zip(prepared).zip(working).enumerate()
+        {
+            state.physical_kv.commit(prepared)?;
+            state.conv.advance(conv, 1);
+            state.unconsumed_logits = Some(logits.get(row)?);
+            state.pending_token = None;
+            state.position += 1;
+        }
+        Ok(())
+    }
+
+    /// One decode step of every row: in one pass where the model batches
+    /// rows ([`Self::batches_rows`]), else one after another. A row's
     /// result does not depend on the others.
     pub fn decode_step_batch(
         &self,
@@ -1449,6 +1530,13 @@ impl Inkling2ChatModel {
             return Err(Error::InvalidInput(
                 "Inkling 2 continuous batch contains a non-decodable state".into(),
             ));
+        }
+        if states.len() > 1 && self.batches_rows() {
+            self.forward_rows(states)?;
+            return states
+                .iter_mut()
+                .map(|state| self.sample_step(state, 1))
+                .collect();
         }
         states
             .iter_mut()
