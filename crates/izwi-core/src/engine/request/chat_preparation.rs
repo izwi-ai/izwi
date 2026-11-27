@@ -248,8 +248,12 @@ impl EngineCoreRequest {
         }
 
         let family = model_variant.family();
+        // Hybrid Qwen prompts always carry an artifact; an Inkling 2 prompt
+        // does when it has images, whose features the artifact holds.
         let needs_prepared_prompt =
-            matches!(family, ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat);
+            matches!(family, ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat)
+                || (family == ModelFamily::Inkling2Chat
+                    && !self.chat_config.media_inputs.is_empty());
         match prepared_chat_prompt.as_ref() {
             Some(prepared) if prepared.family() != family => {
                 return Err(Error::InvalidInput(format!(
@@ -265,7 +269,7 @@ impl EngineCoreRequest {
             }
             None if needs_prepared_prompt => {
                 return Err(Error::InvalidInput(format!(
-                    "Chat request {} is missing its prepared hybrid-Qwen prompt artifact",
+                    "Chat request {} is missing its prepared prompt artifact",
                     self.id
                 )));
             }
@@ -438,10 +442,11 @@ impl EngineCoreRequest {
             None if matches!(
                 model_variant.family(),
                 ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat
-            ) =>
+            ) || (model_variant.family() == ModelFamily::Inkling2Chat
+                && !self.chat_config.media_inputs.is_empty()) =>
             {
                 Err(Error::InvalidInput(format!(
-                    "Chat request {} is missing its prepared hybrid-Qwen prompt artifact",
+                    "Chat request {} is missing its prepared prompt artifact",
                     self.id
                 )))
             }

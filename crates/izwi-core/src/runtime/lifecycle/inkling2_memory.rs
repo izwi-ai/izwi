@@ -95,6 +95,7 @@ mod tests {
         let footprint = Inkling2Footprint {
             expert_bytes: 1_000,
             dense_bytes: 400,
+            vision_bytes: 0,
             router_bytes: 10,
             largest_dense_bytes: 100,
         };

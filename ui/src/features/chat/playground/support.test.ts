@@ -88,8 +88,9 @@ describe("chat playground support", () => {
     );
   });
 
-  it("recognizes Qwen3.5 as the image-capable chat family", () => {
+  it("recognizes the image-capable chat families", () => {
     expect(supportsImageAttachmentsForModel("Qwen3.5-4B")).toBe(true);
+    expect(supportsImageAttachmentsForModel("Inkling-2-Mini")).toBe(true);
     expect(supportsImageAttachmentsForModel("Qwen3-14B-GGUF")).toBe(false);
   });
 

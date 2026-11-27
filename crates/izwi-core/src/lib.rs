@@ -166,7 +166,7 @@ pub use catalog::{
 };
 pub use runtime_models::shared::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole,
-    ChatTemplateKwargs, ChatTruncation, CHAT_AUDIO_PLACEHOLDER,
+    ChatTemplateKwargs, ChatTruncation, CHAT_AUDIO_PLACEHOLDER, CHAT_IMAGE_PLACEHOLDER,
 };
 
 /// How `<think>` reasoning splits from a chat answer, shared with the gateway.

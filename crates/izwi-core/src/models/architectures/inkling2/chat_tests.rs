@@ -3,18 +3,26 @@
 
 use candle_core::{DType, Device};
 
-use super::chat::{ChatDecodeState, ExpertBackendRequest, Inkling2ChatModel};
+use super::chat::{
+    fitted_image_size, ChatDecodeState, ExpertBackendRequest, Inkling2ChatModel,
+    Inkling2ImageInput, Inkling2PreparedPrompt, MAX_IMAGE_TOKENS,
+};
 use super::checkpoint::Inkling2Checkpoint;
 use super::config::tests::{fixture, tiny};
-use super::prompt::END_SAMPLING;
+use super::prompt::{END_SAMPLING, IMAGE_SLOT};
 use super::reply::tests::test_tokenizer_sized;
 use super::tests::{golden, max_error, tiny_trunk};
+use super::vision::image_tokens;
+use super::vision_tests::image_golden;
 use crate::backends::DeviceProfile;
 use crate::model::ModelVariant;
 use crate::models::shared::attention::physical::{
     test_physical_caches_for_model_layers_on, PhysicalPagedKvCache,
 };
-use crate::models::shared::chat::ChatGenerationConfig;
+use crate::models::shared::chat::{
+    ChatGenerationConfig, ChatMediaInput, ChatMediaKind, ChatMessage, ChatRole,
+    CHAT_IMAGE_PLACEHOLDER,
+};
 
 fn tiny_model() -> Inkling2ChatModel {
     tiny_model_on(DeviceProfile::cpu())
@@ -29,6 +37,7 @@ fn tiny_model_with(profile: DeviceProfile, experts: ExpertBackendRequest) -> Ink
     // ASCII byte tokens, then the special tokens.
     let tokenizer = test_tokenizer_sized(128);
     config.eos_token_id = tokenizer.token_to_id(END_SAMPLING).unwrap();
+    config.image_token_id = tokenizer.token_to_id(IMAGE_SLOT).unwrap();
     let checkpoint = Inkling2Checkpoint::open(&fixture("inkling2_golden"), &tiny()).unwrap();
     Inkling2ChatModel::from_parts(
         ModelVariant::Inkling2Mini,
@@ -232,6 +241,175 @@ fn a_replayed_session_resumes_exactly() {
     assert!(model.continue_replay(&mut resumed, prompt, 9, end).unwrap());
     let got = generate(&model, &mut resumed, steps);
     assert_eq!(got, want);
+}
+
+/// A conversation with the fixture's two images, sealed with their features.
+fn prepared_with_images(model: &Inkling2ChatModel) -> Inkling2PreparedPrompt {
+    let images = image_golden()
+        .images
+        .iter()
+        .map(|image| Inkling2ImageInput {
+            height: image.shape[0],
+            width: image.shape[1],
+            channels: image.shape[2],
+            pixels: image.bytes.clone(),
+        })
+        .collect::<Vec<_>>();
+    let messages = [ChatMessage {
+        role: ChatRole::User,
+        content: format!("Compare {CHAT_IMAGE_PLACEHOLDER} with {CHAT_IMAGE_PLACEHOLDER}."),
+    }];
+    let config = ChatGenerationConfig::default();
+    let prepared = model
+        .prepare_prompt_with_images(&messages, &config, &images)
+        .unwrap();
+    // One image, or text that spells the placeholder a third time, does not
+    // pair off.
+    assert!(model
+        .prepare_prompt_with_images(&messages, &config, &images[..1])
+        .is_err());
+    // A text prompt cannot carry media.
+    let mut with_media = config.clone();
+    with_media.request.media_inputs.push(ChatMediaInput {
+        kind: ChatMediaKind::Image,
+        source: "data:image/png;base64,".into(),
+    });
+    assert!(model.prompt_token_ids(&messages, &with_media).is_err());
+    prepared
+}
+
+/// The dense reference for a prompt with images: the trunk on its own state,
+/// with the image features in the slots' place.
+fn reference_logits_with_images(
+    model: &Inkling2ChatModel,
+    prepared: &Inkling2PreparedPrompt,
+) -> Vec<f32> {
+    let golden = image_golden();
+    let features = golden
+        .images
+        .iter()
+        .flat_map(|image| image.features.iter().copied())
+        .collect::<Vec<_>>();
+    let hidden = model.config().hidden;
+    let features =
+        candle_core::Tensor::from_vec(features, (prepared.image_tokens(), hidden), &Device::Cpu)
+            .unwrap();
+    let trunk = tiny_trunk(&Device::Cpu);
+    let ids = prepared.prompt_ids();
+    let embeddings = trunk
+        .embed_with_images(ids, model.config().image_token_id, &features, 0)
+        .unwrap();
+    let mut state = trunk.new_state().unwrap();
+    let hidden = trunk
+        .forward_embeddings(&embeddings, &mut state, None)
+        .unwrap();
+    let last = hidden.narrow(0, ids.len() - 1, 1).unwrap();
+    values(&trunk.logits(&last).unwrap())
+}
+
+/// A prompt with images prefills to the reference's logits however its
+/// spans cut the image slots, and its slots count the images' cells.
+#[test]
+fn a_prompt_with_images_prefills_to_the_reference_logits() {
+    let model = tiny_model();
+    let prepared = prepared_with_images(&model);
+    let slot = model.config().image_token_id;
+    let ids = prepared.prompt_ids();
+    let slots = ids.iter().filter(|id| **id == slot).count();
+    assert_eq!(slots, 6 + 1);
+    assert_eq!(prepared.image_tokens(), slots);
+    let want = reference_logits_with_images(&model, &prepared);
+    let first_slot = ids.iter().position(|id| *id == slot).unwrap();
+    let config = ChatGenerationConfig::default();
+    // One span; then spans that end inside the first image and between the
+    // two.
+    for cuts in [vec![], vec![first_slot + 2, first_slot + 6, ids.len() - 2]] {
+        let mut state = model
+            .begin_prepared_prefill_managed(&prepared, 4, &config, caches(&model, 1).remove(0))
+            .unwrap();
+        let mut at = 0;
+        for end in cuts.into_iter().chain([ids.len()]) {
+            let complete = model
+                .continue_resumable_prefill(&mut state, ids, at, end)
+                .unwrap();
+            assert_eq!(complete, end == ids.len());
+            at = end;
+        }
+        let error = max_error(&values(state_logits(&state)), &want);
+        // The reference takes the fixture's features, the model its own
+        // vision tower's: rounding apart, as the logits then are.
+        assert!(error <= 2e-3, "logit error with images {error}");
+    }
+    // The same tokens without the features are another prompt.
+    let plain = model
+        .start_decode_managed(ids, 4, &config, caches(&model, 1).remove(0))
+        .unwrap();
+    assert!(max_error(&values(state_logits(&plain)), &want) > 1e-2);
+}
+
+/// A session with images that is released and replayed continues with the
+/// tokens of the uninterrupted run: the replay has the image features.
+#[test]
+fn a_replayed_session_with_images_resumes_exactly() {
+    let model = tiny_model().without_turn_end_for_test();
+    let prepared = prepared_with_images(&model);
+    let ids = prepared.prompt_ids();
+    let config = ChatGenerationConfig::default();
+    let steps = 8;
+    let mut whole = model
+        .start_prepared_decode_managed(&prepared, steps, &config, caches(&model, 1).remove(0))
+        .unwrap();
+    let want = generate(&model, &mut whole, steps);
+    assert_eq!(want.len(), steps);
+
+    let mut state = model
+        .start_prepared_decode_managed(&prepared, steps, &config, caches(&model, 1).remove(0))
+        .unwrap();
+    generate(&model, &mut state, 3);
+    let saved = state.replay_checkpoint().unwrap();
+    drop(state);
+    let mut resumed = model
+        .begin_replay_managed(&saved, caches(&model, 1).remove(0))
+        .unwrap();
+    let end = saved.replay_tokens();
+    // The first span ends inside an image, the second runs into the
+    // generated tokens.
+    let slot = model.config().image_token_id;
+    let cut = ids.iter().position(|id| *id == slot).unwrap() + 3;
+    assert!(!model.continue_replay(&mut resumed, ids, 0, cut).unwrap());
+    assert!(model.continue_replay(&mut resumed, ids, cut, end).unwrap());
+    assert_eq!(generate(&model, &mut resumed, steps), want);
+}
+
+#[test]
+fn a_large_image_is_fitted_to_the_token_limit() {
+    // Within the limit: untouched, whatever its shape.
+    assert_eq!(
+        fitted_image_size(1600, 1600, 40, MAX_IMAGE_TOKENS),
+        (1600, 1600)
+    );
+    assert_eq!(fitted_image_size(7, 10, 4, 6), (7, 10));
+    // A long strip within the limit is untouched too.
+    assert_eq!(
+        fitted_image_size(8192, 100, 40, MAX_IMAGE_TOKENS),
+        (8192, 100)
+    );
+    for (height, width) in [(4000, 3000), (8192, 2000), (1601, 1600)] {
+        let (h, w) = fitted_image_size(height, width, 40, MAX_IMAGE_TOKENS);
+        let tokens = image_tokens(h, w, 40);
+        assert!(tokens <= MAX_IMAGE_TOKENS, "{height}x{width} -> {h}x{w}");
+        // It is not shrunk further than it must be.
+        assert!(
+            tokens * 10 >= MAX_IMAGE_TOKENS * 8,
+            "{height}x{width} -> {tokens}"
+        );
+        // The shape is kept.
+        let (want, got) = (height as f64 / width as f64, h as f64 / w as f64);
+        assert!(
+            (got / want - 1.0).abs() < 0.05,
+            "{height}x{width} -> {h}x{w}"
+        );
+    }
 }
 
 /// Rows of a batch do not affect each other.

@@ -504,6 +504,7 @@ impl NativeExecutor {
                     NativeChatModel::Inkling2(_) => Self::run_blocking(|| {
                         model.start_inkling2_decode_state_managed(
                             &request.prompt_tokens,
+                            prepared_chat_prompt.and_then(|prepared| prepared.as_inkling2()),
                             max_new_tokens,
                             &generation_config,
                             cache,

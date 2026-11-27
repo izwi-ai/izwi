@@ -294,6 +294,7 @@ pub(crate) mod tests {
             CONTENT_TOOL_ERROR,
             END_MESSAGE,
             END_SAMPLING,
+            crate::models::architectures::inkling2::prompt::IMAGE_SLOT,
         ];
         let mut vocab = serde_json::Map::new();
         for byte in 0u32..bytes {

@@ -35,6 +35,9 @@ const ROPE_THETA: f32 = 10_000.0;
 const CHECKER: usize = 8;
 const CHECKER_LIGHT: i32 = 204;
 const CHECKER_DARK: i32 = 153;
+/// Most bytes of attention scores computed at once: heads are taken a few at
+/// a time so a large image's scores (quadratic in its patches) stay bounded.
+pub const ATTENTION_CHUNK_BYTES: usize = 256 << 20;
 /// The padding value on the 0-255 scale.
 const PAD_VALUE: f32 = -1.0;
 
@@ -381,9 +384,16 @@ impl Inkling2Vision {
             let query = heads_first(rotate(split(layer.query.forward(&x)?)?)?)?;
             let key = heads_first(rotate(split(layer.key.forward(&x)?)?)?)?;
             let value = heads_first(split(layer.value.forward(&x)?)?)?;
-            let scores = (query.matmul(&key.transpose(1, 2)?.contiguous()?)? * scale)?;
-            let attended = softmax(&scores, D::Minus1)?
-                .matmul(&value)?
+            let per_chunk = (ATTENTION_CHUNK_BYTES / (tokens * tokens * 4)).clamp(1, heads);
+            let mut attended = Vec::with_capacity(heads.div_ceil(per_chunk));
+            for first in (0..heads).step_by(per_chunk) {
+                let count = per_chunk.min(heads - first);
+                let keys = key.narrow(0, first, count)?.transpose(1, 2)?.contiguous()?;
+                let scores = (query.narrow(0, first, count)?.matmul(&keys)? * scale)?;
+                attended
+                    .push(softmax(&scores, D::Minus1)?.matmul(&value.narrow(0, first, count)?)?);
+            }
+            let attended = Tensor::cat(&attended, 0)?
                 .transpose(0, 1)?
                 .reshape((tokens, hidden))?;
             let attended = layer.output.forward(&attended)?;

@@ -3835,6 +3835,9 @@ async fn admin_models_expose_names_tasks_sizes_and_image_input() {
         .as_str()
         .is_some_and(|name| !name.is_empty() && name != "Qwen3.5-4B"));
 
+    let second_vision_chat = find("Inkling-2-Mini");
+    assert!(modalities(second_vision_chat).contains(&"image_input".to_string()));
+
     let text_chat = find("LFM2.5-1.2B-Instruct-GGUF");
     assert!(!modalities(text_chat).contains(&"image_input".to_string()));
 

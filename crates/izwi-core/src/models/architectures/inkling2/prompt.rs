@@ -19,7 +19,9 @@
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
-use crate::models::shared::chat::{ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole};
+use crate::models::shared::chat::{
+    ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole, CHAT_IMAGE_PLACEHOLDER,
+};
 use crate::tokenizer::Tokenizer;
 
 pub const MESSAGE_USER: &str = "<|message_user|>";
@@ -79,6 +81,47 @@ impl Inkling2Prompt {
         self.special(kind);
         self.text(text);
         self.special(END_MESSAGE);
+    }
+
+    /// A user or tool message whose text may carry image placeholders: each
+    /// stretch of text is its own text message and each placeholder an image
+    /// message of as many slots as `slots` yields for it, as the template
+    /// renders a list of content parts. With no slots the text is one text
+    /// message.
+    fn message_with_images(
+        &mut self,
+        role: &'static str,
+        name: &str,
+        text: &str,
+        slots: &mut Option<std::slice::Iter<'_, usize>>,
+    ) -> Result<()> {
+        let Some(slots) = slots else {
+            self.message(role, name, CONTENT_TEXT, text);
+            return Ok(());
+        };
+        if !text.contains(CHAT_IMAGE_PLACEHOLDER) {
+            self.message(role, name, CONTENT_TEXT, text);
+            return Ok(());
+        }
+        let mut parts = text.split(CHAT_IMAGE_PLACEHOLDER).peekable();
+        while let Some(part) = parts.next() {
+            if !part.is_empty() {
+                self.message(role, name, CONTENT_TEXT, part);
+            }
+            if parts.peek().is_some() {
+                let count = *slots.next().ok_or_else(|| {
+                    Error::InvalidInput("a message has more image placeholders than images".into())
+                })?;
+                self.special(role);
+                self.text(name);
+                self.special(CONTENT_IMAGE);
+                for _ in 0..count {
+                    self.special(IMAGE_SLOT);
+                }
+                self.special(END_MESSAGE);
+            }
+        }
+        Ok(())
     }
 
     /// The prompt as the template would print it.
@@ -339,10 +382,14 @@ pub fn forced_call(request: &ChatRequestConfig) -> Result<Option<ForcedCall>> {
     }))
 }
 
-/// Renders a conversation.
+/// Renders a conversation. `image_slots` holds the image-token count of
+/// every image the user and tool messages carry, in order; each takes the
+/// place of one image placeholder in their text. With none, placeholders are
+/// plain text.
 pub fn render_prompt(
     messages: &[ChatMessage],
     request: &ChatRequestConfig,
+    image_slots: &[usize],
 ) -> Result<Inkling2Prompt> {
     if messages.is_empty() {
         return Err(Error::InvalidInput(
@@ -350,6 +397,7 @@ pub fn render_prompt(
         ));
     }
     let mut prompt = Inkling2Prompt::default();
+    let mut slots = (!image_slots.is_empty()).then(|| image_slots.iter());
     if !request.tools.is_empty() {
         prompt.special(MESSAGE_SYSTEM);
         prompt.text("tool_declare");
@@ -372,14 +420,16 @@ pub fn render_prompt(
         }
         match message.role {
             ChatRole::System => prompt.message(MESSAGE_SYSTEM, "", CONTENT_TEXT, &message.content),
-            ChatRole::User => prompt.message(MESSAGE_USER, "", CONTENT_TEXT, &message.content),
+            ChatRole::User => {
+                prompt.message_with_images(MESSAGE_USER, "", &message.content, &mut slots)?
+            }
             ChatRole::Tool => {
                 let name = if pending_calls.is_empty() {
                     String::new()
                 } else {
                     pending_calls.remove(0)
                 };
-                prompt.message(MESSAGE_TOOL, &name, CONTENT_TEXT, &message.content);
+                prompt.message_with_images(MESSAGE_TOOL, &name, &message.content, &mut slots)?;
             }
             ChatRole::Assistant => {
                 let turn = parse_assistant_text(&message.content);
@@ -410,6 +460,12 @@ pub fn render_prompt(
     if !effort_written {
         prompt.message(MESSAGE_SYSTEM, "", CONTENT_TEXT, &effort);
     }
+    if slots.is_some_and(|mut slots| slots.next().is_some()) {
+        return Err(Error::InvalidInput(
+            "a request has more images than its user and tool messages have image placeholders"
+                .into(),
+        ));
+    }
     // A forced call to a named function: open the call for the model, which
     // continues with the arguments.
     if let Some(ForcedCall::Named { name, json }) = forced_call(request)? {
@@ -433,8 +489,11 @@ mod tests {
     /// A fixture conversation (OpenAI form) as the server hands it to a
     /// family: text only, reasoning and tool calls folded into the assistant
     /// text.
-    fn as_server_messages(case: &Value) -> Option<Vec<ChatMessage>> {
+    /// A case's messages as the server hands them to a family, and the slot
+    /// count of each image they carry (one, as the template writes it).
+    fn as_server_messages(case: &Value) -> Option<(Vec<ChatMessage>, Vec<usize>)> {
         let mut out = Vec::new();
+        let mut slots = Vec::new();
         for message in case["messages"].as_array().unwrap() {
             let role = match message["role"].as_str().unwrap() {
                 "system" => ChatRole::System,
@@ -444,8 +503,32 @@ mod tests {
                 other => panic!("role {other}"),
             };
             // Content given as parts is joined by the server before it
-            // reaches a family; those cases are not comparable.
-            let text = message["content"].as_str()?;
+            // reaches a family, an image part as its placeholder. Two text
+            // parts in a row become one text there; those cases are not
+            // comparable.
+            let joined;
+            let text = match &message["content"] {
+                Value::String(text) => text.as_str(),
+                Value::Array(parts) => {
+                    let mut text = String::new();
+                    let mut after_text = false;
+                    for part in parts {
+                        if part["type"] == "image" {
+                            text.push_str(CHAT_IMAGE_PLACEHOLDER);
+                            slots.push(1);
+                            after_text = false;
+                        } else if after_text {
+                            return None;
+                        } else {
+                            text.push_str(part["text"].as_str()?);
+                            after_text = true;
+                        }
+                    }
+                    joined = text;
+                    joined.as_str()
+                }
+                _ => return None,
+            };
             let mut content =
                 assistant_content_with_reasoning(message["reasoning_content"].as_str(), text);
             if let Some(calls) = message["tool_calls"].as_array() {
@@ -453,7 +536,7 @@ mod tests {
             }
             out.push(ChatMessage { role, content });
         }
-        Some(out)
+        Some((out, slots))
     }
 
     fn request_of(case: &Value) -> ChatRequestConfig {
@@ -489,15 +572,18 @@ mod tests {
             if request.tools.iter().any(Value::is_null) {
                 continue;
             }
-            let Some(messages) = as_server_messages(case) else {
+            let Some((messages, slots)) = as_server_messages(case) else {
                 continue;
             };
-            let rendered = render_prompt(&messages, &request).unwrap().rendered();
+            let rendered = render_prompt(&messages, &request, &slots)
+                .unwrap()
+                .rendered();
             let want = case["rendered"].as_str().unwrap();
             assert_eq!(rendered, want, "case {name}");
             compared.push(name.to_string());
         }
         for needed in [
+            "image_parts",
             "one_user_turn",
             "system_then_user",
             "two_system_messages",
@@ -548,6 +634,38 @@ mod tests {
     }
 
     #[test]
+    fn images_take_their_placeholders_in_order() {
+        let user = |content: &str| ChatMessage {
+            role: ChatRole::User,
+            content: content.into(),
+        };
+        let request = ChatRequestConfig::default();
+        let two = format!("Compare {CHAT_IMAGE_PLACEHOLDER} with {CHAT_IMAGE_PLACEHOLDER}");
+        let rendered = render_prompt(&[user(&two)], &request, &[2, 3])
+            .unwrap()
+            .rendered();
+        let image = |count: usize| {
+            format!(
+                "{MESSAGE_USER}{CONTENT_IMAGE}{}{END_MESSAGE}",
+                IMAGE_SLOT.repeat(count)
+            )
+        };
+        assert!(rendered.ends_with(&format!(
+            "{MESSAGE_USER}{CONTENT_TEXT}Compare {END_MESSAGE}{}{MESSAGE_USER}{CONTENT_TEXT} with {END_MESSAGE}{}",
+            image(2),
+            image(3)
+        )));
+        // Images and placeholders must pair off.
+        assert!(render_prompt(&[user(&two)], &request, &[2]).is_err());
+        assert!(render_prompt(&[user(&two)], &request, &[2, 3, 1]).is_err());
+        // Without images the placeholder is text like any other.
+        let plain = render_prompt(&[user(&two)], &request, &[])
+            .unwrap()
+            .rendered();
+        assert!(plain.contains(CHAT_IMAGE_PLACEHOLDER));
+    }
+
+    #[test]
     fn a_forced_call_opens_the_tool_message() {
         let request = ChatRequestConfig {
             response_prefix: "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": ".to_string(),
@@ -557,7 +675,7 @@ mod tests {
             role: ChatRole::User,
             content: "Weather?".into(),
         }];
-        let rendered = render_prompt(&messages, &request).unwrap().rendered();
+        let rendered = render_prompt(&messages, &request, &[]).unwrap().rendered();
         assert!(rendered.ends_with(
             "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":"
         ));
@@ -569,7 +687,7 @@ mod tests {
             ..ChatRequestConfig::default()
         };
         assert_eq!(forced_call(&request).unwrap(), Some(ForcedCall::Any));
-        let rendered = render_prompt(&messages, &request).unwrap().rendered();
+        let rendered = render_prompt(&messages, &request, &[]).unwrap().rendered();
         assert!(rendered.ends_with("<|content_text|>Weather?<|end_message|>"));
     }
 
@@ -585,7 +703,7 @@ mod tests {
             ChatMessage { role: ChatRole::Tool, content: "2".into() },
             ChatMessage { role: ChatRole::Tool, content: "3".into() },
         ];
-        let rendered = render_prompt(&messages, &ChatRequestConfig::default())
+        let rendered = render_prompt(&messages, &ChatRequestConfig::default(), &[])
             .unwrap()
             .rendered();
         assert!(rendered.ends_with(

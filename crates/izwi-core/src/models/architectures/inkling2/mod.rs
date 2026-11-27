@@ -47,7 +47,7 @@ mod vision_tests;
 
 pub use chat::{
     ChatDecodeState as Inkling2ChatDecodeState, ChatDecodeStep as Inkling2ChatDecodeStep,
-    Inkling2ChatModel,
+    Inkling2ChatModel, Inkling2PreparedPrompt,
 };
 pub use checkpoint::Inkling2Checkpoint;
 pub use config::{Inkling2Config, Inkling2LayerKind};

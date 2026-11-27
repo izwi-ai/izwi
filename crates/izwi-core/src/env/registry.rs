@@ -1557,7 +1557,7 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         Path,
         "unset (local file media disabled)",
         Once,
-        "Sets the absolute directory Qwen3.5 vision may read file:// media from; unset disables local media.",
+        "Sets the absolute directory chat image input may read file:// media from; unset disables local media.",
     ),
     CoreEnvVar::new(
         "IZWI_METAL_DTYPE",

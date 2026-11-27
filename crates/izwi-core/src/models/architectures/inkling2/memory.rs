@@ -3,14 +3,14 @@
 //! * The **experts** stay in their stored form (NVFP4 codes with FP8 block
 //!   scales, MXFP8 values with scale bytes) and are read from the mapped
 //!   file on every backend; they are host (or unified) memory, never copied.
-//! * Every **dense** text tensor is held in F32 on the device the model is
-//!   loaded on, the unembedding without its padded rows. The routers'
-//!   weights and biases are host F32.
-//! * The vision tower and the MTP head are not loaded.
+//! * Every **dense** tensor, the text trunk's and the vision tower's, is
+//!   held in F32 on the device the model is loaded on, the unembedding
+//!   without its padded rows. The routers' weights and biases are host F32.
+//! * The MTP head is not loaded.
 
 use std::path::Path;
 
-use super::checkpoint::{expected_census, Inkling2Checkpoint, Stored, TEXT_PREFIX};
+use super::checkpoint::{expected_census, Inkling2Checkpoint, Stored, TEXT_PREFIX, VISION_PREFIX};
 use super::config::Inkling2Config;
 use crate::backends::BackendKind;
 use crate::error::Result;
@@ -19,8 +19,11 @@ use crate::error::Result;
 pub struct Inkling2Footprint {
     /// Stored bytes of every expert tensor.
     pub expert_bytes: u64,
-    /// F32 bytes of the dense tensors on the device.
+    /// F32 bytes of the dense tensors on the device, the vision tower's
+    /// among them.
     pub dense_bytes: u64,
+    /// The vision tower's share of `dense_bytes`.
+    pub vision_bytes: u64,
     /// F32 bytes of the routers on the host.
     pub router_bytes: u64,
     /// F32 bytes of the largest dense tensor (the embedding).
@@ -32,15 +35,20 @@ impl Inkling2Footprint {
         let mut footprint = Self {
             expert_bytes: 0,
             dense_bytes: 0,
+            vision_bytes: 0,
             router_bytes: 0,
             largest_dense_bytes: 0,
         };
         let unembedding = format!("{TEXT_PREFIX}.unembed.weight");
         for entry in expected_census(config, checkpoint.expert_formats()) {
-            if !entry.name.starts_with(TEXT_PREFIX) {
+            let vision = entry.name.starts_with(VISION_PREFIX);
+            if !vision && !entry.name.starts_with(TEXT_PREFIX) {
                 continue;
             }
             let elements = entry.shape.iter().product::<usize>() as u64;
+            if vision {
+                footprint.vision_bytes += elements * 4;
+            }
             match entry.stored {
                 Stored::Dense | Stored::DenseF32 => {
                     let elements = if entry.name == unembedding {
@@ -160,6 +168,12 @@ mod tests {
             (config.vocab * config.hidden * 4) as u64
         );
         assert!(footprint.dense_bytes > footprint.largest_dense_bytes);
+        // The vision tower is loaded with the model and priced with it.
+        assert_eq!(
+            footprint.vision_bytes,
+            checkpoint.stored_bytes_under(VISION_PREFIX) * 2
+        );
+        assert!(footprint.vision_bytes > 0 && footprint.vision_bytes < footprint.dense_bytes);
         // On the device, CUDA holds the experts and the host only the routers.
         assert_eq!(
             footprint.resident_bytes(BackendKind::Cuda, true),
@@ -177,7 +191,8 @@ mod tests {
     }
 
     /// The published model, priced from its config and the published expert
-    /// formats: 14.6 GiB of packed experts and 6.0 GiB of F32 dense tensors.
+    /// formats: 14.6 GiB of packed experts, 6.0 GiB of F32 dense text
+    /// tensors and 1.2 GiB of F32 vision tensors.
     #[test]
     fn the_published_checkpoint_fits_the_documented_sizes() {
         let config = published();
@@ -192,11 +207,16 @@ mod tests {
             .collect::<Vec<_>>();
         let mut expert_bytes = 0u64;
         let mut dense_bytes = 0u64;
+        let mut vision_bytes = 0u64;
         for entry in expected_census(&config, &formats) {
+            let elements = entry.shape.iter().product::<usize>() as u64;
+            if entry.name.starts_with(VISION_PREFIX) {
+                vision_bytes += elements * 4;
+                continue;
+            }
             if !entry.name.starts_with(TEXT_PREFIX) {
                 continue;
             }
-            let elements = entry.shape.iter().product::<usize>() as u64;
             match entry.stored {
                 Stored::Dense | Stored::DenseF32 => dense_bytes += elements * 4,
                 Stored::U8 | Stored::Fp8 => expert_bytes += elements,
@@ -213,6 +233,11 @@ mod tests {
             (dense_bytes as f64 / gib - 5.99).abs() < 0.05,
             "{}",
             dense_bytes as f64 / gib
+        );
+        assert!(
+            (vision_bytes as f64 / gib - 1.2).abs() < 0.1,
+            "{}",
+            vision_bytes as f64 / gib
         );
     }
 }

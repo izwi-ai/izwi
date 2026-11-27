@@ -86,6 +86,7 @@ Each has a test, and breaking each fails the parity test:
 | --- | --- | --- | --- |
 | Experts, as stored (14.6 GiB) | mapped file | mapped file | device, uploaded as stored (the mapped file if they run on the host) |
 | Dense text tensors, F32 (6.0 GiB) | host | device | device |
+| Vision tower, F32 (1.2 GiB) | host | device | device |
 | Routers, F32 | host | host | host, and a device copy with the experts |
 | Keys and values | F32 | F16 | BF16 |
 
@@ -132,9 +133,43 @@ The served path is the composed trunk on every backend:
 
 Not implemented yet: a fused paged attention kernel with the position bias
 and sink (which a whole-step graph needs: until then 48 attention cores per
-token run eagerly), fused convolution kernels, device experts on Metal, dense tensors in the checkpoint's BF16, image input (the vision
-tower is not loaded), prefix sharing, releasing windowed pages, the MTP
-head, and grammar-constrained tool calls and JSON output.
+token run eagerly), fused convolution kernels, device experts on Metal, dense
+tensors in the checkpoint's BF16, prefix sharing, releasing windowed pages,
+the MTP head, and grammar-constrained tool calls and JSON output.
+
+## Image input
+
+`vision.rs` follows transformers' `Inkling2ImageProcessor` and
+`Inkling2VisionModel`.
+
+- An image is used at its own resolution: one image token per 40 x 40 pixels,
+  rounded up per side. Transparency is composited over a checkerboard, and the
+  bottom and right are padded to whole cells with a value just below black.
+- The tower (23 layers, width 1024) embeds 20-pixel patches, adds a learned
+  32 x 32 position grid resampled bilinearly to the image's patch grid, rotates
+  queries and keys by patch row and column, and projects each cell's 2 x 2
+  patches to one language-model embedding. Images are encoded one at a time;
+  attention heads are taken a few at a time so the scores of a large image
+  stay within 256 MiB.
+- The prompt writes each image as its own message (`role`,
+  `<|content_image|>`, one `<|unused_200054|>` slot per image token,
+  `<|end_message|>`). The image's embeddings replace the slots' token
+  embeddings after the embedding norm.
+- The server marks an image's place in a message's text with
+  `CHAT_IMAGE_PLACEHOLDER`; the prompt renderer splits user and tool messages
+  on it. Fetching and decoding (data URL, guarded public URL, a file under
+  `IZWI_MEDIA_LOCAL_ROOT`) is `models/shared/media`, shared with Qwen3.5.
+- A prompt with images travels as a prepared artifact
+  (`NativeChatPreparedPrompt::Inkling2`): its tokens and the image features on
+  the host. The decode state keeps the features, so prefill in spans and a
+  replay after suspension put them back in the same slots.
+
+Two limits are this server's, not the model's: a request carries at most 4
+images, and an image that would take more than 1,600 image tokens
+(1,600 x 1,600 pixels) is scaled down, keeping its shape, until it fits. The
+reference never resizes; the tower's attention is quadratic in the patch
+count. The tower is loaded with the model in F32 (1.2 GiB as published) and
+is part of the load's admission figures.
 
 ## Chat surface
 
@@ -161,6 +196,8 @@ head, and grammar-constrained tool calls and JSON output.
 | Prompt against the published template | CPU test | passes |
 | Trunk on the Metal device; serving on a Metal cache with F32 keys (logit error 1.4e-4, greedy tokens equal) and with F16 keys as served (logit error 0.10 on the random fixture) | Metal tests, M-series Mac | passes |
 | The reference fixture against Transformers itself, every layer application and the logits | `generate_inkling2_golden.py --check-transformers`, Transformers 5.24.1 | passes: F64 logits within 1e-12 |
+| Image cells, vision features and the logits of a prompt with two images against the reference fixture; prefill in spans that cut an image; replay with images | CPU test | passes |
+| An image chat through the runtime: PNG data URLs, two requests at once, failures that leave the model serving | CPU test, synthetic checkpoint | passes |
 | Real checkpoint on any backend | a machine with 24 GB+ | not run |
 | Device experts inside the served model, on the kernels' CPU reference: load check, logits, greedy tokens equal to the host path | CPU test | passes |
 | The CUDA expert kernels' source, run on the host one thread at a time against an independent evaluation | `scripts/cuda-host-emulation/moe_packed.cpp` | passes |

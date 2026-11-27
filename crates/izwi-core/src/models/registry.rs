@@ -28,7 +28,9 @@ use crate::models::architectures::chatterbox::ChatterboxTtsModel;
 use crate::models::architectures::fish_drama3::FishDrama3Model;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
 use crate::models::architectures::audio8::Audio8TtsModel;
-use crate::models::architectures::inkling2::{Inkling2ChatDecodeState, Inkling2ChatModel};
+use crate::models::architectures::inkling2::{
+    Inkling2ChatDecodeState, Inkling2ChatModel, Inkling2PreparedPrompt,
+};
 use crate::models::architectures::gemma3::chat::{
     ChatDecodeCheckpoint as Gemma3ChatDecodeCheckpoint, ChatDecodeState as Gemma3ChatDecodeState,
     Gemma3ChatModel,
@@ -6323,6 +6325,8 @@ pub enum NativeChatPreparedPrompt {
     Qwen35(Qwen35PreparedPrompt),
     Qwen36Moe(Qwen36PreparedPrompt),
     Qwen38(Qwen38PreparedPrompt),
+    /// A prompt with images; a text prompt has no artifact.
+    Inkling2(Inkling2PreparedPrompt),
 }
 
 /// The end of a prompt's first turn (the system turn, with any tools, when
@@ -6344,6 +6348,7 @@ impl NativeChatPreparedPrompt {
             Self::Qwen35(prepared) => prepared.prompt_ids(),
             Self::Qwen36Moe(prepared) => prepared.prompt_ids(),
             Self::Qwen38(prepared) => prepared.prompt_ids(),
+            Self::Inkling2(prepared) => prepared.prompt_ids(),
         }
     }
 
@@ -6352,6 +6357,7 @@ impl NativeChatPreparedPrompt {
             Self::Qwen35(_) => ModelFamily::Qwen35Chat,
             Self::Qwen36Moe(_) => ModelFamily::Qwen35MoeChat,
             Self::Qwen38(_) => ModelFamily::Qwen38Chat,
+            Self::Inkling2(_) => ModelFamily::Inkling2Chat,
         }
     }
 
@@ -6362,6 +6368,8 @@ impl NativeChatPreparedPrompt {
             Self::Qwen35(prepared) => prepared.history_boundary(),
             Self::Qwen36Moe(prepared) => prepared.history_boundary(),
             Self::Qwen38(prepared) => prepared.history_boundary(),
+            // Prompts with images share no prefix.
+            Self::Inkling2(_) => None,
         }
     }
 
@@ -6377,21 +6385,28 @@ impl NativeChatPreparedPrompt {
     pub(crate) fn as_qwen35(&self) -> Option<&Qwen35PreparedPrompt> {
         match self {
             Self::Qwen35(prepared) => Some(prepared),
-            Self::Qwen36Moe(_) | Self::Qwen38(_) => None,
+            Self::Qwen36Moe(_) | Self::Qwen38(_) | Self::Inkling2(_) => None,
+        }
+    }
+
+    pub(crate) fn as_inkling2(&self) -> Option<&Inkling2PreparedPrompt> {
+        match self {
+            Self::Inkling2(prepared) => Some(prepared),
+            Self::Qwen35(_) | Self::Qwen36Moe(_) | Self::Qwen38(_) => None,
         }
     }
 
     pub(crate) fn as_qwen36_moe(&self) -> Option<&Qwen36PreparedPrompt> {
         match self {
             Self::Qwen36Moe(prepared) => Some(prepared),
-            Self::Qwen35(_) | Self::Qwen38(_) => None,
+            Self::Qwen35(_) | Self::Qwen38(_) | Self::Inkling2(_) => None,
         }
     }
 
     pub(crate) fn as_qwen38(&self) -> Option<&Qwen38PreparedPrompt> {
         match self {
             Self::Qwen38(prepared) => Some(prepared),
-            Self::Qwen35(_) | Self::Qwen36Moe(_) => None,
+            Self::Qwen35(_) | Self::Qwen36Moe(_) | Self::Inkling2(_) => None,
         }
     }
 }
@@ -6768,6 +6783,13 @@ impl NativeChatModel {
                 Ok((
                     prepared.prompt_ids().to_vec(),
                     Some(NativeChatPreparedPrompt::Qwen38(prepared)),
+                ))
+            }
+            Self::Inkling2(model) if !config.request.media_inputs.is_empty() => {
+                let prepared = model.prepare_prompt(messages, config)?;
+                Ok((
+                    prepared.prompt_ids().to_vec(),
+                    Some(NativeChatPreparedPrompt::Inkling2(prepared)),
                 ))
             }
             _ => Ok((self.prompt_token_ids_with_config(messages, config)?, None)),
@@ -7492,6 +7514,24 @@ impl NativeChatModel {
                     target_cache,
                 )?),
             ),
+            Self::Inkling2(model) if mtp_cache.is_none() => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_inkling2)
+                    .filter(|prepared| prepared.prompt_ids() == prompt_ids)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Inkling 2 prefill was given another prompt's prepared artifact".into(),
+                        )
+                    })?;
+                Ok(NativeChatDecodeState::Inkling2(
+                    model.begin_prepared_prefill_managed(
+                        prepared,
+                        max_new_tokens,
+                        config,
+                        target_cache,
+                    )?,
+                ))
+            }
             Self::Lfm2(model) if prepared.is_none() && mtp_cache.is_none() => Ok(
                 NativeChatDecodeState::Lfm2(model.begin_resumable_prefill_state_managed(
                     prompt_ids,
@@ -7597,8 +7637,14 @@ impl NativeChatModel {
                     model.continue_resumable_prefill(state, prompt_ids, span_start, span_end)?;
                 (complete, state.prefill_progress())
             }
+            // A prompt with images: the state took the features when it
+            // began, so the artifact only has to be this prompt's.
             (Self::Inkling2(model), NativeChatDecodeState::Inkling2(state))
-                if prepared.is_none() =>
+                if prepared.is_none_or(|prepared| {
+                    prepared
+                        .as_inkling2()
+                        .is_some_and(|prepared| prepared.prompt_ids() == prompt_ids)
+                }) =>
             {
                 let complete =
                     model.continue_resumable_prefill(state, prompt_ids, span_start, span_end)?;
@@ -7652,12 +7698,21 @@ impl NativeChatModel {
     pub(crate) fn start_inkling2_decode_state_managed(
         &self,
         prompt_ids: &[u32],
+        prepared: Option<&Inkling2PreparedPrompt>,
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<NativeChatDecodeState> {
-        match self {
-            Self::Inkling2(model) => Ok(NativeChatDecodeState::Inkling2(
+        match (self, prepared) {
+            (Self::Inkling2(model), Some(prepared)) if prepared.prompt_ids() == prompt_ids => {
+                Ok(NativeChatDecodeState::Inkling2(
+                    model.start_prepared_decode_managed(prepared, max_new_tokens, config, cache)?,
+                ))
+            }
+            (Self::Inkling2(_), Some(_)) => Err(Error::InvalidInput(
+                "Inkling 2 was given another prompt's prepared artifact".into(),
+            )),
+            (Self::Inkling2(model), None) => Ok(NativeChatDecodeState::Inkling2(
                 model.start_decode_managed(prompt_ids, max_new_tokens, config, cache)?,
             )),
             _ => Err(Error::InvalidInput(

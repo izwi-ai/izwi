@@ -15,12 +15,13 @@ use tracing::info;
 
 use super::checkpoint::Inkling2Checkpoint;
 use super::config::Inkling2Config;
-use super::prompt::{forced_call, render_prompt};
+use super::prompt::{forced_call, render_prompt, IMAGE_SLOT};
 use super::reply::{Inkling2Reply, Inkling2ReplyTokens};
 use super::state::{
     kv_dtype, managed_contract, paged_geometry, Inkling2ConvRuntimeState, Inkling2PagedContext,
 };
 use super::trunk::Inkling2Trunk;
+use super::vision::{image_tokens, preprocess_image, Inkling2Vision};
 use crate::backends::kv::KvWriteBatchCompletion;
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, TensorStateArena,
@@ -31,7 +32,12 @@ use crate::kernels::cuda::stretch_graphs::StretchGraphs;
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
-use crate::models::shared::chat::{replay_journal_span, ChatGenerationConfig, ChatMessage};
+use crate::models::shared::chat::{
+    replay_journal_span, ChatGenerationConfig, ChatMediaInput, ChatMessage,
+};
+use crate::models::shared::media::{
+    decode_image, fetch_media_bytes, image_media_host_bytes, MediaResourceEstimate,
+};
 use crate::models::shared::sampling::{resolve_token_logprob, ChatSampler};
 use crate::tokenizer::Tokenizer;
 
@@ -119,6 +125,102 @@ fn chat_error(message: impl std::fmt::Display) -> Error {
     Error::InferenceError(format!("Inkling 2 chat: {message}"))
 }
 
+/// Images a request may carry.
+pub const MAX_IMAGES: usize = 4;
+/// Image tokens one image may take. The reference never resizes an image;
+/// the vision tower's attention is quadratic in four times this, so a larger
+/// image is scaled down to fit (1,600 tokens is 1,600 x 1,600 pixels).
+pub const MAX_IMAGE_TOKENS: usize = 1_600;
+
+/// Device bytes the vision tower works in for one image: a chunk of
+/// attention scores, its softmax and product, and the widest activations.
+const VISION_WORKSPACE_BYTES: u64 = 1 << 30;
+
+/// Host and device bytes a request's images need while its prompt is
+/// prepared. Rejects more than [`MAX_IMAGES`], anything that is not an
+/// image, and an empty source.
+pub fn media_resource_estimate(media_inputs: &[ChatMediaInput]) -> Result<MediaResourceEstimate> {
+    let host_bytes = image_media_host_bytes(media_inputs, "Inkling 2")?;
+    Ok(MediaResourceEstimate {
+        host_bytes,
+        backend_tensor_bytes: if media_inputs.is_empty() {
+            0
+        } else {
+            VISION_WORKSPACE_BYTES
+        },
+    })
+}
+
+/// A decoded image: `[height, width, channels]` U8 with 3 (RGB) or 4 (RGBA)
+/// channels.
+#[derive(Debug, Clone)]
+pub struct Inkling2ImageInput {
+    pub height: usize,
+    pub width: usize,
+    pub channels: usize,
+    pub pixels: Vec<u8>,
+}
+
+/// The size an image is used at: its own unless it would take more than
+/// `max_tokens` image tokens, then the largest size of the same shape that
+/// fits.
+pub fn fitted_image_size(
+    height: usize,
+    width: usize,
+    cell: usize,
+    max_tokens: usize,
+) -> (usize, usize) {
+    if image_tokens(height, width, cell) <= max_tokens {
+        return (height, width);
+    }
+    let scale = ((max_tokens * cell * cell) as f64 / (height * width) as f64).sqrt();
+    let (mut h, mut w) = (
+        ((height as f64 * scale).floor() as usize).max(1),
+        ((width as f64 * scale).floor() as usize).max(1),
+    );
+    // Rounding each side up to whole cells can still overshoot.
+    while image_tokens(h, w, cell) > max_tokens {
+        if h >= w && h > 1 {
+            h -= 1;
+        } else if w > 1 {
+            w -= 1;
+        } else {
+            break;
+        }
+    }
+    (h, w)
+}
+
+/// A prompt that carries images: its tokens, with one image slot per image
+/// token, and the features that take the slots' place. The features are on
+/// the host (`[slots, hidden]`, F32) so a suspended session holds no device
+/// memory for them.
+#[derive(Debug, Clone)]
+pub struct Inkling2PreparedPrompt {
+    prompt_ids: Vec<u32>,
+    image_features: Tensor,
+}
+
+impl Inkling2PreparedPrompt {
+    pub fn prompt_ids(&self) -> &[u32] {
+        &self.prompt_ids
+    }
+
+    /// Image tokens in the prompt.
+    pub fn image_tokens(&self) -> usize {
+        self.image_features.dim(0).unwrap_or(0)
+    }
+}
+
+/// The image features a span needs: `used` of them belong to tokens before
+/// the span, and only the span's first `prompt` tokens are prompt tokens (a
+/// generated token is never an image slot, whatever its id).
+struct SpanImages<'a> {
+    features: &'a Tensor,
+    used: usize,
+    prompt: usize,
+}
+
 pub struct ChatDecodeState {
     conv: Inkling2ConvRuntimeState,
     physical_kv: PhysicalPagedKvCache,
@@ -139,6 +241,8 @@ pub struct ChatDecodeState {
     replay_end: Option<usize>,
     /// Logprob entries of the current decode step, drained by the registry.
     pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
+    /// Features of the prompt's image tokens, on the host.
+    image_features: Option<Tensor>,
 }
 
 pub(crate) struct ChatDecodeCheckpoint {
@@ -155,8 +259,9 @@ pub(crate) struct ChatDecodeCheckpoint {
 }
 
 /// CPU continuation record of a session released for capacity. It owns no
-/// tensors; the released state is rebuilt by replaying the prompt and every
-/// generated token but the pending one.
+/// device tensors (a prompt's image features are host memory); the released
+/// state is rebuilt by replaying the prompt and every generated token but the
+/// pending one.
 #[derive(Clone)]
 pub(crate) struct ChatReplayCheckpoint {
     replay_tokens: usize,
@@ -166,6 +271,7 @@ pub(crate) struct ChatReplayCheckpoint {
     sampler: ChatSampler,
     reply: Inkling2Reply,
     max_new_tokens: usize,
+    image_features: Option<Tensor>,
 }
 
 impl ChatReplayCheckpoint {
@@ -213,6 +319,7 @@ impl ChatDecodeState {
             sampler: self.sampler.clone(),
             reply: self.reply.clone(),
             max_new_tokens: self.max_new_tokens,
+            image_features: self.image_features.clone(),
         })
     }
 
@@ -348,6 +455,8 @@ pub struct Inkling2ChatModel {
     experts: ExpertPlacement,
     /// CUDA graphs of a decode step's pure stages, or why there are none.
     graphs: std::result::Result<StretchGraphs, String>,
+    /// The vision tower, when the checkpoint has one.
+    vision: Option<Inkling2Vision>,
 }
 
 impl InferenceStateContractProvider for Inkling2ChatModel {
@@ -475,6 +584,11 @@ impl Inkling2ChatModel {
         } else {
             Err("the experts run on the host".to_string())
         };
+        let vision = config
+            .vision
+            .is_some()
+            .then(|| Inkling2Vision::load(checkpoint, &config, &device.device))
+            .transpose()?;
         let max_context_tokens = config.max_context_tokens.min(DEFAULT_MAX_CONTEXT_TOKENS);
         info!(
             "Loaded Inkling 2 chat model on {:?} from {} ({} layer applications, {:.1} GiB of packed experts, {} context tokens)",
@@ -494,6 +608,7 @@ impl Inkling2ChatModel {
             max_context_tokens,
             experts,
             graphs,
+            vision,
         })
     }
 
@@ -595,10 +710,158 @@ impl Inkling2ChatModel {
     ) -> Result<Vec<u32>> {
         if !config.request.media_inputs.is_empty() {
             return Err(Error::InvalidInput(
-                "Inkling 2 image input is not available yet".to_string(),
+                "an Inkling 2 prompt with images is prepared with its images".to_string(),
             ));
         }
-        render_prompt(messages, &config.request)?.encode(&self.tokenizer)
+        render_prompt(messages, &config.request, &[])?.encode(&self.tokenizer)
+    }
+
+    /// Whether this checkpoint takes images.
+    pub fn accepts_images(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// Image tokens `image` takes in a prompt, after any scaling down.
+    pub fn image_tokens_for(&self, height: usize, width: usize) -> Result<usize> {
+        let cell = self.vision()?.config().cell();
+        let (height, width) = fitted_image_size(height, width, cell, MAX_IMAGE_TOKENS);
+        Ok(image_tokens(height, width, cell))
+    }
+
+    fn vision(&self) -> Result<&Inkling2Vision> {
+        self.vision.as_ref().ok_or_else(|| {
+            Error::InvalidInput("this Inkling 2 checkpoint has no vision tower".to_string())
+        })
+    }
+
+    /// Renders a conversation whose messages carry `images` in order (one
+    /// per image placeholder), encodes the images and seals both. Each image
+    /// must already fit [`MAX_IMAGE_TOKENS`] (see [`fitted_image_size`]).
+    pub fn prepare_prompt_with_images(
+        &self,
+        messages: &[ChatMessage],
+        config: &ChatGenerationConfig,
+        images: &[Inkling2ImageInput],
+    ) -> Result<Inkling2PreparedPrompt> {
+        let vision = self.vision()?;
+        if images.is_empty() || images.len() > MAX_IMAGES {
+            return Err(Error::InvalidInput(format!(
+                "Inkling 2 takes 1 to {MAX_IMAGES} images per request, not {}",
+                images.len()
+            )));
+        }
+        let cell = vision.config().cell();
+        let mut slots = Vec::with_capacity(images.len());
+        let mut features = Vec::with_capacity(images.len());
+        for image in images {
+            let cells = preprocess_image(
+                &image.pixels,
+                image.height,
+                image.width,
+                image.channels,
+                cell,
+            )?;
+            if cells.tokens() > MAX_IMAGE_TOKENS {
+                return Err(Error::InvalidInput(format!(
+                    "an image of {}x{} pixels takes {} image tokens; the limit is {MAX_IMAGE_TOKENS}",
+                    image.width,
+                    image.height,
+                    cells.tokens()
+                )));
+            }
+            slots.push(cells.tokens());
+            features.push(
+                vision
+                    .encode(&cells)?
+                    .to_device(&candle_core::Device::Cpu)?,
+            );
+        }
+        let prompt_ids =
+            render_prompt(messages, &config.request, &slots)?.encode(&self.tokenizer)?;
+        let image_features = Tensor::cat(&features, 0)?;
+        let slot_id = self.config.image_token_id;
+        if super::prompt::special_id(&self.tokenizer, IMAGE_SLOT)? != slot_id {
+            return Err(chat_error(
+                "the tokenizer's image slot is not the config's image token",
+            ));
+        }
+        let in_prompt = prompt_ids.iter().filter(|id| **id == slot_id).count();
+        if in_prompt != image_features.dim(0)? {
+            return Err(Error::InvalidInput(format!(
+                "the prompt has {in_prompt} image tokens for {} image features; text may not contain the image token",
+                image_features.dim(0)?
+            )));
+        }
+        Ok(Inkling2PreparedPrompt {
+            prompt_ids,
+            image_features,
+        })
+    }
+
+    /// The prompt of a request with images: fetches and decodes each image,
+    /// scales down one that would take more than [`MAX_IMAGE_TOKENS`], and
+    /// seals the tokens with the image features.
+    pub fn prepare_prompt(
+        &self,
+        messages: &[ChatMessage],
+        config: &ChatGenerationConfig,
+    ) -> Result<Inkling2PreparedPrompt> {
+        let cell = self.vision()?.config().cell();
+        media_resource_estimate(&config.request.media_inputs)?;
+        let images = config
+            .request
+            .media_inputs
+            .iter()
+            .map(|media| {
+                let image = decode_image(&fetch_media_bytes(&media.source)?)?;
+                let (width, height) = (image.width() as usize, image.height() as usize);
+                let (fit_height, fit_width) =
+                    fitted_image_size(height, width, cell, MAX_IMAGE_TOKENS);
+                let image = if (fit_height, fit_width) == (height, width) {
+                    image
+                } else {
+                    image.resize_exact(
+                        fit_width as u32,
+                        fit_height as u32,
+                        image::imageops::FilterType::CatmullRom,
+                    )
+                };
+                let (channels, pixels) = if image.color().has_alpha() {
+                    (4, image.to_rgba8().into_raw())
+                } else {
+                    (3, image.to_rgb8().into_raw())
+                };
+                Ok(Inkling2ImageInput {
+                    height: fit_height,
+                    width: fit_width,
+                    channels,
+                    pixels,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.prepare_prompt_with_images(messages, config, &images)
+    }
+
+    /// What a span of the journal (`prompt_ids`, then generated tokens)
+    /// needs of the prompt's image features.
+    fn span_images<'a>(
+        &self,
+        features: Option<&'a Tensor>,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+    ) -> Option<SpanImages<'a>> {
+        let features = features?;
+        let slot = self.config.image_token_id;
+        let before = span_start.min(prompt_ids.len());
+        Some(SpanImages {
+            features,
+            used: prompt_ids[..before]
+                .iter()
+                .filter(|id| **id == slot)
+                .count(),
+            prompt: span_end.min(prompt_ids.len()).saturating_sub(span_start),
+        })
     }
 
     /// Runs `tokens` at positions `start..` and commits their keys, values
@@ -611,6 +874,7 @@ impl Inkling2ChatModel {
         cache: &mut PhysicalPagedKvCache,
         conv: &mut Inkling2ConvRuntimeState,
         want_logits: bool,
+        images: Option<SpanImages<'_>>,
     ) -> Result<Option<Tensor>> {
         if tokens.is_empty() || cache.context_len() != start || conv.cursor() != start as u64 {
             return Err(chat_error(format!(
@@ -620,7 +884,23 @@ impl Inkling2ChatModel {
             )));
         }
         cache.validate_sparse_model_layers(&paged_geometry(&self.config))?;
-        let embeddings = self.trunk.embed(tokens)?;
+        let embeddings = match images {
+            Some(images) if images.prompt > 0 => {
+                let prompt = images.prompt.min(tokens.len());
+                let head = self.trunk.embed_with_images(
+                    &tokens[..prompt],
+                    self.config.image_token_id,
+                    images.features,
+                    images.used,
+                )?;
+                if prompt < tokens.len() {
+                    Tensor::cat(&[&head, &self.trunk.embed(&tokens[prompt..])?], 0)?
+                } else {
+                    head
+                }
+            }
+            _ => self.trunk.embed(tokens)?,
+        };
         let mut working = conv.conv()?.clone();
         let mut prepared = cache.prepare_append(start, tokens.len())?;
         let hidden = {
@@ -680,7 +960,26 @@ impl Inkling2ChatModel {
             prefill_progress: 0,
             replay_end: None,
             pending_logprobs: Vec::new(),
+            image_features: None,
         })
+    }
+
+    /// [`Self::begin_resumable_prefill_managed`] for a prompt with images.
+    pub(crate) fn begin_prepared_prefill_managed(
+        &self,
+        prepared: &Inkling2PreparedPrompt,
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        let mut state = self.begin_resumable_prefill_managed(
+            &prepared.prompt_ids,
+            max_new_tokens,
+            config,
+            cache,
+        )?;
+        state.image_features = Some(prepared.image_features.clone());
+        Ok(state)
     }
 
     pub(crate) fn begin_resumable_prefill_managed(
@@ -732,12 +1031,19 @@ impl Inkling2ChatModel {
             )));
         }
         let complete = span_end == prompt_ids.len();
+        let images = self.span_images(
+            state.image_features.as_ref(),
+            prompt_ids,
+            span_start,
+            span_end,
+        );
         let logits = self.forward_span(
             &prompt_ids[span_start..span_end],
             span_start,
             &mut state.physical_kv,
             &mut state.conv,
             complete,
+            images,
         )?;
         state.prefill_progress = span_end;
         state.position = span_end;
@@ -757,6 +1063,21 @@ impl Inkling2ChatModel {
     ) -> Result<ChatDecodeState> {
         let mut state =
             self.begin_resumable_prefill_managed(prompt_ids, max_new_tokens, config, cache)?;
+        self.continue_resumable_prefill(&mut state, prompt_ids, 0, prompt_ids.len())?;
+        Ok(state)
+    }
+
+    /// [`Self::start_decode_managed`] for a prompt with images.
+    pub fn start_prepared_decode_managed(
+        &self,
+        prepared: &Inkling2PreparedPrompt,
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        let mut state =
+            self.begin_prepared_prefill_managed(prepared, max_new_tokens, config, cache)?;
+        let prompt_ids = &prepared.prompt_ids;
         self.continue_resumable_prefill(&mut state, prompt_ids, 0, prompt_ids.len())?;
         Ok(state)
     }
@@ -787,6 +1108,7 @@ impl Inkling2ChatModel {
             prefill_progress: saved.prefill_progress,
             replay_end: Some(saved.replay_tokens),
             pending_logprobs: Vec::new(),
+            image_features: saved.image_features.clone(),
         })
     }
 
@@ -814,12 +1136,19 @@ impl Inkling2ChatModel {
             )));
         }
         let ids = replay_journal_span(prompt_ids, &state.generated_ids, span_start, span_end)?;
+        let images = self.span_images(
+            state.image_features.as_ref(),
+            prompt_ids,
+            span_start,
+            span_end,
+        );
         self.forward_span(
             &ids,
             span_start,
             &mut state.physical_kv,
             &mut state.conv,
             false,
+            images,
         )?;
         state.position = span_end;
         let complete = span_end == replay_end;
@@ -861,6 +1190,7 @@ impl Inkling2ChatModel {
                 &mut state.physical_kv,
                 &mut state.conv,
                 true,
+                None,
             )?;
             state.position += 1;
             committed = 1;

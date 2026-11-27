@@ -410,7 +410,8 @@ export function supportsImageAttachmentsForModel(
   if (!variant) {
     return false;
   }
-  return variant.trim().toLowerCase().startsWith("qwen3.5-");
+  const name = variant.trim().toLowerCase();
+  return name.startsWith("qwen3.5-") || name.startsWith("inkling-2-");
 }
 
 export function isLfm25ThinkingModel(variant: string | null): boolean {

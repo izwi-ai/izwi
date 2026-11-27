@@ -1618,7 +1618,7 @@ mod tests {
     #[test]
     fn every_chat_model_resolves_its_pinned_default_sampling() {
         type Sampling = (f32, f32, usize, f32, f32);
-        let profiled: [(ModelVariant, [Sampling; 3]); 10] = [
+        let profiled: [(ModelVariant, [Sampling; 3]); 11] = [
             (
                 ModelVariant::Qwen3827BFp8,
                 [
@@ -1677,6 +1677,8 @@ mod tests {
             ),
             (ModelVariant::Lfm317BGguf, [(0.1, 1.0, 50, 1.1, 0.0); 3]),
             (ModelVariant::Lfm317BQ8Gguf, [(0.1, 1.0, 50, 1.1, 0.0); 3]),
+            // The published generation config: plain sampling.
+            (ModelVariant::Inkling2Mini, [(1.0, 1.0, 0, 1.0, 0.0); 3]),
         ];
         let engine_default = (0.7, 0.9, 0, 1.1, 0.0);
         let mut chat_models = 0;

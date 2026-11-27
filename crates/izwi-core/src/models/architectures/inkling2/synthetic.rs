@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use super::config::tests::fixture;
-use super::prompt::END_SAMPLING;
+use super::prompt::{END_SAMPLING, IMAGE_SLOT};
 use super::reply::tests::{test_tokenizer_json, test_tokenizer_sized};
 use crate::artifacts::downloader::INKLING2_SYNTHETIC_MARKER;
 
@@ -28,6 +28,9 @@ pub(crate) fn write_checkpoint(dir: &Path) {
         .token_to_id(END_SAMPLING)
         .unwrap();
     config["eos_token_id"] = serde_json::json!(end);
+    config["image_token_id"] = serde_json::json!(test_tokenizer_sized(BYTE_TOKENS)
+        .token_to_id(IMAGE_SLOT)
+        .unwrap());
     std::fs::write(
         dir.join("config.json"),
         serde_json::to_vec_pretty(&config).unwrap(),

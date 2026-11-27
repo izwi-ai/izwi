@@ -359,15 +359,11 @@ impl RuntimeService {
             )?)?;
         }
         if request.task_type == TaskType::Chat && !request.chat_config.media_inputs.is_empty() {
-            if !request
-                .model_variant
-                .is_some_and(|variant| variant.family() == ModelFamily::Qwen35Chat)
-            {
-                return Err(Error::InvalidInput(
-                    "Only Qwen3.5 chat requests may include media inputs".to_string(),
-                ));
-            }
-            let estimate = crate::models::architectures::qwen35::media_resource_estimate(
+            let variant = request.model_variant.ok_or_else(|| {
+                Error::InvalidInput("A chat request with media inputs names no model".to_string())
+            })?;
+            let estimate = crate::runtime::chat::chat_media_resource_estimate(
+                variant,
                 &request.chat_config.media_inputs,
             )?;
             spec.resources = spec.resources.checked_add(media_preparation_resources(

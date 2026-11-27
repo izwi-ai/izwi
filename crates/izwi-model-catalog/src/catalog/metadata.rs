@@ -2061,6 +2061,11 @@ impl ModelVariant {
         )
     }
 
+    /// Whether the chat model takes images in a conversation.
+    pub fn accepts_image_input(&self) -> bool {
+        self.is_qwen35_chat_gguf() || self.is_inkling2()
+    }
+
     /// Whether this is the revision-pinned native Qwen3.8 FP8 checkpoint.
     pub fn is_qwen38_fp8(&self) -> bool {
         matches!(self, Self::Qwen3827BFp8)

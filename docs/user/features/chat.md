@@ -15,7 +15,7 @@ Izwi chat provides:
 - **Multiple model families** — Qwen3.5, Qwen3.6, Qwen3.8, Inkling 2, LFM2.5, and LFM3
 - **System prompts** — Shape assistant behavior
 - **Streaming output** — Incremental response tokens
-- **Multimodal support (Qwen3.5 only)** — Image inputs in chat API requests
+- **Multimodal support (Qwen3.5 and Inkling 2)** — Image inputs in chat API requests
 
 ---
 
@@ -111,7 +111,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 ### Multimodal (Image) Example
 
-Image inputs are supported only on Qwen3.5 GGUF chat variants:
+Image inputs are supported on Qwen3.5 GGUF chat variants and `Inkling-2-Mini`:
 
 ```json
 {
@@ -142,7 +142,7 @@ streaming sequence.
 | Qwen3.5 | `Qwen3.5-0.8B`, `Qwen3.5-2B`, `Qwen3.5-4B`, `Qwen3.5-9B` |
 | Qwen3.6 FP8 | `Qwen3.6-35B-A3B-FP8` (text only) |
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text only) |
-| Inkling 2 | `Inkling-2-Mini` (text only for now; thinking effort levels, tool calling) |
+| Inkling 2 | `Inkling-2-Mini` (image input; thinking effort levels, tool calling) |
 | LFM2.5 | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
 | LFM3 | `LFM3-1.7B-GGUF`, `LFM3-1.7B-Q8_0-GGUF` (reasoning on by default, tool calling) |
 

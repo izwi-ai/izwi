@@ -113,6 +113,129 @@ async fn synthetic_chats_run_alone_and_concurrently_alike_body() {
     assert!(runtime.loaded_model_diagnostics().await.is_empty());
 }
 
+/// A PNG of `width x height` pixels as a data URL; `seed` varies its pixels,
+/// and every other pixel is half transparent.
+fn png_data_url(width: u32, height: u32, seed: u8) -> String {
+    use base64::Engine;
+    let image = image::RgbaImage::from_fn(width, height, |x, y| {
+        let value = (x * 37 + y * 101) as u8 ^ seed;
+        image::Rgba([
+            value,
+            value.wrapping_mul(3),
+            value.wrapping_add(90),
+            if (x + y) % 2 == 0 { 255 } else { 128 },
+        ])
+    });
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+async fn chat_with_images(
+    runtime: &RuntimeService,
+    text: &str,
+    images: &[String],
+) -> crate::error::Result<ChatGeneration> {
+    let params = crate::engine::GenerationParams {
+        temperature: 0.0,
+        max_tokens: MAX_TOKENS,
+        ..Default::default()
+    };
+    let chat_config = crate::models::shared::chat::ChatRequestConfig {
+        media_inputs: images
+            .iter()
+            .map(|source| crate::models::shared::chat::ChatMediaInput {
+                kind: crate::models::shared::chat::ChatMediaKind::Image,
+                source: source.clone(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    Box::pin(
+        runtime.chat_generate_with_generation_params_and_chat_config_and_correlation(
+            VARIANT,
+            user(text),
+            params,
+            chat_config,
+            None,
+        ),
+    )
+    .await
+}
+
+/// Images reach the model through the runtime: fetched, decoded, cut into
+/// cells, encoded, and prefilled in place of their slots.
+async fn synthetic_chats_see_their_images_body() {
+    use crate::models::shared::chat::CHAT_IMAGE_PLACEHOLDER as IMAGE;
+    let models = models_dir("images");
+    let runtime = runtime_with(&models, 2).await;
+    // The tiny tower's cell is 4 pixels: 10 x 7 pixels are 3 x 2 cells.
+    let first = png_data_url(10, 7, 0);
+    let second = png_data_url(10, 7, 0x5a);
+    let ask = format!("What is in {IMAGE}?");
+    let plain = chat(&runtime, "What is in ?").await.expect("text chat");
+    let seen = chat_with_images(&runtime, &ask, std::slice::from_ref(&first))
+        .await
+        .expect("image chat");
+    // The text's two messages, the image message's role, type and end, and
+    // six slots.
+    assert_eq!(seen.prompt_tokens, plain.prompt_tokens + 3 + 3 + 6);
+    let again = chat_with_images(&runtime, &ask, std::slice::from_ref(&first))
+        .await
+        .expect("image chat again");
+    assert_eq!(again.text, seen.text);
+    // Another image under the same tokens is another reply: the pixels are
+    // read, not only counted.
+    let other = chat_with_images(&runtime, &ask, std::slice::from_ref(&second))
+        .await
+        .expect("second image");
+    assert_eq!(other.prompt_tokens, seen.prompt_tokens);
+    assert_ne!(other.text, seen.text);
+    // Two requests with images at once reply as they do alone.
+    let both = futures::future::join_all([
+        chat_with_images(&runtime, &ask, std::slice::from_ref(&first)),
+        chat_with_images(&runtime, &ask, std::slice::from_ref(&second)),
+    ])
+    .await;
+    assert_eq!(both[0].as_ref().expect("concurrent").text, seen.text);
+    assert_eq!(both[1].as_ref().expect("concurrent").text, other.text);
+    // Two images in one message.
+    let two = format!("Compare {IMAGE} and {IMAGE}.");
+    let compared = chat_with_images(&runtime, &two, &[first.clone(), second.clone()])
+        .await
+        .expect("two images");
+    assert!(compared.prompt_tokens > seen.prompt_tokens + 6);
+    // Images and placeholders that do not pair off, and bytes that are not
+    // an image, fail the request and leave the model serving.
+    assert!(
+        chat_with_images(&runtime, &two, std::slice::from_ref(&first))
+            .await
+            .is_err()
+    );
+    let broken = "data:image/png;base64,AAAA".to_string();
+    assert!(chat_with_images(&runtime, &ask, &[broken]).await.is_err());
+    let after = chat_with_images(&runtime, &ask, std::slice::from_ref(&first))
+        .await
+        .expect("after failures");
+    assert_eq!(after.text, seen.text);
+    Box::pin(runtime.unload_model(VARIANT))
+        .await
+        .expect("unload");
+}
+
+#[test]
+fn synthetic_chats_see_their_images() {
+    crate::block_on_large_stack(4, synthetic_chats_see_their_images_body);
+}
+
 #[test]
 fn synthetic_chats_run_alone_and_concurrently_alike() {
     crate::block_on_large_stack(4, synthetic_chats_run_alone_and_concurrently_alike_body);
