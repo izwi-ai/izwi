@@ -949,7 +949,7 @@ pub(crate) async fn copy_optional_preparation_string(
 
 pub(crate) fn media_preparation_resources(
     backend: BackendKind,
-    estimate: crate::models::architectures::qwen35::Qwen35MediaResourceEstimate,
+    estimate: crate::models::shared::media::MediaResourceEstimate,
 ) -> Result<ResourceVector> {
     let total_unified = estimate
         .host_bytes

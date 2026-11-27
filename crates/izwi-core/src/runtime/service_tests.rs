@@ -2668,7 +2668,7 @@ fn transient_estimates_are_fully_known_for_every_backend() {
 
 #[test]
 fn media_preparation_estimates_map_to_physical_backend_domains() {
-    let estimate = crate::models::architectures::qwen35::Qwen35MediaResourceEstimate {
+    let estimate = crate::models::shared::media::MediaResourceEstimate {
         host_bytes: 300,
         backend_tensor_bytes: 700,
     };
